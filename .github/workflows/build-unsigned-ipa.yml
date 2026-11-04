@@ -1,0 +1,59 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # If the build complains about the Xcode/SDK version, switch to the newest
+    # macOS image GitHub offers (e.g. macos-26) or pick Xcode with xcode-select.
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # postinstall also fetches the pinned FFmpeg xcframeworks and checks CocoaPods.
+      - name: Install dependencies
+        run: npm ci
+
+      # iOS (not tvOS, not Catalyst) native project + pod install.
+      - name: Expo prebuild (iOS)
+        run: npm run prebuild:ios
+
+      - name: Build unsigned .app
+        working-directory: ios
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -1)
+          SCHEME=$(basename -s .xcscheme "$(ls ${WORKSPACE%.xcworkspace}.xcodeproj/xcshareddata/xcschemes/*.xcscheme | head -1)")
+          echo "workspace=$WORKSPACE scheme=$SCHEME"
+          mkdir -p ../build
+          xcodebuild build \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ../build/derived \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tee ../build/xcodebuild.log | (command -v xcbeautify >/dev/null && xcbeautify || cat)
+        env:
+          NODE_BINARY: node
+
+      - name: Package IPA
+        run: |
+          APP=$(ls -d build/derived/Build/Products/Release-iphoneos/*.app | head -1)
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../TomoTV-unsigned.ipa Payload)
+          ls -lh build/TomoTV-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TomoTV-unsigned-ipa
+          path: build/TomoTV-unsigned.ipa
