@@ -5,10 +5,9 @@ on:
 
 jobs:
   build:
-    # If the build complains about the Xcode/SDK version, switch to the newest
-    # macOS image GitHub offers (e.g. macos-26) or pick Xcode with xcode-select.
-    runs-on: macos-15-intel
-    timeout-minutes: 90
+    # Keep whatever label worked for you (macos-latest, macos-15, macos-15-intel...).
+    runs-on: macos-latest
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -18,16 +17,42 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      # postinstall also fetches the pinned FFmpeg xcframeworks and checks CocoaPods.
       - name: Install dependencies
         run: npm ci
 
       - name: Install ffmpeg
         run: brew install ffmpeg
 
-      # iOS (not tvOS, not Catalyst) native project + pod install.
+      # The tvos-assets prebuild plugin encodes App Store listing videos with ffmpeg.
+      # They are not part of the app, and the encoding takes a very long time on a CI
+      # runner. This wrapper hands real ffmpeg anything that is not a video encode
+      # (so encoder detection still works) and writes an empty file for video outputs.
+      - name: Install ffmpeg wrapper (skip listing-video encoding)
+        run: |
+          REAL=$(command -v ffmpeg)
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          cat > "$RUNNER_TEMP/fakebin/ffmpeg" <<WRAP
+          #!/bin/bash
+          echo "\$(date +%T) ffmpeg \$*" >> "$RUNNER_TEMP/ffmpeg-calls.log"
+          last="\${@: -1}"
+          case "\$last" in
+            *.mp4|*.mov|*.m4v) : > "\$last"; exit 0 ;;
+          esac
+          exec "$REAL" "\$@"
+          WRAP
+          chmod +x "$RUNNER_TEMP/fakebin/ffmpeg"
+          echo "FFMPEG_PATH=$RUNNER_TEMP/fakebin/ffmpeg" >> "$GITHUB_ENV"
+
       - name: Expo prebuild (iOS)
-        run: npm run prebuild:ios
+        timeout-minutes: 30
+        run: |
+          date +%T
+          npm run prebuild:ios
+          date +%T
+
+      - name: Show ffmpeg calls
+        if: always()
+        run: cat "$RUNNER_TEMP/ffmpeg-calls.log" 2>/dev/null | cut -c1-300 || true
 
       - name: Build unsigned .app
         working-directory: ios
