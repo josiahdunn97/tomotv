@@ -1,0 +1,266 @@
+{
+  "$schema": "./shots.schema.json",
+  "output": "applestore/generated",
+  "background": "rust",
+  "locales": {
+    "en": {},
+    "de": {},
+    "fr": {},
+    "es": {}
+  },
+  "devices": {
+    "iphone": {},
+    "ipad": {},
+    "tv": {},
+    "mac": {},
+    "duo": { "layout": "pair" }
+  },
+  "shots": [
+    {
+      "id": "01-library",
+      "title": "YOUR JELLYFIN\nLIBRARY",
+      "spec": "live tv · movies · shows · music",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/"
+      },
+      "l10n": {
+        "de": {
+          "title": "DEINE JELLYFIN\nBIBLIOTHEK",
+          "spec": "live-tv · filme · serien · musik"
+        },
+        "fr": {
+          "title": "MÉDIATHÈQUE\nJELLYFIN",
+          "spec": "tv en direct · films · séries · musique"
+        },
+        "es": {
+          "title": "TU BIBLIOTECA\nJELLYFIN",
+          "spec": "tv en vivo · películas · series · música"
+        }
+      }
+    },
+    {
+      "id": "02-player",
+      "title": "THE PLAYER\nYOU KNOW",
+      "spec": "pip · airplay · subtitles",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/player",
+        "params": {
+          "videoId": "{item:Sintel}",
+          "videoName": "Sintel",
+          "startTicks": "6310000000"
+        },
+        "ready": "session"
+      },
+      "platforms": {
+        "iphone": { "spec": "airplay · audio · subtitles" },
+        "duo": { "spec": "airplay · audio · subtitles", "layout": "inner" },
+        "tv": { "title": "RECORD WHAT'S\nON RIGHT NOW", "spec": "one press · from the player" }
+      },
+      "l10n": {
+        "de": {
+          "title": "DER PLAYER\nDEN DU KENNST",
+          "spec": "bild-in-bild · untertitel",
+          "platforms": {
+            "iphone": { "spec": "airplay · audio · untertitel" },
+            "duo": { "spec": "airplay · audio · untertitel" },
+            "tv": { "title": "NIMM AUF,\nWAS GERADE LÄUFT", "spec": "ein klick · direkt im player" }
+          }
+        },
+        "fr": {
+          "title": "VOTRE LECTEUR\nHABITUEL",
+          "spec": "airplay · sous-titres",
+          "platforms": {
+            "iphone": { "spec": "airplay · audio · sous-titres" },
+            "duo": { "spec": "airplay · audio · sous-titres" },
+            "tv": { "title": "ENREGISTREZ\nCE QUI PASSE", "spec": "un clic · depuis le lecteur" }
+          }
+        },
+        "es": {
+          "title": "REPRODUCTOR\nDE SIEMPRE",
+          "spec": "airplay · subtítulos",
+          "platforms": {
+            "iphone": { "spec": "airplay · audio · subtítulos" },
+            "duo": { "spec": "airplay · audio · subtítulos" },
+            "tv": { "title": "GRABA LO QUE\nESTÁ EN EL AIRE", "spec": "un clic · desde el reproductor" }
+          }
+        }
+      }
+    },
+    {
+      "id": "03-info",
+      "title": "PICK UP WHERE\nYOU STOPPED",
+      "spec": "on every device",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/video-info",
+        "params": {
+          "videoId": "{item:Jungle Book}",
+          "name": "Jungle Book"
+        }
+      },
+      "l10n": {
+        "de": {
+          "title": "WEITER WO DU\nWARST",
+          "spec": "auf jedem gerät"
+        },
+        "fr": {
+          "title": "REPRENEZ OÙ\nVOUS EN ÉTIEZ",
+          "spec": "sur chaque appareil"
+        },
+        "es": {
+          "title": "SIGUE DONDE\nLO DEJASTE",
+          "spec": "en cada dispositivo"
+        }
+      }
+    },
+    {
+      "id": "04-livetv",
+      "title": "LIVE TV FROM\nYOUR TUNER",
+      "spec": "live previews · groups · xmltv guides",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/live-tv"
+      },
+      "l10n": {
+        "de": {
+          "title": "LIVE-TV VON\nDEINEM TUNER",
+          "spec": "live-vorschau · gruppen · xmltv-guides"
+        },
+        "fr": {
+          "title": "TV EN DIRECT\nET SON GUIDE",
+          "spec": "aperçus en direct · groupes · guides xmltv"
+        },
+        "es": {
+          "title": "TV EN VIVO\nCON GUÍA",
+          "spec": "vistas en vivo · grupos · guías xmltv"
+        }
+      }
+    },
+    {
+      "id": "05-downloads",
+      "title": "DOWNLOAD IT\nWATCH OFFLINE",
+      "spec": "an item or a whole folder",
+      "devices": ["iphone", "ipad", "mac", "duo"],
+      "capture": {
+        "path": "/downloads"
+      },
+      "l10n": {
+        "de": {
+          "title": "LADE RUNTER\nSCHAU OFFLINE",
+          "spec": "titel oder verzeichnis"
+        },
+        "fr": {
+          "title": "REGARDEZ\nHORS LIGNE",
+          "spec": "un élément ou un dossier"
+        },
+        "es": {
+          "title": "DESCARGA Y VE\nSIN CONEXIÓN",
+          "spec": "un elemento o carpeta"
+        }
+      }
+    },
+    {
+      "id": "06-quality",
+      "title": "OPENS AT THE\nRIGHT QUALITY",
+      "spec": "minimum buffering",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/settings"
+      },
+      "l10n": {
+        "de": {
+          "title": "STARTET IN\nTOP-QUALITÄT",
+          "spec": "kaum puffern"
+        },
+        "fr": {
+          "title": "S'OUVRE À LA\nBONNE QUALITÉ",
+          "spec": "tampon minimal"
+        },
+        "es": {
+          "title": "ABRE EN LA\nCALIDAD JUSTA",
+          "spec": "búfer mínimo"
+        }
+      }
+    },
+    {
+      "id": "07-connect",
+      "title": "FINDS YOUR\nSERVER",
+      "spec": "nothing to type",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/connect/servers"
+      },
+      "l10n": {
+        "de": {
+          "title": "FINDET DEINEN\nSERVER",
+          "spec": "nichts einzutippen"
+        },
+        "fr": {
+          "title": "TROUVE VOTRE\nSERVEUR",
+          "spec": "rien à saisir"
+        },
+        "es": {
+          "title": "ENCUENTRA TU\nSERVIDOR",
+          "spec": "sin escribir nada"
+        }
+      }
+    },
+    {
+      "id": "08-search",
+      "title": "SEARCH YOUR\nWHOLE SERVER",
+      "spec": "title, genre, artist, year",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/search",
+        "params": {
+          "q": "animation"
+        }
+      },
+      "l10n": {
+        "de": {
+          "title": "SUCHE ÜBER\nDEN SERVER",
+          "spec": "titel, genre, künstler, jahr"
+        },
+        "fr": {
+          "title": "CHERCHEZ\nPARTOUT",
+          "spec": "titre, genre, artiste"
+        },
+        "es": {
+          "title": "BUSCA EN TODO\nTU SERVIDOR",
+          "spec": "título, género, año"
+        }
+      }
+    },
+    {
+      "id": "09-filters",
+      "title": "NARROW IT\nDOWN",
+      "spec": "genre · year · favorites",
+      "devices": ["iphone", "ipad", "tv", "mac", "duo"],
+      "capture": {
+        "path": "/filters",
+        "params": {
+          "folderId": "{library:Films}",
+          "name": "Films",
+          "libraryId": "{library:Films}",
+          "libraryName": "Films"
+        }
+      },
+      "l10n": {
+        "de": {
+          "title": "GRENZE ES\nEIN",
+          "spec": "genre · jahr · favoriten"
+        },
+        "fr": {
+          "title": "AFFINEZ\nLA LISTE",
+          "spec": "genre · année · favoris"
+        },
+        "es": {
+          "title": "AFINA LA\nBÚSQUEDA",
+          "spec": "género · año · favoritos"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,489 @@
+# The On-Device Playback Engine
+
+**Category:** Implementation
+**Keywords:** engine, remux, codec, transcode, localRemux, swscale, deinterlace, decline, coverage
+
+The single authority on what plays on the device and what reaches the Jellyfin
+server. Written because the engine outran its documentation: the rules lived
+across four files, three docs described a version of them that had not been true
+for months, and the gaps that produced were invisible until audited.
+
+## Related
+
+- [`CLAUDE-patterns.md`](./CLAUDE-patterns.md) - architecture and the playback flow
+- [`CLAUDE-multi-audio.md`](./CLAUDE-multi-audio.md) - the server lane's audio switching
+- [`CLAUDE-testing.md`](./CLAUDE-testing.md) - the playback regression suite
+
+---
+
+## The three lanes
+
+| Lane         | What happens                                                                                           | When                                                                                    |
+| ------------ | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `direct`     | Jellyfin's `/stream?Static=true`, or the file itself when it is on this device, straight into AVPlayer | Codec and container both native. Subtitles never move a file off this lane on their own |
+| `localRemux` | The engine reads the original file, rewraps or re-encodes on device, serves fMP4 HLS over loopback     | Anything AVPlayer cannot open that the device can handle                                |
+| `transcode`  | Jellyfin re-encodes and serves HLS                                                                     | Only when the engine declines a file AVPlayer cannot open either                        |
+
+The product claim is that the middle lane is the common case. Every decline is
+a server transcode, which is why each one below has to earn its place.
+
+## Every reason a file reaches the server
+
+`canRemuxLocally()` in `services/localRemux.ts`, in evaluation order. These are
+the complete set; nothing else declines.
+
+| Decline                                                                      | Cause                                                                                                                                                                                                                                                            |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native module unavailable`                                                  | Broken build. Logged as a warning, not debug                                                                                                                                                                                                                     |
+| `no media streams` / `no video codec in metadata` / `no runtime in metadata` | Jellyfin metadata gaps                                                                                                                                                                                                                                           |
+| `audio track requires an unavailable server supplier`                        | An uncarriable audio track on a held file or an audio-only item, which have no server audio rendition to lean on. Never a live channel: its metadata is a label (a tuner's lineup string, `MPEG` for MP2), and the engine reads the real streams off the demuxer |
+| ~~`no AV1 hardware decode`~~                                                 | **Gone.** AV1 without hardware decode takes the software path through the vendored dav1d, like VP9, at any size. With hardware it is copied instead.                                                                                                             |
+| `video codec unsupported`                                                    | No decoder in the linked FFmpeg                                                                                                                                                                                                                                  |
+
+Plus one from the caller (`hooks/useVideoPlayback.ts`): the transcode latch once
+the server lane has been used.
+
+Subtitles are not among them. `cannotDirectPlay` carries every reason a file
+cannot be handed to AVPlayer as it stands, and only those may end at the server,
+because that rung re-encodes the whole film. Subtitles are the other half of the
+decision: they reach the engine, which draws image tracks as bitmaps and carries
+text tracks as renditions, and they never reach the server. A file the engine
+declines that AVPlayer opens as it stands plays as it stands, without them.
+Burn-in rides a transcode the file already needed rather than calling for one.
+
+### A file on this device
+
+`playsFromDisk` reads the local container, not the item's Jellyfin metadata,
+which still describes the source. A download already in a container
+AVFoundation opens is declined by the repackager, so `repackaged` is false on
+exactly the files that need no engine: keying the held branch on it read them as
+not held, and their embedded `mov_text` pushed them off direct play into the
+loopback engine, and from there to a server a download exists to do without.
+Only a sidecar saved beside the media, or an image track, still asks for the
+engine. When that ask fails, the file replays from the disk without its
+subtitles rather than not playing: the film outranks the sidecar.
+
+### The engine decides by doing
+
+One size gate: 8K video (7680 wide or 4320 tall) the device does not copy is declined by
+`canRemuxLocally` and plays as one server transcode at the preset the measured link carries
+(`needsSingleServerTranscode`; `openServerLane` skips the gateway and the multi-audio loader for
+it). Measured on T40: the gateway's rung and audio carrier each decode the source, one 8K decode
+ran at 1.17x to 1.49x on the server, two at 0.83x. Below 8K `canRemuxLocally` admits every codec in
+`TRANSCODABLE_VIDEO_CODECS` at any depth or field order; whether this device keeps up is measured
+by the session itself.
+
+- **Pre-flight.** The producer times every segment it closes
+  (`Remuxer.reportThroughput`: wall seconds against the segment's media
+  duration, cushion ahead of the playhead, whether the loop slept on its
+  read-ahead cap, thermal state) and sends it to JS as `onEngineThroughput`.
+  `useVideoPlayback` holds `setStreamUrl` until segment 0's sample arrives. At
+  or above realtime, AVPlayer is bound as before. Below it, the session is
+  stopped and the server lane opens at the viewer's own preset, with nothing
+  on screen to restart: the fallback reason is `engine below realtime`. No
+  sample within the engine's own 20 s segment deadline fails the session the
+  way it always did.
+  **A session that offers Slipstream rungs skips this timing entirely**
+  (`preflight.keptForTier`): the master opens on a rung, so the engine's own
+  segment 0 is not the startup gate and a slow link is not a verdict against
+  the device. See `memories/CLAUDE-slipstream.md`.
+- **Remembered per file.** `packages/tomo-engine/src/verdicts.ts` keeps
+  `Documents/engine-verdicts.json`, keyed by server, item and media source
+  (`services/engineVerdicts.ts` builds the key). A
+  verdict is written only from a clean sample (thermal nominal or fair, no
+  download repackage running); a session that produced no segment within
+  the deadline is remembered too (`recordTimeoutVerdict`). A verdict only
+  counts for the build that wrote it, and the probe's `preflight` event
+  carries the sample and whether it was kept.
+  The lane pick and `predictPlaybackLane` both consult it, so the second play
+  of a remembered file is a server transcode from the first request and the
+  info panel and download planner say so.
+- **Mid-play.** Samples keep arriving. `engineStarving` (pure, in
+  `localRemux.ts`) is true when the last two timed, unthrottled segments of the
+  current generation ran below realtime and at most one segment is ahead of the
+  player; the hook then moves to the server at the playhead once, directly,
+  and records the verdict. A session riding a rung is exempt: its primary is
+  unproducible by design, and starving it is the point of the rung. No record to date shows a session that passed
+  pre-flight falling below realtime later; this is the backstop, in place of
+  the STALLED ladder's restart-then-server.
+- **8K** needs no rule: the H.264 encoder refuses to open at 7680x4320 and the
+  start-time fallback lands on the server, verdict included.
+
+The bench (`npm run bench:transcode`, `scripts/transcode-bench.mjs`,
+`app/dev-bench.tsx`) stays the tool that says where a device stands
+(`test/playback/bench/`); nothing in the app reads it. The 2021 Apple TV
+(`AppleTV6,2`) record: 1440p VP9 and AV1 at 3.6x and 4.2x, 4K24 8-bit at 1.79x
+and 2.07x with flat 10 s windows at thermal "serious", 4K 10-bit at 1.19x and
+1.55x, 8K encoder refused. VideoToolbox hwaccel decode
+(`AV_HWDEVICE_TYPE_VIDEOTOOLBOX`) is unbuilt; the record's decode-only column
+says the software decoder, not the encode, is the ceiling on that box.
+
+## Reading the file and writing the segments
+
+The input is read through three ranged connections (`ParallelRangeReader`, 2 MB chunks), the
+whole MKV whatever tracks are in use: FFmpeg's Matroska demuxer reads every block's bytes before
+its discard check. No byte on any connection for 5 s (`silenceTimeout`) drops the fetches in
+flight and starts them again on fresh connections, the way a seek drops them, so their completions
+consume no retry; the 20 s read timeout stays as the cap. Measured on an Apple TV: a flow that
+stopped on all three connections waited the 20 s out and refetched at once (a 33 s segment), and a
+body that trickled at 35 Mb/s for 11 s recovered by itself, which the silence rule leaves alone.
+Finished segments are written on a serial queue off the pipeline thread, one in flight; the
+segment completes when its file has landed. Until then it sits in `Rendition.writing`, which
+counts as produced wherever a restart is decided (the stranded seek, the control block's drop,
+the per-segment skip, the copy's follow), and the prune marks a segment still in flight so the
+writer drops the file instead. The write was 0.9 to 1.5 s of every 3 to 6 s segment (60 to 90 MB
+on the 2021 Apple TV); the `segment N took` line reports it as `file ... off thread`.
+
+## What the linked build can actually do
+
+**We build FFmpeg ourselves.** `scripts/ffmpeg/build.sh` compiles upstream
+FFmpeg (version pinned in `scripts/ffmpeg/sources.sh`) plus mbedTLS, dav1d,
+uavs3d and the libass font stack, for seven slices; CI publishes the
+xcframeworks and `packages/tomo-engine/scripts/fetch-ffmpeg.js` downloads them against the SHA256s in
+`packages/tomo-engine/ffmpeg-lock.json`. **Nothing compiles on `npm install`.**
+
+**dav1d ships under a private symbol prefix (`tomo_dav1d_`).** `expo-image` pulls
+`libavif/libdav1d` into the same binary, and a static link has one flat symbol
+namespace, so two versions of `dav1d_*` cross-wire: FFmpeg allocates a context to
+one struct layout and reads it with another. `build_dav1d` renames the exported
+API through a header generated from `nm`, and the arm kernels through dav1d's own
+`PRIVATE_PREFIX`. The build fails if any externally visible `dav1d_` symbol
+survives. Do not "simplify" this away: dropping our copy costs on-device AV1,
+and dropping expo-image's costs AVIF in the photo viewer.
+
+Before this we took MPVKit's prebuilt FFmpeg, whose configure line made two
+choices for mpv that cost us coverage: `--disable-decoders` behind a 60-entry
+allowlist, and `--enable-vulkan`, which made its libswscale reference shaderc
+and refuse to link on tvOS. Both are gone.
+
+`npm run probe:codecs` prints the truth by `av_codec_iterate`. Never infer it
+from symbols: the static archives carry object files for codecs that were never
+enabled. The build registers **520 decoders** (271 video, 226 audio, 22
+subtitle) and exactly five audio encoders plus the two VideoToolbox video ones.
+The output side is pruned hard on purpose: one muxer (`mp4`), one bitstream
+filter (`pgs_frame_merge`), a named filter list. Decoders, demuxers and parsers
+are left entirely enabled: that is the point of owning the build.
+
+**DASH and teletext are in the build since ffmpeg-n8.1.2-tomo.5.** The `dash` demuxer needs
+libxml2 (`build.sh` writes a pc for the SDK's `libxml2.tbd`, podspec links `xml2`); teletext
+decodes through `libzvbi_teletextdec`. The release also adds the protocols `crypto` (AES-128
+HLS), `udp`, `rtp`, `rtmp`, `rtmps`, `data`,
+`mmsh`, `mmst`, each checked by name in `scripts/ffmpeg/linktest.c`. `ImageSubtitleDecoder`
+opens teletext with `txt_page=subtitle` on the page's own 492x250 canvas, measured from the
+first rect. `isManifestSource` takes `.mpd`/`dash`; `originVariantUrl` hands an MPD over whole
+and refuses one carrying `ContentProtection`.
+
+**`build.sh` edits two upstream files in place**, each edit checked to still apply:
+`videotoolbox.c` asks Catalyst for Metal-compatible pixel buffers, and since tomo.8 `movenc.c`
+takes the `dec3` Atmos flag from a dependent E-AC-3 substream when the stream has one (ETSI TS
+103 420 8.3.1). A Blu-ray style track (AC-3 core plus a dependent frame carrying the objects,
+two sync frames per packet) was declared without Atmos because upstream reads the first frame
+of each packet; the streaming style 5.1 JOC track (one E-AC-3 frame per packet) always carried it.
+Measured on the Interstellar remux: `dec3` 6 bytes and no flag before, 8 bytes with
+`flag_eac3_extension_type_a=1` after. On the Apple TV with AirPods, Control Center shows Dolby
+Atmos for that track with tomo.8, as it does for the 5.1 track; plain AC-3 shows Multichannel.
+
+**The allowlists use the names FFPROBE reports**, which is what Jellyfin puts in
+`MediaStream.Codec`, not the decoder's own name. These differ and have bitten
+before: TSCC decodes through `camtasia` and reports as `tscc`; AVS3 through
+`libuavs3d` reports as `avs3`; DivX 3 through `msmpeg4` reports as `msmpeg4v3`;
+Musepack through `mpc7`/`mpc8` reports as `musepack7`/`musepack8`; MPEG-4 ALS
+through `als` reports as `mp4als`; ATRAC3+ reports as `atrac3p`. G.722 and G.726
+report as `adpcm_g722`/`adpcm_g726`, so the `adpcm` prefix covers them.
+
+Matching is `startsWith`, so a prefix that swallows an unsupported sibling is a
+bug: bare `avs` is deliberately NOT listed because it would match `avs2`, which
+needs libdavs2 and is not built.
+
+Nothing in FFmpeg's native decoder set is out of reach any more. DivX 3, Theora,
+DV and Cinepak all decode on device, and so do VVC/H.266, APV, AVS1, RealAudio
+sipr, the ATRAC family, QDM2, WavPack and Musepack. What still reaches the
+server is the pixel gate and metadata gaps, nothing else. `rawvideo` is
+registered and deliberately excluded: uncompressed 1080p is ~1.5 Gbps off the
+server.
+
+## The video path, and why it used to be narrow
+
+`packages/tomo-engine/ios/LocalRemuxer/VideoTranscoder.swift` decodes in software and encodes
+with VideoToolbox. Its input contract is the whole story:
+
+- `h264_videotoolbox` accepts **8-bit `yuv420p` or `nv12`, nothing else**.
+- With no way to convert, any decoder producing anything else was refused and the
+  file went to the server. That is why ProRes (4:2:2 10-bit), MJPEG (full-range
+  4:2:2), FFV1 and HuffYUV were unreachable despite having registered decoders.
+- **Two conversion paths, and the fast one is not the general one.**
+  `yuv420p`, `yuvj420p` and `nv12` are wrapped straight out of the decoder with
+  `CVPixelBufferCreateWithPlanarBytes` (no copy) and converted by a
+  `VTPixelTransferSession`. That covers every MPEG-2, MPEG-4, VP8/9, WMV, H.263,
+  RV and FLV source. `npm run probe:pixel-transfer` proves those three convert.
+- **Everything else goes through libswscale**, which is vendored again now that
+  we build FFmpeg without Vulkan. This replaced two hand-written interleaves
+  that hardcoded 4:2:0 and 4:2:2 chroma geometry. They did not fail on other
+  layouts, which is what made them dangerous: ProRes decodes to `yuv422p10` and
+  lost half its chroma rows to a hardcoded `h / 2`; DV decodes to `yuv411p` and
+  read three quarters of every chroma row out of alignment padding. Both
+  returned a plausible, wrong picture. swscale knows all ~200 pixel formats, so
+  enabling a decoder no longer means auditing a conversion by hand.
+- Deinterlacing runs BEFORE the conversion, on the decoder's own planar
+  output, through libavfilter's bwdif.
+
+Encoder choice follows source depth: `h264_videotoolbox` for 8-bit,
+`hevc_videotoolbox` with `p010le` for 10-bit. HEVC output needs no special
+handling for the playlist: `Remuxer.buildMuxer` applies the `hvc1` sample-entry
+tag off the output codec id, and a non-SDR variant already declares an `hvc1`
+CODECS token through `hdrFallbackTag`.
+
+### Deinterlacing is bwdif's, inside the frameworks
+
+Interlaced sources go through a `buffer -> bwdif -> buffersink` graph in
+`VideoTranscoder` (`mode=send_frame`, parity from the container's field order,
+`deint=all`). Interlaced H.264 is in that set: `needsTranscode` refuses it the
+copy (HLS authoring spec 1.14 forbids interlaced samples; AVPlayer weaves
+them, and a PAFF copy puts one FIELD per fMP4 sample). A live TS answers
+`field_order` unknown and `extradata` empty whatever the probe terms
+(measured on a 1080i25 PAFF HLS origin), so the pipeline reads to the opening
+keyframe, lifts its parameter sets, and `H264ParameterSets` reads
+`frame_mbs_only_flag` to pick the lane; such SPS-driven sessions run bwdif
+`parity=auto:deint=interlaced`, by each frame's own flags. Two properties are
+load-bearing:
+
+- **The filter code lives in the FFmpeg frameworks, compiled -O2 whatever the
+  app builds at.** The previous hand-written Swift pass ran ~300x slower at
+  -Onone (10.8 vs 3333 fps measured), so every Debug build black-screened
+  interlaced content and pegged a core: T37 on device, twice. A per-pixel loop
+  in app-target Swift can never carry a realtime path.
+- **`mode=send_frame` must be explicit.** bwdif's DEFAULT is send_field, one
+  frame per field, which doubles the frame rate and breaks the pipeline's
+  timing. Read out of vf_bwdif.c, not assumed.
+
+bwdif holds one frame of lookahead, so EAGAIN from the sink is the steady state
+and EOF (`av_buffersrc_add_frame(src, nil)`) releases the last frame.
+Seek-restart rebuilds the transcoder (`Remuxer.swift`), so no stale filter state
+survives a seek.
+
+`yadif_videotoolbox` (Metal GPU) remains a possible upgrade, its own change with
+its own comparison. Apple's `kVTDecompressionPropertyKey_FieldMode` only applies
+to streams VideoToolbox decodes itself, and our interlaced sources (MPEG-2 and
+interlaced H.264 alike) are decoded in software; `VideoTranscoder.logDecodeSupport()`
+logs per-device what VideoToolbox can decode.
+
+## The audio path has no such ceiling
+
+Libswresample **is** vendored, and `AudioTranscoder` runs every decoder's output
+through it, choosing the narrowest sample format that holds the source and
+preserving the channel layout rather than taking `av_channel_layout_default`
+(which would relabel AC-3's 5.1(side) as 5.1(back)). So any registered decoder
+can ride the pipeline whatever its format, rate or layout.
+
+Copied untouched: AAC, ALAC, AC-3, E-AC-3, and FLAC whose extradata is exactly a
+34-byte STREAMINFO block. AC-3 and E-AC-3 copying is what preserves Atmos, since
+JOC rides inside E-AC-3 as side data: the `delay_moov` path in
+`Remuxer.buildMuxer` is what makes the fMP4 muxer accept it.
+
+Everything else is decoded and re-encoded to **FLAC**, with AAC only as a
+fallback. That is lossless, which is why DTS and TrueHD keep their quality.
+MP3 is deliberately in the re-encode set: Apple's HLS spec allows MP3 only in
+MPEG-TS segments and AVPlayer refuses an fMP4 with an `.mp3` sample entry.
+
+**One uncarriable track no longer condemns a file.** The carriable tracks are
+kept and the rest dropped; only a file with no carriable track at all declines.
+
+**A file with many tracks is not converted whole at start.** Every track is in the master and
+has its muxer and header, but the read loop feeds only the playing track, every copied track
+(a copy costs a mux, and a Dolby copy's header exists only once it has a packet) and the
+subtitle tracks flagged default or forced plus the one the stored choice lands on
+(`isSelected`, computed in `useVideoPlayback.openEngineLane`). A request for anything else
+(`aN-seg{n}.m4s`, `sub{N}.m3u8`, `sub{N}-{n}.vtt`, `sub{N}.vtt`, `pgs{N}.json`) is the pick: the
+pipeline restarts once at the lowest segment asked for (`activationSeekSegment`; a subtitle pick
+at the playhead, `playheadSegmentLocked`, read off the player's buffer report, and before the
+player's first media request the playhead is the resume point's segment, `firstMediaRequestSeen`,
+since AVFoundation picks a legible rendition at load on its own: measured on an iPhone, that pick
+restarted the engine at 0 on a 229 s resume) and that
+generation feeds the track or opens its decoder (`Rendition.active`,
+`pendingAudioActivations`, `pendingSubtitleActivations`). A rendition that already holds a
+segment is not rewritten by any generation (the Dolby Vision rewrite still runs, its context
+carries state across frames), and while that generation is behind where the producer was
+(`activationGeneration`, `activationSpanEnd`) a request ahead of it waits instead of restarting
+over it. A seek pending beside the picks is not dropped: subtitle picks ride the seek's restart,
+an audio pick near the seek (within `seekAheadSegments`) restarts at the lower of the two with the
+span reaching the higher, and one far from it lets the seek win. A track's
+request for a segment the primary holds re-seeks through the pick's own seek,
+since the control block drops a plain seek for a segment the primary has
+(`seekForStrandedLocked`). After 45 s of played time the app calls
+`prepareRemainingTracks` and the remaining converted audio tracks come up one per segment, at a
+cut, on a timed segment the producer neither held nor rode a rung through; a track whose first
+segment runs past its length is left inactive and the ramp stops (`stepTrackRamp`). That first
+segment's sample is flagged `activating`, and `engineStarving` never reads one as a verdict.
+Subtitle tracks are never ramped: 74 PGS tracks decoded to PNG are gigabytes nobody asked for.
+Live and self-described sessions feed every track. Measured on Interstellar (15 audio, 74 PGS):
+the whole-file conversion made a 6 s segment in 9.48 s, which is what this removes.
+
+## Audio-only files
+
+They run the same pipeline with no video track. `Remuxer.runPipeline` guards on
+`hasVideo`: stream selection, rendition building, plan reporting and the seek
+rebuild all tolerate its absence, the timing stream becomes the carried audio
+track, and every audio frame is independently decodable so any packet opens a
+generation. The master playlist omits `VIDEO-RANGE`, `RESOLUTION` and
+`FRAME-RATE`, and carries the audio CODECS token alone.
+
+`audioNeedsRewrap()` decides it on the JS side, checking codec **and** container:
+AVPlayer decodes Vorbis in nothing, and refuses an Ogg container whatever is
+inside it.
+
+## Scrub previews: the I-frame rendition
+
+Every VOD session with video lists an `#EXT-X-I-FRAME-STREAM-INF` beside the
+copy, ladder masters included. Live and audio-only sessions get none. Direct
+play needs none: AVKit makes thumbnails from a progressive file itself
+(measured on tvOS and iOS 2026-10-05).
+
+- Entries: the demuxer's keyframes where it indexes them, measured on FFmpeg
+  8.1.3: Matroska/WebM (after the Cues seek), MP4/MOV and AVI list every
+  keyframe; ASF only after a timestamp seek; TS, PS and FLV only what was read.
+  Unindexed sources use the segment grid, the keyframe at or before each start
+  stamped at the start (`IFrameIndex.swift`). Thinned to one a second.
+- Frames come through an I-frame `FrameGrabber` of their own (`FrameGrabber+IFrames.swift`).
+  The rendition is always SDR (authoring spec 6.16): the keyframe is copied only
+  for an SDR picture inside 1920x1080 that playback copies; everything else
+  (HDR, 4K, a transcoded session, every server lane) is encoded as H.264 High
+  4.0 inside 1920x1080, PQ and HLG tone-mapped by VideoToolbox's pixel transfer
+  from the decoded frame's own colour tags (PQ to BT.709 measured on Apple TV
+  2026-10-07). Dolby Vision profile 5 gets no line. tfdt sits on the session
+  anchor; each sample lasts until the next tfdt (7.3); mfhd counts the entries.
+- `IFrameStore` never fails an entry: AVPlayer retries a 404 I-frame segment
+  without end and stops trick play (604 retries in 30 s, measured). Newest
+  request first; a request that waits past its budget (4 s on a copy link,
+  0.6 s under a ladder) gets the nearest made fragment restamped; a failing
+  source rests 5 s, then 30 s. 24 MB LRU.
+- Server lanes: `ProviderIFrames` on a frame provider, named by an absolute line
+  in the shimmed or multi-audio master. Stamps are source time minus the file's
+  start: Jellyfin's fMP4 output keeps that timeline, TS adds 10 s, and AVPlayer
+  lines our fMP4 I-frames up with both (pixel-identical at their times).
+- MPEG-TS seeks by byte estimate on a `ByteTimeMap` (ends, landings, keyframes
+  read): 1 to 3 seeks against FFmpeg's 5 to 17 requests (4.2 to 14.1 s) on a
+  30 min recording over HTTPS.
+- BANDWIDTH is RFC 8216's windowed peak over the I-frame EXTINFs (spec 6.9):
+  exact from MP4/AVI index sizes, else a bound (an encoded frame is re-encoded
+  toward 2 Mb/s over its EXTINF; a Matroska copy is bounded by its cluster positions).
+  AVERAGE-BANDWIDTH is the mean of 8 entries sampled once AVPlayer holds its
+  reservoir, kept per item across launches and declared from the item's next
+  master; until then it equals BANDWIDTH. Under the line this replaced (a 4K PQ
+  copy declaring the main variant's peak, no AVERAGE-BANDWIDTH) every resumed 4K
+  HDR session on tvOS failed with -16042 once it loaded the I-frame init; which
+  attribute tvOS objected to is not isolated (2026-10-06/07).
+- Measured 2026-10-05: tvOS AVKit draws thumbnails over the scrub bar from it;
+  iOS has no thumbnail and paints the scrub target into the video itself, from
+  the same fragments (126 fetched in one scrubbing run). Jellyfin's JPEG
+  trickplay is no input: `CODECS="jpeg"` is ignored and `"mjpg"` stalls AVPlayer.
+
+## The retry ladder
+
+Three rungs, in order: **direct, engine, server.**
+
+Inside the engine lane sits a ladder of its own: the master carries the device's
+stream copy and the server-fed rungs together, and AVPlayer moves between them
+without a reload (`memories/CLAUDE-slipstream.md`). The server lane below is
+reached only when the engine lane as a whole cannot hold the item.
+
+A failed direct play tries the engine before the server. AVPlayer refusing a
+file whose codec and container both passed inspection usually means a container
+fault, and rewrapping is exactly what fixes that; going straight to the server
+re-encoded a whole film to work around a broken wrapper. `directPlayFailedRef`
+carries that state, and it appears in **both** the remux condition and the
+transcode condition; without the second, a file the engine declines falls back
+to direct play and fails identically forever.
+
+## The server transcoding setting
+
+Settings > Streaming > Server transcoding, stored per device as
+`serverTranscoding` in `services/uiPreferences.ts`, read through the two
+predicates in `services/transcodePolicy.ts`. The server's own per-user
+permission (`SupportsTranscoding`, which Jellyfin writes from
+`EnableVideoPlaybackTranscoding` for a video and `EnableAudioPlaybackTranscoding`
+for an audio item) caps every level; `services/jellyfin/transcodePermissions.ts`
+reads the same policy off `/Users/Me` so the setting page can say so out loud.
+
+| Level                  | Rungs for the link | Files the device cannot play | Live server rung                      | Convert and Download | Uncarriable audio supplier |
+| ---------------------- | ------------------ | ---------------------------- | ------------------------------------- | -------------------- | -------------------------- |
+| `linkOrFile` (default) | yes                | yes                          | yes                                   | yes                  | yes                        |
+| `fileOnly`             | no                 | yes                          | yes                                   | yes                  | yes                        |
+| `never`                | no                 | no: the item is unplayable   | no: error after the one engine reopen | hidden               | no: the item is unplayable |
+
+`fileOnly` is `linkRungsAllowed` false: `offeredTierRungs` declares no rung
+unless the session is a server-video gateway, so the master is the copy alone,
+the engine skips its startup link probe (`RemuxSession+LinkProbe`, empty
+ladder), no tier report arrives and `copyOnlyRef` stays false, so a read-bound
+sample never hands over (`handOverToServer`). A produce-bound stall still does:
+that is the device, not the link. `never` is `serverTranscodeAllowed` false:
+`serverDenied` in `useVideoPlayback`, `canRemuxLocally` declining an
+uncarriable track, `openLiveServerRung` answering null, `planLiveErrorRecovery`
+and `planLaneGates` taking `serverTranscodingAllowed`, `predictPlaybackLane`
+reporting `"unplayable"` for the item panel and the download sheet.
+
+## Sessions survive a Metro reload until invalidate stops them
+
+Engine state is static (`LocalRemuxer.sessions`, the loopback server, its port),
+so a reload keeps it: only the JS runtime is replaced, and the `stopLocalRemux`
+calls in effect cleanups race the dying runtime and can be dropped. Each
+`LocalRemuxer` module instance records the tokens it started (`ownedTokens`)
+and its `invalidate()` override stops exactly those when the runtime is torn
+down (reload or host shutdown), so a newer runtime's sessions are untouched.
+The call chain is RCTHost `_reloadWithShouldRestartSurfaces` -> RCTInstance
+`invalidate` -> RCTTurboModuleManager `invalidate` -> the module, dispatched to
+the dying instance's threads while the new one boots; the per-instance token
+set, not timing, is what keeps the new run's sessions safe. This is RN's own
+cleanup hook (`RCTInvalidating`; RCTNetworking cancels its tasks the same way),
+not a dev-only shim. Release never reloads, so there it only runs at shutdown. The "footprint N MB" segment
+lines print whole-process `phys_footprint` (`RemuxSession+Pipeline.swift`),
+the number to watch across reloads.
+
+## Provider connection limits
+
+Every live read, and every file read that names its provider (`liveOriginKey`), takes a lease on
+that provider's budget in `LiveConnectionBroker.swift` before it opens. Reads rank
+`sweep < preview < ring < playback`; a higher one revokes the lowest lower one on a full budget
+and waits for its connection to close. A budget is set (`setOriginConnectionBudget`; Tomo's
+Connection limits screen sets one per tuner playlist and `services/liveConnectionLimits.ts` hands
+it to every host and port that playlist reads, the lowest limit winning where playlists share one) or
+learned, in memory only, from the provider itself: a refusal or a kick while
+this device holds other reads sets it to what was held. Nothing stores a learned budget: it only
+ever goes down (`learnLocked`), so a stored one could never be corrected.
+
+A refused open (`httpOpenErrors` in `RemuxSession+Pipeline.swift`: every HTTP tag but 404) makes
+the lower reads yield and retries with backoff 0.5, 1, 2, 4 s, then once a second while the
+provider had a close in the last 15 s (it counts a closed read until it next writes to it, up to
+10 s on a stalling Dispatcharr feed); a 4xx (`limitErrors`, 429 has its own FFmpeg tag) also
+teaches the number unless a read on the provider closed in the last 15 s, a 5xx never does. A
+neighbour with nothing below it to revoke fails at once; playback waits out the playback it
+replaces. A preview takes nothing from anyone and holds a slot only while one stays spare beside
+it for the sweep (`previewsWithoutSpareLocked`): a learned or set budget that leaves none ends it.
+The sweep's grab is a fight (`LiveFrameQueue.swift`): it waits for a slot, tries a refused open
+every second for its deadline, leaves an open the origin admitted to the origin (a 75 s silence
+guard aside: Dispatcharr holds an admitted client silent up to its 60 s client wait and counts
+a hung-up unserved client as a ghost for 50 s, so our cut never frees the slot) and, once served,
+has the deadline for its pictures and clip. The origin ending an unserved open (`ended`: EOF,
+invalid data, I/O error, reset) is the channel's own answer; the sampler strikes it (two make it
+down: read last, never first on focus, no preview) and brings no refused sibling back. A fight lost beside
+other reads calls `noteLostFight`, which ends the preview and teaches on a 4xx, unless the
+provider has shown room beside a preview (`noteOpened`: a read admitted while an admitted preview
+was held) and only one channel has lost since (its own 403 or 503). A provider that never showed
+room stops previews at the second channel lost beside one. Tests: `LiveConnectionBrokerTests`
+against `scripts/demo-livetv/relay.py` with `RELAY_CAP_STATUS` 403, 429, 503 and 404,
+`RELAY_RELEASE_LAG_MS` and `RELAY_HOLD_MS` (admitted, silent, then closed). Issue 104 was a 429
+answered by a one-connection provider's server.
+
+## Rules of engagement
+
+1. `ios/` and `tvos/` are generated and gitignored. Engine edits go in
+   `packages/tomo-engine/ios/`, Tomo-only native edits in `native/ios/`, and every one needs `npm run prebuild:tv`, which is Keiver's
+   command to run, never Claude's.
+2. Verify codec availability with `npm run probe:codecs`, never from memory and
+   never from `nm`.
+3. Every coverage change gets a fixture whose manifest entry flips from
+   `transcode` to `localRemux`. That diff is the proof, and it is the only proof
+   that distinguishes "the lane works" from "the lane compiles".
+4. Jellyfin's stream `Index` is an identity (URLs, `sub<N>`/`pgs<N>` routes, reports), never a
+   file position: 12.0 lists sidecars first and renumbers (jellyfin 19b756a507). The engine finds a
+   track by `source` (nth of its type, count, FFmpeg codec name; `sourcePosition` in
+   `services/jellyfin/audioTracks.ts`) and refuses a mismatch. Fixture: T104.

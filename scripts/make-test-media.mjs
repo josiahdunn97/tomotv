@@ -1,0 +1,1526 @@
+#!/usr/bin/env node
+/**
+ * Test media generator for the playback regression suite.
+ *
+ * Rebuilds the surround/lossless test set from nothing, so a lost media folder
+ * is recoverable instead of fatal. Three kinds of media, for three reasons:
+ *
+ *   1. SYNTHETIC (generated here). Every channel carries a distinct tone and the
+ *      video burns in a legend naming the format and layout, so a channel swap,
+ *      a downmix or a dropped LFE is measurable on a scope and audible in a
+ *      room. Deterministic, which is what makes hash baselines possible. This is
+ *      the audio analogue of T44's burned-in clock.
+ *   2. REAL ENCODER OUTPUT (downloaded from samples.ffmpeg.org, the FFmpeg/FATE
+ *      corpus). Synthetic files cannot reproduce a disc-authentic layered TrueHD
+ *      stream or a DTS core + MA extension, because ffmpeg's truehd/dca encoders
+ *      are experimental and core-only respectively.
+ *   3. REAL ATMOS (downloaded from Apple's own HLS example stream). E-AC-3 JOC
+ *      has no free encoder. Apple's advanced example carries a genuine JOC
+ *      rendition, which doubles as a correctness oracle: it is exactly the
+ *      format the engine is trying to produce, authored by Apple.
+ *
+ * Video items go to ~/Movies/development-videos because audio-only items never
+ * reach the remux engine (useVideoPlayback gates local remux on !audioOnly), so
+ * every surround soundtrack is muxed with a video track. Audio-only lossless
+ * items go to ~/Music/Development Surround to exercise the audio player path.
+ *
+ * Generation uses Jellyfin's bundled ffmpeg, not Homebrew's: it carries the
+ * ac3/eac3/truehd/dca/flac/alac encoders this needs. Same reason the T44 Theora
+ * file is generated with it.
+ *
+ * Usage:
+ *   node scripts/make-test-media.mjs              build what is missing
+ *   node scripts/make-test-media.mjs --force      rebuild everything
+ *   node scripts/make-test-media.mjs --no-download   synthetic only, no network
+ *   node scripts/make-test-media.mjs --only T60,T63  subset
+ *   node scripts/make-test-media.mjs --bench         the transcode bench ladder (B01-B09)
+ *   node scripts/make-test-media.mjs --with-library  register the fixture
+ *                                                    libraries in Jellyfin
+ *
+ * The library step is opt-in, not opt-out. It mutates a real server, and this
+ * script runs against whatever .env.playback-test points at, which is somebody's
+ * personal Jellyfin, not a throwaway. It has already cost one: an earlier version
+ * created a second library over a path that already had one, leaving duplicate
+ * libraries the owner then had to untangle by hand.
+ *
+ * Requires: Jellyfin.app installed (for its ffmpeg), and the same
+ * .env.playback-test the regression driver uses for the library step.
+ */
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { ensureLibrary as ensureFixtureLibrary, jf as jellyfinFetch, loadEnv as loadEnvFile } from "./lib/jellyfin-library.mjs";
+
+const exec = promisify(execFile);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ENV_PATH = path.join(ROOT, ".env.playback-test");
+const SOURCES_PATH = path.join(ROOT, "test", "playback", "media-sources.json");
+
+// Lowercase and hyphenated, and NOT "Development Videos": that name belonged to a
+// second fixture directory whose copies of T07/T08/T11 differed in duration from
+// these, so a title resolved to either file at random. Both were merged here.
+const VIDEO_DIR = path.join(os.homedir(), "Movies", "development-videos");
+const SURROUND_DIR = path.join(os.homedir(), "Music", "Development Surround");
+const AUDIO_DIR = path.join(os.homedir(), "Music", "Development Audio");
+const CACHE_DIR = path.join(os.homedir(), "Movies", ".tomotv-media-cache");
+
+const FFMPEG = "/Applications/Jellyfin.app/Contents/MacOS/ffmpeg";
+const FFPROBE = "/Applications/Jellyfin.app/Contents/MacOS/ffprobe";
+const FONT = "/System/Library/Fonts/Helvetica.ttc";
+const POSTER_SOURCE = path.join(ROOT, "assets", "brand", "tomo-tv.png");
+
+const DURATION = 60;
+const SIZE = "1280x720";
+/** Discs and streaming both ship 48kHz; 44.1 would not be representative. */
+const RATE = 48000;
+/** testsrc2 is high-detail noise, so it needs a cap or every item lands past 20MB. */
+const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p"];
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => {
+  const i = args.indexOf(name);
+  return i >= 0 && args[i + 1] ? args[i + 1] : null;
+};
+const FORCE = flag("--force");
+const ONLY =
+  opt("--only")
+    ?.split(",")
+    .map((s) => s.trim().toUpperCase()) ?? null;
+const wanted = (id) => !ONLY || ONLY.includes(id);
+
+function fail(msg) {
+  console.error(`\n✗ ${msg}`);
+  process.exit(1);
+}
+
+// ---------- channel tones ----------
+
+/**
+ * One frequency per channel. Spread far enough apart that a spectrum view
+ * identifies each channel unambiguously, with the LFE down at 60Hz.
+ *
+ * Labels are FFmpeg channel names and are load-bearing: every input here is
+ * MONO, and a mono input's channel is FC, so `join` left to its own devices
+ * name-matches the first input to FC and fills the rest in order — which put
+ * 200Hz in the centre and shifted everything else. The explicit `map` below is
+ * what keeps each tone in its intended channel. Verified by FFT, not assumed.
+ *
+ * In a filter graph "5.1" is the BACK variant, so the surround channels are named
+ * BL/BR here. AC-3 draws no distinction between back and side, so the same file
+ * decodes back as 5.1(side) — same channel order, different label. The check
+ * below is index-based for exactly that reason.
+ */
+const TONES = {
+  5.1: [
+    { hz: 200, label: "FL" },
+    { hz: 300, label: "FR" },
+    { hz: 400, label: "FC" },
+    { hz: 60, label: "LFE" },
+    { hz: 700, label: "BL" },
+    { hz: 900, label: "BR" },
+  ],
+  7.1: [
+    { hz: 200, label: "FL" },
+    { hz: 300, label: "FR" },
+    { hz: 400, label: "FC" },
+    { hz: 60, label: "LFE" },
+    { hz: 700, label: "BL" },
+    { hz: 900, label: "BR" },
+    { hz: 1200, label: "SL" },
+    { hz: 1500, label: "SR" },
+  ],
+  stereo: [
+    { hz: 300, label: "FL" },
+    { hz: 500, label: "FR" },
+  ],
+};
+
+/** Explicit input-to-channel mapping for `join`; see the note on TONES. */
+const joinFilter = (layout) => {
+  const tones = TONES[layout];
+  const map = tones.map((t, i) => `${i}.0-${t.label}`).join("|");
+  return `join=inputs=${tones.length}:channel_layout=${layout}:map=${map}`;
+};
+
+/** drawtext is fed only spaces and alphanumerics, so nothing needs escaping. */
+function legend(line1, line2) {
+  const draw = (text, y) => `drawtext=fontfile=${FONT}:text='${text}':fontsize=44:fontcolor=white:box=1:boxcolor=black@0.75:boxborderw=14:x=(w-text_w)/2:y=${y}`;
+  return `${draw(line1, 48)},${draw(line2, 130)}`;
+}
+
+/**
+ * Build the ffmpeg argv for one synthetic item: N sine inputs joined into the
+ * target layout, plus a testsrc2 video carrying the legend.
+ */
+function synthArgs({ layout, codecArgs, out, title }) {
+  const tones = TONES[layout];
+  const inputs = [];
+  for (const t of tones) inputs.push("-f", "lavfi", "-i", `sine=frequency=${t.hz}:duration=${DURATION}:sample_rate=${RATE}`);
+  inputs.push("-f", "lavfi", "-i", `testsrc2=size=${SIZE}:rate=24:duration=${DURATION}`);
+
+  const videoIndex = tones.length;
+  const audioLabels = tones.map((_, i) => `[${i}:a]`).join("");
+  const toneLine = tones.map((t) => `${t.label}${t.hz}`).join("  ");
+  const filter = `${audioLabels}${joinFilter(layout)}[a];[${videoIndex}:v]${legend(title, toneLine)}[v]`;
+
+  return ["-y", ...inputs, "-filter_complex", filter, "-map", "[v]", "-map", "[a]", ...X264, ...codecArgs, out];
+}
+
+// ---------- the matrix ----------
+
+/**
+ * Video items. `mode` is the lane the app is expected to choose, recorded here
+ * so the manifest entries can be written from this table rather than by hand.
+ */
+const SYNTHETIC = [
+  { id: "T60", title: "T60 REMUX AC3 5.1", layout: "5.1", codecArgs: ["-c:a", "ac3", "-b:a", "640k"] },
+  { id: "T61", title: "T61 REMUX EAC3 5.1", layout: "5.1", codecArgs: ["-c:a", "eac3", "-b:a", "768k"] },
+  // FFmpeg's eac3 encoder tops out at 5.1, so E-AC-3 7.1 cannot be synthesised;
+  // T80 (real 7_pt_1.eac3) covers that. FLAC reaches 8 channels, so it carries
+  // the 8-channel path here — which is also the lossless path A2 cares about.
+  { id: "T62", title: "T62 REMUX FLAC 7.1 24bit", layout: "7.1", codecArgs: ["-c:a", "flac", "-sample_fmt", "s32"] },
+  { id: "T63", title: "T63 REMUX TrueHD 5.1", layout: "5.1", codecArgs: ["-c:a", "truehd", "-strict", "-2"] },
+  { id: "T64", title: "T64 REMUX DTS 5.1", layout: "5.1", codecArgs: ["-c:a", "dca", "-strict", "-2", "-ar", "48000"] },
+  { id: "T65", title: "T65 REMUX FLAC 5.1 24bit", layout: "5.1", codecArgs: ["-c:a", "flac", "-sample_fmt", "s32"] },
+  { id: "T66", title: "T66 REMUX ALAC 5.1 24bit", layout: "5.1", codecArgs: ["-c:a", "alac", "-sample_fmt", "s32p"] },
+  { id: "T67", title: "T67 REMUX PCM 5.1 24bit", layout: "5.1", codecArgs: ["-c:a", "pcm_s24le"] },
+  { id: "T68", title: "T68 REMUX Opus 5.1", layout: "5.1", codecArgs: ["-c:a", "libopus", "-mapping_family", "1", "-b:a", "384k"] },
+  { id: "T69", title: "T69 REMUX Vorbis 5.1", layout: "5.1", codecArgs: ["-c:a", "libvorbis", "-q:a", "6"] },
+];
+
+/** Audio-only twins: these exercise the direct/audio-player path, not the engine. */
+const SYNTHETIC_AUDIO = [
+  { id: "T70", title: "T70 DIRECT audio FLAC 5.1 24bit", ext: "flac", layout: "5.1", codecArgs: ["-c:a", "flac", "-sample_fmt", "s32"] },
+  { id: "T71", title: "T71 DIRECT audio ALAC 5.1 24bit", ext: "m4a", layout: "5.1", codecArgs: ["-c:a", "alac", "-sample_fmt", "s32p"] },
+  { id: "T72", title: "T72 DIRECT audio PCM 5.1 24bit", ext: "wav", layout: "5.1", codecArgs: ["-c:a", "pcm_s24le"] },
+  { id: "T73", title: "T73 DIRECT audio FLAC stereo 24bit", ext: "flac", layout: "stereo", codecArgs: ["-c:a", "flac", "-sample_fmt", "s32"] },
+];
+
+/**
+ * Engine coverage fixtures: one per decision the engine gained when libswscale
+ * was vendored and the allowlists were opened up.
+ *
+ * Each exists to make a single lane observable. Every one of these was a server
+ * transcode before, so its manifest entry flipping from `transcode` to
+ * `localRemux` is the proof the lane works.
+ *
+ * Pixel format is the point for most of them: ProRes decodes 4:2:2 10-bit,
+ * MJPEG full-range 4:2:2, FFV1 and HuffYUV whatever they were fed. None could
+ * reach h264_videotoolbox before, which takes 8-bit yuv420p/nv12 and nothing
+ * else, and there was no scaler to convert with.
+ */
+const COVERAGE = [
+  {
+    id: "T32",
+    title: "T32 DEVTC ProRes 422",
+    ext: "mov",
+    video: ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],
+    audio: ["-c:a", "aac", "-b:a", "192k"],
+  },
+  {
+    id: "T33",
+    title: "T33 DEVTC MJPEG 422",
+    ext: "avi",
+    video: ["-c:v", "mjpeg", "-pix_fmt", "yuvj422p", "-q:v", "4"],
+    audio: ["-c:a", "pcm_s16le"],
+  },
+  {
+    id: "T34",
+    title: "T34 DEVTC FFV1 lossless",
+    ext: "mkv",
+    video: ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv422p"],
+    audio: ["-c:a", "flac"],
+  },
+  {
+    id: "T35",
+    title: "T35 DEVTC HuffYUV",
+    ext: "avi",
+    video: ["-c:v", "huffyuv", "-pix_fmt", "yuv422p"],
+    audio: ["-c:a", "pcm_s16le"],
+  },
+  {
+    // The 10-bit lane: hevc_videotoolbox with p010le instead of the old
+    // "bit depth over 8-bit" decline.
+    id: "T36",
+    title: "T36 DEVTC VP9 10bit",
+    ext: "webm",
+    video: ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p10le", "-b:v", "2M", "-deadline", "realtime", "-cpu-used", "8"],
+    audio: ["-c:a", "libopus", "-b:a", "128k"],
+  },
+  {
+    // Top-field-first, the shape of a DVD rip. Proves the deinterlace pass.
+    id: "T37",
+    title: "T37 DEVTC MPEG2 interlaced",
+    ext: "mpg",
+    video: ["-c:v", "mpeg2video", "-b:v", "4M", "-flags", "+ilme+ildct", "-top", "1", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a", "mp2", "-b:a", "192k"],
+  },
+  {
+    // The old-AVI shape exactly: MPEG-4 video the engine already transcoded,
+    // with ADPCM audio that used to send the whole file to the server anyway.
+    id: "T38",
+    title: "T38 DEVTC MPEG4 ADPCM",
+    ext: "avi",
+    video: ["-c:v", "mpeg4", "-vtag", "DX50", "-b:v", "1500k", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a", "adpcm_ima_wav", "-ar", "44100", "-ac", "2"],
+  },
+  {
+    // AV1 without hardware decode, which is every Apple TV. Used to go to the
+    // server on the strength of an unmeasured "dav1d is too slow" comment;
+    // measured at 681 fps (28.4x realtime) for 1080p, so it takes the software
+    // decode path like VP9. preset 8 keeps generation from taking all day.
+    id: "T92",
+    title: "T92 DEVTC AV1",
+    ext: "mp4",
+    video: ["-c:v", "libsvtav1", "-preset", "8", "-crf", "40", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a", "aac", "-b:a", "192k"],
+  },
+  {
+    id: "T93",
+    title: "T93 DEVTC DivX3",
+    ext: "avi",
+    video: ["-c:v", "msmpeg4", "-vtag", "DIV3", "-b:v", "1200k", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a", "mp3", "-b:a", "128k"],
+  },
+  {
+    // yuv411p. Geometry is fixed: DV NTSC is 720x480 at 29.97 or ffmpeg refuses.
+    id: "T94",
+    title: "T94 DEVTC DV NTSC 411",
+    ext: "avi",
+    size: "720x480",
+    fps: "30000/1001",
+    video: ["-c:v", "dvvideo", "-pix_fmt", "yuv411p"],
+    audio: ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2"],
+  },
+  {
+    // Decodes to rgb24. Small because the Cinepak encoder runs at ~0.3x realtime.
+    id: "T95",
+    title: "T95 DEVTC Cinepak",
+    ext: "avi",
+    size: "320x240",
+    video: ["-c:v", "cinepak"],
+    audio: ["-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"],
+  },
+  {
+    // Both tracks are carriable: AC-3 copies, WavPack decodes. The manifest
+    // asserts 2 renditions, one per track.
+    id: "T39",
+    title: "T39 REMUX mixed carriable audio",
+    ext: "mkv",
+    dualAudio: true,
+    video: ["-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a:0", "ac3", "-b:a:0", "448k", "-c:a:1", "wavpack"],
+  },
+];
+
+/**
+ * Transcode bench ladder (scripts/transcode-bench.mjs): real footage, the T40 8K Blender
+ * source scaled to each rung, so the on-device lane is measured on content rather than
+ * testsrc2 noise. Opt-in (`--bench` or `--only B..`): the 4K encodes take minutes each.
+ */
+const BENCH_SOURCE = path.join(VIDEO_DIR, "T40 SERVER VP9 8K gate-reject.webm");
+const BENCH_SECONDS = 30;
+const VP9 = (kbps, pixFmt) => ["-c:v", "libvpx-vp9", "-b:v", `${kbps}k`, "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1", "-pix_fmt", pixFmt];
+const AV1 = (pixFmt) => ["-c:v", "libsvtav1", "-preset", "8", "-crf", "35", "-pix_fmt", pixFmt];
+const AAC = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"];
+const BENCH = [
+  { id: "B01", title: "B01 BENCH VP9 1080p", ext: "webm", size: "1920x1080", video: VP9(6000, "yuv420p"), audio: ["-c:a", "copy"] },
+  { id: "B02", title: "B02 BENCH VP9 1440p", ext: "webm", size: "2560x1440", video: VP9(10000, "yuv420p"), audio: ["-c:a", "copy"] },
+  { id: "B03", title: "B03 BENCH VP9 2160p", ext: "webm", size: "3840x2160", video: VP9(18000, "yuv420p"), audio: ["-c:a", "copy"] },
+  { id: "B04", title: "B04 BENCH VP9 2160p 10bit", ext: "webm", size: "3840x2160", video: VP9(20000, "yuv420p10le"), audio: ["-c:a", "copy"] },
+  { id: "B05", title: "B05 BENCH AV1 1080p", ext: "mp4", size: "1920x1080", video: AV1("yuv420p"), audio: AAC },
+  { id: "B06", title: "B06 BENCH AV1 1440p", ext: "mp4", size: "2560x1440", video: AV1("yuv420p"), audio: AAC },
+  { id: "B07", title: "B07 BENCH AV1 2160p", ext: "mp4", size: "3840x2160", video: AV1("yuv420p"), audio: AAC },
+  { id: "B08", title: "B08 BENCH AV1 2160p 10bit", ext: "mp4", size: "3840x2160", video: AV1("yuv420p10le"), audio: AAC },
+  // The 24 fps source at 60 fps: 2.5x the pixel rate of B03, a file a device may fail the
+  // engine's pre-flight on (test/playback/README.md, "The engine decides by doing").
+  { id: "B12", title: "B12 BENCH VP9 2160p60", ext: "webm", size: "3840x2160", fps: 60, video: VP9(30000, "yuv420p"), audio: ["-c:a", "copy"] },
+  // Field-coded like a broadcast capture: the one rung that takes the bwdif pass.
+  {
+    id: "B09",
+    title: "B09 BENCH MPEG2 1080i",
+    ext: "mpg",
+    size: "1920x1080",
+    video: ["-c:v", "mpeg2video", "-b:v", "15M", "-flags", "+ilme+ildct", "-top", "1", "-pix_fmt", "yuv420p"],
+    audio: ["-c:a", "mp2", "-b:a", "192k", "-ac", "2"],
+  },
+];
+
+/**
+ * Audio-only coverage, built into the music library the audio lane resolves
+ * from. TTA is lossless music AVPlayer cannot open; it reaches the engine
+ * through the video-less session that used to be a hard "no video stream".
+ */
+const COVERAGE_AUDIO = [
+  // WMA in ASF, not TTA. The TTA *decoder* is in the build but the TTA
+  // *demuxer* is not, so a .tta file cannot be opened at all — checking the
+  // decoder list without checking the demuxer list is how the first attempt
+  // at this fixture was wrong. WMA satisfies all three: Jellyfin's ffmpeg
+  // encodes it, the asf demuxer is enabled, wma* decodes, and AVPlayer
+  // cannot open it.
+  { id: "T56", title: "T56 REMUX audio WMA", ext: "wma", codecArgs: ["-c:a", "wmav2", "-b:a", "192k"] },
+];
+
+/**
+ * Real encoder output. Bare elementary streams are muxed with a generated video
+ * track, since audio-only never reaches the engine. `container` items already
+ * carry video and are copied as-is.
+ */
+const SAMPLES_BASE = "https://samples.ffmpeg.org/A-codecs";
+const JELLYFIN_TEST_VIDEOS = "https://repo.jellyfin.org/test-videos";
+const DAV1D_TEST_DATA = "https://code.videolan.org/videolan/dav1d-test-data/-/raw/master";
+const DOWNLOADS = [
+  { id: "T80", title: "T80 REMUX EAC3 7.1 real", url: `${SAMPLES_BASE}/AC3/eac3/7_pt_1.eac3`, mux: true },
+  { id: "T81", title: "T81 REMUX EAC3 5.1 real", url: `${SAMPLES_BASE}/AC3/eac3/matrix2_english_5.1_640.eac3`, mux: true },
+  { id: "T82", title: "T82 REMUX AC3 5.1 real", url: `${SAMPLES_BASE}/AC3/monsters_inc_5.1_448.ac3`, mux: true },
+  { id: "T83", title: "T83 REMUX EAC3 channelcheck", url: `${SAMPLES_BASE}/AC3/eac3/channelcheck-ddplus_480.mp4`, container: "mkv" },
+  { id: "T84", title: "T84 REMUX EAC3 matroska", url: `${SAMPLES_BASE}/AC3/eac3/sample-eac3.mkv`, container: "mkv" },
+  { id: "T85", title: "T85 REMUX TrueHD real", url: `${SAMPLES_BASE}/TrueHD/vc1-with-truehd.m2ts`, container: "mkv" },
+  { id: "T86", title: "T86 REMUX DTS-HD MA real", url: `${SAMPLES_BASE}/DTS/bond_sample_dtshdma.m2ts`, container: "mkv" },
+  { id: "T87", title: "T87 REMUX DTS 5.1 real", url: `${SAMPLES_BASE}/DTS/lotr_5.1_768.dts`, mux: true },
+  // Real sample: no ffmpeg here has a Theora encoder. Video-only, ~10.5s.
+  // theora.ogg in the same directory is corrupt.
+  { id: "T96", title: "T96 DEVTC Theora real", url: "https://samples.ffmpeg.org/ogg/Theora/susie-exp.ogg", container: "mkv" },
+  // Typeset ASS: one 10s cue under \fade, \t, \frz and \fscx, plus the TTF it
+  // asks for as an attachment stream. Nothing synthetic reaches this shape.
+  { id: "T99", title: "T99 REMUX H264 ASS real", url: "https://samples.ffmpeg.org/sub/softrotor-fancy.mkv", container: "mkv", tagSubtitle: true },
+  // SSA v4.00 out of Aegisub (FFmpeg's own FATE suite): 35 cues, karaoke, \pos
+  // signs, and every line styled "*Default", the leading star SSA writes for a
+  // style it did not resolve.
+  { id: "T100", title: "T100 REMUX H264 SSA real", url: "http://fate-suite.ffmpeg.org/sub/a9-misc.ssa", subs: true, tagSubtitle: true },
+  // AV1 from Jellyfin's own test set (CC BY-SA 4.0): copied where the chip decodes AV1, re-encoded elsewhere.
+  { id: "T118", title: "T118 REMUX AV1 4K HDR10 real", url: `${JELLYFIN_TEST_VIDEOS}/HDR/HDR10/AV1/Test%20Jellyfin%204K%20AV1%20HDR10%2040M.mp4`, container: "mkv" },
+  { id: "T119", title: "T119 REMUX AV1 1080p 10bit real", url: `${JELLYFIN_TEST_VIDEOS}/SDR/AV1/Test%20Jellyfin%201080p%20AV1%2010bit%205M.mp4`, container: "mkv" },
+  // dav1d conformance streams, 10 frames each, repeated by stream copy to 20s. T120 is the
+  // ordinary 4:2:0 control at the same size; the others are the profiles a decoder may refuse.
+  { id: "T120", title: "T120 REMUX AV1 10bit 420 conformance", url: `${DAV1D_TEST_DATA}/10-bit/data/00000671.ivf`, container: "mkv", loop: 59 },
+  { id: "T121", title: "T121 REMUX AV1 10bit 444 conformance", url: `${DAV1D_TEST_DATA}/10-bit/data/00000730.ivf`, container: "mkv", loop: 59 },
+  { id: "T122", title: "T122 REMUX AV1 12bit 420 conformance", url: `${DAV1D_TEST_DATA}/12-bit/data/00000686.ivf`, container: "mkv", loop: 59 },
+  { id: "T123", title: "T123 REMUX AV1 12bit 444 conformance", url: `${DAV1D_TEST_DATA}/12-bit/data/00000700.ivf`, container: "mkv", loop: 59 },
+  { id: "T124", title: "T124 REMUX AV1 8bit RGB conformance", url: `${DAV1D_TEST_DATA}/8-bit/features/rgb.ivf`, container: "mkv", loop: 19 },
+  // libaom's monochrome vector: Main profile with no chroma planes.
+  { id: "T125", title: "T125 REMUX AV1 monochrome conformance", url: "https://storage.googleapis.com/aom-test-data/av1-1-b8-24-monochrome.ivf", container: "mkv", loop: 47 },
+  { id: "T126", title: "T126 REMUX AV1 8K HDR10 real", url: `${JELLYFIN_TEST_VIDEOS}/HDR/HDR10/AV1/Test%20Jellyfin%208K%20AV1%20HDR10%20100M.mp4`, container: "mkv" },
+];
+
+const APPLE_MASTER = "https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/main.m3u8";
+const ATMOS_ID = "T88";
+const ATMOS_TITLE = "T88 REMUX EAC3 JOC Atmos real";
+
+// ---------- helpers ----------
+
+function log(msg) {
+  console.log(msg);
+}
+
+function exists(p) {
+  return fs.existsSync(p);
+}
+
+async function ff(argv, label) {
+  try {
+    await exec(FFMPEG, argv, { maxBuffer: 64 * 1024 * 1024 });
+    return true;
+  } catch (e) {
+    const tail = String(e.stderr || e.message)
+      .trim()
+      .split("\n")
+      .slice(-4)
+      .join("\n    ");
+    console.warn(`  ✗ ${label}\n    ${tail}`);
+    return false;
+  }
+}
+
+/**
+ * Energy of one frequency in one sample buffer (Goertzel). Cheaper than an FFT
+ * and needs no dependency, which matters because this runs on every build.
+ */
+function goertzel(samples, stride, offset, freq, rate) {
+  const n = Math.floor((samples.length - offset) / stride);
+  const k = Math.round((n * freq) / rate);
+  const coeff = 2 * Math.cos((2 * Math.PI * k) / n);
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < n; i++) {
+    const s = samples[offset + i * stride] + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s;
+  }
+  return s2 * s2 + s1 * s1 - coeff * s1 * s2;
+}
+
+/**
+ * Decode a slice and confirm every channel carries the tone it is supposed to.
+ * The generator asserting its own output is the point: an early version of this
+ * script silently shifted every tone one channel over, because `join` name-matched
+ * the first mono input to FC. Nothing downstream would have noticed.
+ */
+async function verifyChannels(file, layout) {
+  const tones = TONES[layout];
+
+  // Channel count first. An encoder that cannot reach the requested layout
+  // downmixes silently (FFmpeg's eac3 tops out at 5.1), and reading the result
+  // at the wrong stride turns that into unreadable noise rather than a clear
+  // "produced 6 channels, wanted 8".
+  try {
+    const { stdout } = await exec(FFPROBE, ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0", file]);
+    const actual = parseInt(stdout.trim(), 10);
+    if (actual !== tones.length) return { ok: false, detail: `encoder produced ${actual} channels, wanted ${tones.length} (${layout})` };
+  } catch (e) {
+    return { ok: false, detail: `probe failed: ${e.message}` };
+  }
+
+  let raw;
+  try {
+    const { stdout } = await exec(FFMPEG, ["-v", "error", "-ss", "5", "-t", "3", "-i", file, "-map", "0:a", "-ar", String(RATE), "-f", "s16le", "-"], {
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: "buffer",
+    });
+    raw = stdout;
+  } catch (e) {
+    return {
+      ok: false,
+      detail: `decode failed: ${String(e.stderr || e.message)
+        .trim()
+        .split("\n")
+        .pop()}`,
+    };
+  }
+
+  const pcm = new Int16Array(raw.buffer, raw.byteOffset, Math.floor(raw.length / 2));
+  const ch = tones.length;
+  const wrong = [];
+  for (let c = 0; c < ch; c++) {
+    let best = null;
+    for (const t of tones) {
+      const power = goertzel(pcm, ch, c, t.hz, RATE);
+      if (!best || power > best.power) best = { hz: t.hz, power };
+    }
+    if (best.hz !== tones[c].hz) wrong.push(`${tones[c].label} carries ${best.hz}Hz, expected ${tones[c].hz}Hz`);
+  }
+  return wrong.length === 0 ? { ok: true } : { ok: false, detail: wrong.join("; ") };
+}
+
+/**
+ * curl rather than fetch: samples.ffmpeg.org is a slow 2008-era Apache and
+ * Node's undici gives up on the larger files with a bare "fetch failed".
+ * Downloads land in a .part file and are renamed only on success, so an
+ * interrupted run can never leave a truncated file that the next run mistakes
+ * for a complete one.
+ */
+async function download(url, dest) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const part = `${dest}.part`;
+  if (exists(part)) fs.rmSync(part);
+  await exec("curl", ["-fSL", "--retry", "5", "--retry-delay", "3", "--retry-all-errors", "--connect-timeout", "20", "--max-time", "1800", "-o", part, url], { maxBuffer: 4 * 1024 * 1024 });
+  fs.renameSync(part, dest);
+  return fs.statSync(dest).size;
+}
+
+function sha256(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function loadEnv() {
+  return loadEnvFile(ENV_PATH);
+}
+
+const jf = jellyfinFetch;
+
+// ---------- build steps ----------
+
+/** Collected non-fatal problems, reported together at the end. */
+const failures = [];
+
+/**
+ * Coverage fixtures. One testsrc2 video and one stereo tone, encoded into
+ * whatever codec and pixel format the item names — no channel legend, since
+ * what these prove is a decode path rather than a speaker layout.
+ */
+async function buildCoverage() {
+  const built = [];
+  for (const item of COVERAGE) {
+    if (!wanted(item.id)) continue;
+    const out = path.join(VIDEO_DIR, `${item.title}.${item.ext}`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    // A fixture may pin its own geometry; DV and Cinepak both need to.
+    const size = item.size ?? SIZE;
+    const rate = item.fps ?? 24;
+    const argv = [
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      `testsrc2=size=${size}:rate=${rate}:duration=${DURATION}`,
+      "-f",
+      "lavfi",
+      "-i",
+      `sine=frequency=440:duration=${DURATION}:sample_rate=${RATE}`,
+      "-vf",
+      legend(item.title, item.ext.toUpperCase()),
+      // Both tracks come from the one tone; what matters is the codec each is
+      // encoded to, not that they differ.
+      ...(item.dualAudio ? ["-map", "0:v", "-map", "1:a", "-map", "1:a"] : []),
+      ...item.video,
+      ...item.audio,
+      out,
+    ];
+    if (!(await ff(argv, item.title))) {
+      failures.push(`${item.id} encode failed`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+/** The bench ladder, only when asked for: every rung is a scaled re-encode of the 8K source. */
+async function buildBench() {
+  const built = [];
+  const items = BENCH.filter((item) => wanted(item.id) && (ONLY || flag("--bench")));
+  if (!items.length) return built;
+  if (!exists(BENCH_SOURCE)) {
+    failures.push(`bench source missing: ${BENCH_SOURCE} (a Blender open movie, not regenerable)`);
+    console.warn(`  ✗ bench source missing: ${BENCH_SOURCE}`);
+    return built;
+  }
+  for (const item of items) {
+    const out = path.join(VIDEO_DIR, `${item.title}.${item.ext}`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    const [w, h] = item.size.split("x");
+    const filters = `scale=${w}:${h}:flags=lanczos` + (item.fps ? `,fps=${item.fps}` : "");
+    const argv = ["-y", "-t", String(BENCH_SECONDS), "-i", BENCH_SOURCE, "-map", "0:v:0", "-map", "0:a:0", "-vf", filters, ...item.video, ...item.audio, out];
+    if (!(await ff(argv, item.title))) {
+      failures.push(`${item.id} encode failed`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+/**
+ * Slipstream drill items: 12 minutes of real motion (the bench source looped) at a steady
+ * ~6 Mbps H.264, long enough to hold a rung and climb back. T102 carries two audio tracks.
+ */
+const SLIPSTREAM_SECONDS = 720;
+const SLIPSTREAM = [
+  { id: "T101", title: "T101 REMUX H264 AC3 12min slipstream", tracks: [{ layout: "5.1", codec: ["-c:a:0", "ac3", "-b:a:0", "640k"], lang: "eng" }] },
+  {
+    id: "T102",
+    title: "T102 REMUX H264 AC3 AAC 12min slipstream",
+    tracks: [
+      { layout: "5.1", codec: ["-c:a:0", "ac3", "-b:a:0", "640k"], lang: "eng" },
+      { layout: "stereo", codec: ["-c:a:1", "aac", "-b:a:1", "192k"], lang: "spa" },
+    ],
+  },
+];
+const SLIPSTREAM_SUBS = ["eng", "spa", "fra"];
+
+function srtScript(seconds, lang) {
+  const stamp = (s) => `${String(Math.floor(s / 3600)).padStart(2, "0")}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")},000`;
+  const cues = [];
+  for (let s = 0, n = 1; s < seconds; s += 6, n++) cues.push(`${n}\n${stamp(s)} --> ${stamp(s + 5)}\n${lang} cue at ${s}s\n`);
+  return cues.join("\n");
+}
+
+/**
+ * A chaptered item, for the rule that the device makes a chapter picture only where the server
+ * has none. Six chapters written into the container; give the server's extraction one pass over
+ * it and the same file covers the other side of that rule.
+ */
+const CHAPTERS = { id: "T103", title: "T103 REMUX H264 AAC chapters", seconds: 180, count: 6 };
+
+function chapterMetadata(seconds, count) {
+  const step = Math.floor(seconds / count);
+  const blocks = [";FFMETADATA1"];
+  for (let i = 0; i < count; i++) {
+    blocks.push(`[CHAPTER]\nTIMEBASE=1/1000\nSTART=${i * step * 1000}\nEND=${(i + 1) * step * 1000 - 1}\ntitle=Chapter ${i + 1}`);
+  }
+  return `${blocks.join("\n")}\n`;
+}
+
+async function buildChapters() {
+  if (!wanted(CHAPTERS.id)) return [];
+  const out = path.join(VIDEO_DIR, `${CHAPTERS.title}.mkv`);
+  if (exists(out) && !FORCE) {
+    log(`  = ${CHAPTERS.title}`);
+    return [{ ...CHAPTERS, out }];
+  }
+  log(`  + ${CHAPTERS.title}`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const meta = path.join(CACHE_DIR, "chapters.ffmetadata");
+  fs.writeFileSync(meta, chapterMetadata(CHAPTERS.seconds, CHAPTERS.count));
+  // testsrc2 moves enough that each chapter's keyframe is a different picture.
+  const argv = [
+    "-y",
+    "-f",
+    "lavfi",
+    "-i",
+    `testsrc2=size=1920x1080:rate=24:duration=${CHAPTERS.seconds}`,
+    "-f",
+    "lavfi",
+    "-i",
+    `sine=frequency=440:duration=${CHAPTERS.seconds}:sample_rate=${RATE}`,
+    "-i",
+    meta,
+    "-map_metadata",
+    "2",
+    "-map",
+    "0:v",
+    "-map",
+    "1:a",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "20",
+    "-g",
+    "48",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-metadata:s:a:0",
+    "language=eng",
+    out,
+  ];
+  if (!(await ff(argv, CHAPTERS.title))) {
+    failures.push(`${CHAPTERS.id} encode failed`);
+    return [];
+  }
+  return [{ ...CHAPTERS, out }];
+}
+
+/**
+ * Issue 84's file: two audio codecs, two embedded text tracks and a sidecar. Jellyfin 12 lists the
+ * sidecar first and renumbers, so no embedded Index is a file position. Each track names itself.
+ */
+const SIDECAR_SHIFT = { id: "T104", title: "T104 REMUX H264 multi-audio sidecar", seconds: 120 };
+
+async function buildSidecarShift() {
+  if (!wanted(SIDECAR_SHIFT.id)) return [];
+  const out = path.join(VIDEO_DIR, `${SIDECAR_SHIFT.title}.mkv`);
+  if (exists(out) && !FORCE) {
+    log(`  = ${SIDECAR_SHIFT.title}`);
+    return [{ ...SIDECAR_SHIFT, out }];
+  }
+  log(`  + ${SIDECAR_SHIFT.title}`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const seconds = SIDECAR_SHIFT.seconds;
+  const script = (name, label) => {
+    const file = path.join(CACHE_DIR, `sidecar-shift-${name}.srt`);
+    fs.writeFileSync(file, srtScript(seconds, label));
+    return file;
+  };
+  const everyChannel = "pan=5.1(side)|FL=c0|FR=c0|FC=c0|LFE=c0|SL=c0|SR=c0";
+  const argv = [
+    "-y",
+    ...["-f", "lavfi", "-i", `testsrc2=size=1920x1080:rate=24:duration=${seconds}`],
+    ...["-f", "lavfi", "-i", `sine=frequency=330:duration=${seconds}:sample_rate=${RATE}`],
+    ...["-f", "lavfi", "-i", `sine=frequency=880:duration=${seconds}:sample_rate=${RATE}`],
+    ...["-i", script("rus", "EMBEDDED RUS"), "-i", script("eng", "EMBEDDED ENG")],
+    ...["-filter_complex", `[0:v]${legend("T104 issue 84", "rus 330Hz AC3   dan 880Hz DTS")}[v];[1:a]${everyChannel}[a0];[2:a]${everyChannel}[a1]`],
+    ...["-map", "[v]", "-map", "[a0]", "-map", "[a1]", "-map", "3:s", "-map", "4:s"],
+    ...["-c:v", "libx264", "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-b:v", "3M", "-maxrate", "4M", "-bufsize", "8M", "-g", "48"],
+    ...["-c:a:0", "ac3", "-b:a:0", "640k", "-c:a:1", "dca", "-strict", "-2", "-b:a:1", "1509k", "-c:s", "subrip"],
+    ...["-metadata:s:a:0", "language=rus", "-disposition:a:0", "default", "-metadata:s:a:1", "language=dan", "-disposition:a:1", "0"],
+    ...["-metadata:s:s:0", "language=rus", "-disposition:s:0", "0", "-metadata:s:s:1", "language=eng", "-disposition:s:1", "0"],
+    out,
+  ];
+  if (!(await ff(argv, SIDECAR_SHIFT.title))) {
+    failures.push(`${SIDECAR_SHIFT.id} encode failed`);
+    return [];
+  }
+  fs.writeFileSync(path.join(VIDEO_DIR, `${SIDECAR_SHIFT.title}.da.srt`), srtScript(seconds, "SIDECAR DAN"));
+  return [{ ...SIDECAR_SHIFT, out }];
+}
+
+/**
+ * Two English PGS tracks in one file: a forced one with two early images, then an SDH one with a cue
+ * every six seconds. FFmpeg has no PGS encoder, so the .sup streams are written here.
+ */
+const FORCED_SDH = { id: "T107", title: "T107 REMUX H264 PGS forced SDH", seconds: 180 };
+const PGS_CANVAS = { width: 1920, height: 1080 };
+const PGS_LABEL = { width: 800, height: 80 };
+
+function pgsSegment(seconds, type, payload) {
+  const ticks = Math.round(seconds * 90000);
+  const head = Buffer.alloc(13);
+  head.write("PG", 0, "ascii");
+  head.writeUInt32BE(ticks, 2);
+  head.writeUInt32BE(ticks, 6);
+  head.writeUInt8(type, 10);
+  head.writeUInt16BE(payload.length, 11);
+  return Buffer.concat([head, payload]);
+}
+
+/** PGS run-length coding of one row of palette indices, terminated by 00 00. */
+function pgsRow(row) {
+  const out = [];
+  for (let x = 0; x < row.length;) {
+    let run = 1;
+    while (x + run < row.length && row[x + run] === row[x] && run < 16383) run++;
+    const color = row[x];
+    if (color === 0) out.push(0, ...(run < 64 ? [run] : [0x40 | (run >> 8), run & 0xff]));
+    else if (run < 3) out.push(...Array(run).fill(color));
+    else out.push(0, ...(run < 64 ? [0x80 | run] : [0xc0 | (run >> 8), run & 0xff]), color);
+    x += run;
+  }
+  out.push(0, 0);
+  return out;
+}
+
+/** One display set: a label bitmap at (x, y) from `start`, erased at `end`. */
+function pgsCue({ start, end, x, y, pixels, forced, composition }) {
+  const u16 = (n) => [n >> 8, n & 0xff];
+  const window = Buffer.from([1, 0, ...u16(x), ...u16(y), ...u16(PGS_LABEL.width), ...u16(PGS_LABEL.height)]);
+  const pcs = (number, objects) =>
+    Buffer.from([
+      ...u16(PGS_CANVAS.width),
+      ...u16(PGS_CANVAS.height),
+      0x10,
+      ...u16(number),
+      objects ? 0x80 : 0x00,
+      0,
+      0,
+      objects,
+      ...(objects ? [0, 0, 0, forced ? 0x40 : 0, ...u16(x), ...u16(y)] : []),
+    ]);
+  const palette = Buffer.from([0, 0, 0, 16, 128, 128, 0, 1, 235, 128, 128, 255]);
+  const rows = [];
+  for (let row = 0; row < PGS_LABEL.height; row++) rows.push(...pgsRow([...pixels.subarray(row * PGS_LABEL.width, (row + 1) * PGS_LABEL.width)].map((v) => (v > 128 ? 1 : 0))));
+  const length = rows.length + 4;
+  const object = Buffer.from([0, 0, 0, 0xc0, length >> 16, (length >> 8) & 0xff, length & 0xff, ...u16(PGS_LABEL.width), ...u16(PGS_LABEL.height), ...rows]);
+  return Buffer.concat([
+    pgsSegment(start, 0x16, pcs(composition, 1)),
+    pgsSegment(start, 0x17, window),
+    pgsSegment(start, 0x14, palette),
+    pgsSegment(start, 0x15, object),
+    pgsSegment(start, 0x80, Buffer.alloc(0)),
+    pgsSegment(end, 0x16, pcs(composition + 1, 0)),
+    pgsSegment(end, 0x17, window),
+    pgsSegment(end, 0x80, Buffer.alloc(0)),
+  ]);
+}
+
+/** A label drawn by ffmpeg as 8-bit gray, one byte per pixel. */
+async function labelPixels(text) {
+  const { stdout } = await exec(
+    FFMPEG,
+    [
+      ...["-v", "error", "-f", "lavfi", "-i", `color=c=black:s=${PGS_LABEL.width}x${PGS_LABEL.height}:d=1`],
+      ...["-vf", `drawtext=fontfile=${FONT}:text='${text}':fontsize=56:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2`],
+      ...["-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1"],
+    ],
+    { encoding: "buffer", maxBuffer: 16 * 1024 * 1024 },
+  );
+  return stdout;
+}
+
+async function pgsTrack(file, cues, { y, forced }) {
+  const sets = [];
+  for (const [n, cue] of cues.entries()) {
+    sets.push(pgsCue({ ...cue, x: (PGS_CANVAS.width - PGS_LABEL.width) / 2, y, pixels: await labelPixels(cue.text), forced, composition: n * 2 }));
+  }
+  fs.writeFileSync(file, Buffer.concat(sets));
+}
+
+async function buildForcedSdh() {
+  if (!wanted(FORCED_SDH.id)) return [];
+  const out = path.join(VIDEO_DIR, `${FORCED_SDH.title}.mkv`);
+  if (exists(out) && !FORCE) {
+    log(`  = ${FORCED_SDH.title}`);
+    return [{ ...FORCED_SDH, out }];
+  }
+  log(`  + ${FORCED_SDH.title}`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const seconds = FORCED_SDH.seconds;
+  const forcedSup = path.join(CACHE_DIR, "forced-sdh-forced.sup");
+  const sdhSup = path.join(CACHE_DIR, "forced-sdh-sdh.sup");
+  await pgsTrack(
+    forcedSup,
+    [5, 15].map((start, n) => ({ start, end: start + 4, text: `FORCED ${n + 1}` })),
+    { y: 280, forced: true },
+  );
+  const sdhCues = Array.from({ length: Math.floor((seconds - 6) / 6) }, (_, n) => ({ start: 2 + n * 6, end: 6 + n * 6, text: `SDH ${String(n + 1).padStart(2, "0")}` }));
+  await pgsTrack(sdhSup, sdhCues, { y: 920, forced: false });
+  const argv = [
+    "-y",
+    ...["-f", "lavfi", "-i", `testsrc2=size=1920x1080:rate=24:duration=${seconds}`],
+    ...["-f", "lavfi", "-i", `sine=frequency=440:duration=${seconds}:sample_rate=${RATE}`],
+    ...["-f", "sup", "-i", forcedSup, "-f", "sup", "-i", sdhSup],
+    // Each .sup starts at its first cue; without -copyts that cue would be moved to zero.
+    "-copyts",
+    ...["-filter_complex", `[0:v]${legend("T107 forced + SDH PGS", "FORCED 5s 15s   SDH every 6s")}[v]`],
+    ...["-map", "[v]", "-map", "1:a", "-map", "2:s", "-map", "3:s"],
+    ...["-c:v", "libx264", "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-b:v", "3M", "-maxrate", "4M", "-bufsize", "8M", "-g", "48"],
+    ...["-c:a", "aac", "-b:a", "128k", "-c:s", "copy"],
+    ...["-metadata:s:a:0", "language=eng", "-metadata:s:s:0", "language=eng", "-disposition:s:0", "forced", "-metadata:s:s:1", "language=eng", "-disposition:s:1", "hearing_impaired"],
+    out,
+  ];
+  if (!(await ff(argv, FORCED_SDH.title))) {
+    failures.push(`${FORCED_SDH.id} encode failed`);
+    return [];
+  }
+  return [{ ...FORCED_SDH, out }];
+}
+
+async function buildSlipstream() {
+  const built = [];
+  const items = SLIPSTREAM.filter((item) => wanted(item.id));
+  if (!items.length) return built;
+  if (!exists(BENCH_SOURCE)) {
+    failures.push(`slipstream bed source missing: ${BENCH_SOURCE}`);
+    return built;
+  }
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const bed = path.join(CACHE_DIR, "slipstream-bed-1080.mkv");
+  if (
+    !exists(bed) &&
+    !(await ff(
+      ["-y", "-i", BENCH_SOURCE, "-map", "0:v:0", "-vf", "scale=1920:1080:flags=lanczos", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", bed],
+      "slipstream bed",
+    ))
+  ) {
+    failures.push("slipstream bed encode failed");
+    return built;
+  }
+  for (const item of items) {
+    const out = path.join(VIDEO_DIR, `${item.title}.mkv`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    const inputs = ["-stream_loop", String(Math.ceil(SLIPSTREAM_SECONDS / 60) - 1), "-i", bed];
+    const filters = [];
+    let next = 1;
+    item.tracks.forEach((track, t) => {
+      const tones = TONES[track.layout];
+      for (const tone of tones) inputs.push("-f", "lavfi", "-i", `sine=frequency=${tone.hz + t * 50}:duration=${SLIPSTREAM_SECONDS}:sample_rate=${RATE}`);
+      const labels = tones.map((_, i) => `[${next + i}:a]`).join("");
+      filters.push(`${labels}${joinFilter(track.layout)}[a${t}]`);
+      next += tones.length;
+    });
+    const subs = SLIPSTREAM_SUBS.map((lang) => {
+      const file = path.join(CACHE_DIR, `slipstream-${lang}.srt`);
+      fs.writeFileSync(file, srtScript(SLIPSTREAM_SECONDS, lang));
+      inputs.push("-i", file);
+      return next++;
+    });
+    const argv = [
+      "-y",
+      ...inputs,
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "0:v",
+      ...item.tracks.flatMap((_, t) => ["-map", `[a${t}]`]),
+      ...subs.flatMap((index) => ["-map", `${index}:s`]),
+      "-t",
+      String(SLIPSTREAM_SECONDS),
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-b:v",
+      "6M",
+      "-maxrate",
+      "6M",
+      "-bufsize",
+      "12M",
+      "-g",
+      "48",
+      "-keyint_min",
+      "48",
+      "-sc_threshold",
+      "0",
+      "-pix_fmt",
+      "yuv420p",
+      ...item.tracks.flatMap((track) => track.codec),
+      ...item.tracks.flatMap((track, t) => [`-metadata:s:a:${t}`, `language=${track.lang}`]),
+      "-c:s",
+      "srt",
+      ...SLIPSTREAM_SUBS.flatMap((lang, i) => [`-metadata:s:s:${i}`, `language=${lang}`]),
+      out,
+    ];
+    if (!(await ff(argv, item.title))) {
+      failures.push(`${item.id} encode failed`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+/** Audio-only coverage, into the music library rather than the video one. */
+async function buildCoverageAudio() {
+  const built = [];
+  for (const item of COVERAGE_AUDIO) {
+    if (!wanted(item.id)) continue;
+    const out = path.join(SURROUND_DIR, `${item.title}.${item.ext}`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    const argv = ["-y", "-f", "lavfi", "-i", `sine=frequency=440:duration=${DURATION}:sample_rate=${RATE}`, "-ac", "2", ...item.codecArgs, out];
+    if (!(await ff(argv, item.title))) {
+      failures.push(`${item.id} encode failed`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+async function buildSynthetic() {
+  const built = [];
+  for (const item of SYNTHETIC) {
+    if (!wanted(item.id)) continue;
+    const out = path.join(VIDEO_DIR, `${item.title}.mkv`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    if (!(await ff(synthArgs({ ...item, out }), item.title))) continue;
+    const check = await verifyChannels(out, item.layout);
+    if (!check.ok) {
+      console.warn(`  ✗ ${item.id} channel check: ${check.detail}`);
+      failures.push(`${item.id} ${check.detail}`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+async function buildSyntheticAudio() {
+  const built = [];
+  for (const item of SYNTHETIC_AUDIO) {
+    if (!wanted(item.id)) continue;
+    const out = path.join(SURROUND_DIR, `${item.title}.${item.ext}`);
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    const tones = TONES[item.layout];
+    const inputs = [];
+    for (const t of tones) inputs.push("-f", "lavfi", "-i", `sine=frequency=${t.hz}:duration=${DURATION}:sample_rate=${RATE}`);
+    const argv = ["-y", ...inputs, "-filter_complex", `${tones.map((_, i) => `[${i}:a]`).join("")}${joinFilter(item.layout)}[a]`, "-map", "[a]", ...item.codecArgs, out];
+    if (!(await ff(argv, item.title))) continue;
+    const check = await verifyChannels(out, item.layout);
+    if (!check.ok) {
+      console.warn(`  ✗ ${item.id} channel check: ${check.detail}`);
+      failures.push(`${item.id} ${check.detail}`);
+      continue;
+    }
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+const JELLYFIN_ELRC = "https://raw.githubusercontent.com/jellyfin/jellyfin/master/tests/Jellyfin.Providers.Tests/Test%20Data/Lyrics/Fleetwood%20Mac%20-%20Rumors.elrc";
+const LRCLIB_ENTRY = "https://lrclib.net/api/get/37021207";
+
+/**
+ * Songs that exist for their lyrics sidecar: word-level, line-synced and plain. The audio is
+ * T73's tone, as long as the lyrics run. The sidecars are fetched when this runs, Jellyfin's own
+ * parser fixture and one LRCLIB entry, so no lyric text lives in this repo.
+ */
+const fetched = (url) => fetch(url, { signal: AbortSignal.timeout(60000) });
+const LYRIC_ITEMS = [
+  { id: "T113", title: "T113 DIRECT audio lyrics word-level", seconds: 240, sidecar: "elrc", text: async () => (await fetched(JELLYFIN_ELRC)).text() },
+  { id: "T114", title: "T114 DIRECT audio lyrics line-synced", seconds: 100, sidecar: "lrc", text: async () => (await (await fetched(LRCLIB_ENTRY)).json()).syncedLyrics },
+  { id: "T115", title: "T115 DIRECT audio lyrics unsynced", seconds: 100, sidecar: "txt", text: async () => (await (await fetched(LRCLIB_ENTRY)).json()).plainLyrics },
+  // No sidecar: the song lyrics are uploaded to through the server's API.
+  { id: "T117", title: "T117 DIRECT audio lyrics upload target", seconds: 60, sidecar: null },
+];
+
+/** A song with words and no lyrics anywhere: the system voice reading numbered lines. */
+const SPOKEN = { id: "T116", title: "T116 DIRECT audio spoken no lyrics", lines: 24 };
+
+async function buildSpoken() {
+  if (!wanted(SPOKEN.id)) return [];
+  fs.mkdirSync(AUDIO_DIR, { recursive: true });
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const out = path.join(AUDIO_DIR, `${SPOKEN.title}.flac`);
+  if (exists(out) && !FORCE) {
+    log(`  = ${SPOKEN.title}`);
+    return [{ ...SPOKEN, out }];
+  }
+  log(`  + ${SPOKEN.title}`);
+  const script = Array.from({ length: SPOKEN.lines }, (_, i) => `This is fixture line number ${i + 1}, sung by nobody at all.`).join(" [[slnc 900]] ");
+  const voiced = path.join(CACHE_DIR, "spoken.aiff");
+  try {
+    await exec("say", ["-o", voiced, script]);
+  } catch (e) {
+    failures.push(`${SPOKEN.id} say: ${e.message}`);
+    return [];
+  }
+  if (!(await ff(["-y", "-i", voiced, "-ac", "2", "-ar", String(RATE), "-c:a", "flac", out], SPOKEN.title))) return [];
+  return [{ ...SPOKEN, out }];
+}
+
+async function buildLyrics() {
+  const built = [];
+  fs.mkdirSync(AUDIO_DIR, { recursive: true });
+  for (const item of LYRIC_ITEMS) {
+    if (!wanted(item.id)) continue;
+    const out = path.join(AUDIO_DIR, `${item.title}.flac`);
+    const sidecar = item.sidecar ? path.join(AUDIO_DIR, `${item.title}.${item.sidecar}`) : null;
+    if (exists(out) && (!sidecar || exists(sidecar)) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+    log(`  + ${item.title}`);
+    const text = sidecar ? await item.text().catch(() => null) : null;
+    if (sidecar && (typeof text !== "string" || text.trim() === "")) {
+      console.warn(`  ✗ ${item.id} lyrics could not be fetched`);
+      failures.push(`${item.id} lyrics fetch`);
+      continue;
+    }
+    const tones = TONES.stereo;
+    const inputs = [];
+    for (const t of tones) inputs.push("-f", "lavfi", "-i", `sine=frequency=${t.hz}:duration=${item.seconds}:sample_rate=${RATE}`);
+    const argv = ["-y", ...inputs, "-filter_complex", `${tones.map((_, i) => `[${i}:a]`).join("")}${joinFilter("stereo")},volume=0.2[a]`, "-map", "[a]", "-c:a", "flac", "-sample_fmt", "s32", out];
+    if (!(await ff(argv, item.title))) continue;
+    if (sidecar) fs.writeFileSync(sidecar, text);
+    built.push({ ...item, out });
+  }
+  return built;
+}
+
+/** A silent video bed to carry an elementary audio stream into the video library. */
+async function videoBed(title, seconds) {
+  const bed = path.join(CACHE_DIR, `bed-${seconds}.mkv`);
+  if (exists(bed)) return bed;
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const ok = await ff(["-y", "-f", "lavfi", "-i", `testsrc2=size=${SIZE}:rate=24:duration=${seconds}`, ...X264, bed], `video bed ${seconds}s`);
+  return ok ? bed : null;
+}
+
+async function probeDuration(file) {
+  try {
+    const { stdout } = await exec(FFPROBE, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file]);
+    const d = parseFloat(stdout.trim());
+    return Number.isFinite(d) && d > 0 ? Math.min(Math.ceil(d), 120) : DURATION;
+  } catch {
+    return DURATION;
+  }
+}
+
+/**
+ * An untagged subtitle track is never selected: the app matches the viewer's
+ * remembered language, so a track with no language and no default disposition
+ * decodes and is never asked for. A subtitle fixture that nothing selects
+ * measures nothing.
+ */
+const SUBTITLE_TAGS = ["-metadata:s:s:0", "language=eng", "-disposition:s:0", "default"];
+
+/**
+ * A judgeable SSA script: every cue names the second it belongs to and what it
+ * should look like, against a picture carrying the same clock. A sparse
+ * fansub track cannot answer "is this cue right, or is the player wrong"; this
+ * one can, by eye, on a television, with no tooling.
+ *
+ * Real SSA v4.00 all the same: Aegisub's own header shape, CRLF line endings and
+ * the `*Default` style marker, which is what the converter has to survive.
+ */
+function ssaScript(seconds) {
+  const at = (t) => `0:00:${String(Math.floor(t)).padStart(2, "0")}.00`;
+  const stamp = (t) => `${String(Math.floor(t / 60))}:${String(t % 60).padStart(2, "0")}`;
+  // Each entry is what one 2s slot must show; the list repeats to fill the file.
+  const cases = [
+    (t) => `${stamp(t)} plain line`,
+    (t) => `${stamp(t)} {\\i1}inline italic{\\i0} back to plain`,
+    (t) => `${stamp(t)} {\\b1}inline bold{\\b0} back to plain`,
+    (t) => `${stamp(t)} first row\\Nsecond row`,
+    (t) => `${stamp(t)} markup 5 < 7 & 8 > 6`,
+    (t) => `${stamp(t)} {\\k30}ka{\\k30}ra{\\k30}o{\\k30}ke reads as one word`,
+    (t) => `${stamp(t)} {\\p1}m 0 0 l 60 0 60 60 0 60{\\p0}drawing dropped, this stays`,
+    (t) => `${stamp(t)} {\\pos(640,120)}positioned sign, text must survive`,
+  ];
+  const lines = [
+    "[Script Info]",
+    "; Generated by scripts/make-test-media.mjs for the playback suite",
+    "ScriptType: v4.00",
+    "Collisions: Normal",
+    "PlayResX: 1280",
+    "PlayResY: 720",
+    "",
+    "[V4 Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding",
+    "Style: Default,Arial,42,16777215,65535,0,0,0,0,1,2,0,2,30,30,28,0,0",
+    "Style: Emphasis,Arial,42,16777215,65535,0,0,-1,-1,1,2,0,2,30,30,28,0,0",
+    "Style: Sign,Arial,48,65535,65535,0,0,-1,0,1,2,0,8,30,30,28,0,0",
+    "",
+    "[Events]",
+    "Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+  ];
+  let slot = 0;
+  for (let t = 2; t + 2 <= seconds; t += 2, slot++) {
+    // Every fourth line runs on a style rather than an inline override, and the
+    // starred name is the one SSA writes for a style it did not resolve.
+    const style = slot % 4 === 3 ? "Emphasis" : slot % 8 === 7 ? "Sign" : "*Default";
+    const label = slot % 4 === 3 ? `${stamp(t)} styled bold italic, whole line` : cases[slot % cases.length](t);
+    lines.push(`Dialogue: Marked=0,${at(t)},${at(t + 1.8)},${style},,0000,0000,0000,,${label}`);
+  }
+  // One pair that overlaps a segment boundary, since HLS wants a straddling cue
+  // in both segments and nothing else here crosses one.
+  lines.push(`Dialogue: Marked=0,${at(seconds - 12)},${at(seconds - 6)},*Default,,0000,0000,0000,,overlap A, crosses a segment boundary`);
+  lines.push(`Dialogue: Marked=0,${at(seconds - 9)},${at(seconds - 3)},Emphasis,,0000,0000,0000,,overlap B, stacked with A`);
+  return lines.join("\r\n") + "\r\n";
+}
+
+/** The picture the cues are judged against: a running clock, nothing else. The
+ *  drawtext chain rides inside the lavfi input, since -vf is an output option. */
+function clockVideo(seconds) {
+  const draw = [
+    `drawtext=fontfile=${FONT}:text='%{pts\\:hms}':fontsize=96:fontcolor=white:x=(w-text_w)/2:y=180`,
+    `drawtext=fontfile=${FONT}:text='T100 SSA':fontsize=40:fontcolor=0x9999ff:x=(w-text_w)/2:y=300`,
+  ].join(",");
+  return ["-f", "lavfi", "-i", `color=c=0x101018:size=${SIZE}:rate=24:duration=${seconds},${draw}`];
+}
+
+async function buildDownloads(sources) {
+  const built = [];
+  for (const item of DOWNLOADS) {
+    if (!wanted(item.id)) continue;
+    const ext = item.mux ? path.extname(new URL(item.url).pathname) : path.extname(new URL(item.url).pathname);
+    const cached = path.join(CACHE_DIR, `${item.id}${ext}`);
+    const out = path.join(VIDEO_DIR, `${item.title}.mkv`);
+
+    if (exists(out) && !FORCE) {
+      log(`  = ${item.title}`);
+      built.push({ ...item, out });
+      continue;
+    }
+
+    if (!exists(cached) || FORCE) {
+      log(`  ↓ ${item.title}  ${item.url}`);
+      try {
+        const size = await download(item.url, cached);
+        log(`    ${(size / 1048576).toFixed(1)} MB`);
+      } catch (e) {
+        console.warn(`  ✗ ${item.id} download failed: ${e.message}`);
+        continue;
+      }
+    }
+    sources[item.id] = { url: item.url, sha256: sha256(cached), bytes: fs.statSync(cached).size };
+
+    let ok;
+    if (item.mux) {
+      const seconds = await probeDuration(cached);
+      const bed = await videoBed(item.title, seconds);
+      if (!bed) continue;
+      // Audio copied verbatim: the point of these files is real encoder output.
+      ok = await ff(["-y", "-i", bed, "-i", cached, "-map", "0:v", "-map", "1:a", "-c", "copy", "-shortest", out], item.title);
+    } else if (item.subs) {
+      const seconds = 60;
+      const script = path.join(CACHE_DIR, `${item.id}-generated.ssa`);
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      fs.writeFileSync(script, ssaScript(seconds));
+      // Track 0 is the judgeable script, default and eng, so it is the one that
+      // presents itself. Track 1 is the downloaded Aegisub file, kept because a
+      // real fansub header is what the style parser has to survive.
+      ok = await ff(
+        [
+          "-y",
+          ...clockVideo(seconds),
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=440:duration=${seconds}:sample_rate=${RATE}`,
+          "-i",
+          script,
+          "-i",
+          cached,
+          "-map",
+          "0:v",
+          "-map",
+          "1:a",
+          "-map",
+          "2:s",
+          "-map",
+          "3:s",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "30",
+          "-pix_fmt",
+          "yuv420p",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          "-c:s",
+          "copy",
+          ...SUBTITLE_TAGS,
+          "-metadata:s:a:0",
+          "language=eng",
+          "-metadata:s:s:1",
+          "language=spa",
+          "-disposition:s:1",
+          "0",
+          "-t",
+          String(seconds),
+          out,
+        ],
+        item.title,
+      );
+    } else {
+      // Already carries video; rewrap to Matroska without touching any stream.
+      const loop = item.loop ? ["-stream_loop", String(item.loop)] : [];
+      ok = await ff(["-y", ...loop, "-i", cached, "-map", "0", "-c", "copy", ...(item.tagSubtitle ? SUBTITLE_TAGS : []), out], item.title);
+    }
+    if (ok) {
+      log(`  + ${item.title}`);
+      built.push({ ...item, out });
+    }
+  }
+  return built;
+}
+
+async function buildAtmos(sources) {
+  if (!wanted(ATMOS_ID)) return [];
+  const out = path.join(VIDEO_DIR, `${ATMOS_TITLE}.mkv`);
+  if (exists(out) && !FORCE) {
+    log(`  = ${ATMOS_TITLE}`);
+    return [{ id: ATMOS_ID, title: ATMOS_TITLE, out }];
+  }
+
+  log(`  ↓ ${ATMOS_TITLE}  ${APPLE_MASTER}`);
+  const master = await (await fetch(APPLE_MASTER, { signal: AbortSignal.timeout(60000) })).text();
+
+  // The Atmos rendition is the audio group whose CHANNELS attribute carries the
+  // JOC marker; Apple signals Atmos there, not in the CODECS string.
+  const line = master.split("\n").find((l) => l.startsWith("#EXT-X-MEDIA:TYPE=AUDIO") && /CHANNELS="[^"]*JOC/.test(l));
+  if (!line) {
+    console.warn("  ✗ no JOC rendition found in Apple's master playlist");
+    return [];
+  }
+  const uri = line.match(/URI="([^"]+)"/)?.[1];
+  if (!uri) return [];
+
+  const base = APPLE_MASTER.slice(0, APPLE_MASTER.lastIndexOf("/") + 1);
+  const renditionUrl = new URL(uri, base).href;
+  const renditionBase = renditionUrl.slice(0, renditionUrl.lastIndexOf("/") + 1);
+  const playlist = await (await fetch(renditionUrl, { signal: AbortSignal.timeout(60000) })).text();
+
+  const initName = playlist.match(/#EXT-X-MAP:URI="([^"]+)"/)?.[1];
+  const segments = playlist
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  if (!initName || segments.length === 0) {
+    console.warn("  ✗ Apple rendition playlist had no init segment or media segments");
+    return [];
+  }
+
+  // init + segments concatenated is a valid fMP4; that is how fragmented MP4 works.
+  const joined = path.join(CACHE_DIR, `${ATMOS_ID}-joc.mp4`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const parts = [initName, ...segments];
+  const chunks = [];
+  for (const name of parts) {
+    const res = await fetch(new URL(name, renditionBase).href, { signal: AbortSignal.timeout(120000) });
+    if (!res.ok) {
+      console.warn(`  ✗ Atmos segment ${name} -> HTTP ${res.status}`);
+      return [];
+    }
+    chunks.push(Buffer.from(await res.arrayBuffer()));
+  }
+  fs.writeFileSync(joined, Buffer.concat(chunks));
+  log(`    ${(fs.statSync(joined).size / 1048576).toFixed(1)} MB, ${segments.length} segments`);
+  sources[ATMOS_ID] = { url: APPLE_MASTER, rendition: uri, sha256: sha256(joined), bytes: fs.statSync(joined).size };
+
+  const seconds = await probeDuration(joined);
+  const bed = await videoBed(ATMOS_TITLE, seconds);
+  if (!bed) return [];
+  // -c copy is the whole point: JOC is side data inside the E-AC-3 stream, so a
+  // byte copy preserves Atmos. Re-encoding here would silently destroy it.
+  const ok = await ff(["-y", "-i", bed, "-i", joined, "-map", "0:v", "-map", "1:a", "-c", "copy", "-shortest", out], ATMOS_TITLE);
+  if (!ok) return [];
+  log(`  + ${ATMOS_TITLE}`);
+  return [{ id: ATMOS_ID, title: ATMOS_TITLE, out }];
+}
+
+/**
+ * Attach the poster through the API rather than dropping a sibling
+ * `<name>-poster.jpg` in the media folder. The existing test items do it the
+ * file way and it costs them: in a library that accepts photos, every stray jpg
+ * also lands as its own item. Uploading to the item sets the same image with
+ * none of that clutter.
+ */
+async function applyPosters(env, items) {
+  if (!exists(POSTER_SOURCE)) {
+    console.warn(`  poster source missing: ${POSTER_SOURCE}`);
+    return;
+  }
+  const jpg = path.join(CACHE_DIR, "poster.jpg");
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  if (!exists(jpg) || FORCE) {
+    const made = await ff(["-y", "-i", POSTER_SOURCE, "-vf", "scale=600:900:force_original_aspect_ratio=decrease,pad=600:900:(ow-iw)/2:(oh-ih)/2:black", jpg], "poster");
+    if (!made) return;
+  }
+  const b64 = fs.readFileSync(jpg).toString("base64");
+
+  for (const item of items) {
+    let id;
+    try {
+      const found = await (await jf(env, `/Items?recursive=true&limit=5&searchTerm=${encodeURIComponent(item.title)}`)).json();
+      id = found.Items?.find((i) => i.Name === item.title)?.Id;
+    } catch {
+      /* fall through to the warning below */
+    }
+    if (!id) {
+      console.warn(`  poster skipped, item not indexed yet: ${item.title}`);
+      continue;
+    }
+    await jf(env, `/Items/${id}/Images/Primary`, {
+      method: "POST",
+      headers: { "Content-Type": "image/jpeg" },
+      body: b64,
+    }).catch((e) => console.warn(`  poster failed for ${item.id}: ${e.message}`));
+  }
+  log(`  ${items.length} posters applied`);
+}
+
+/** scripts/lib/jellyfin-library.mjs holds the guards; this binds the script's log and failures. */
+function ensureLibrary(env, name, collectionType, dir) {
+  return ensureFixtureLibrary(env, name, collectionType, dir, { log, failures });
+}
+
+// ---------- main ----------
+
+async function main() {
+  if (!exists(FFMPEG)) {
+    fail(
+      `Jellyfin's ffmpeg not found at ${FFMPEG}\n` +
+        `It carries the ac3/eac3/truehd/dca encoders this script needs; Homebrew's build does not.\n` +
+        `Install Jellyfin.app, or point FFMPEG at another full build.`,
+    );
+  }
+  fs.mkdirSync(VIDEO_DIR, { recursive: true });
+  fs.mkdirSync(SURROUND_DIR, { recursive: true });
+
+  const sources = exists(SOURCES_PATH) ? JSON.parse(fs.readFileSync(SOURCES_PATH, "utf8")) : {};
+
+  log("\nSynthetic video items");
+  const video = await buildSynthetic();
+
+  log("\nSynthetic audio-only items");
+  const audio = await buildSyntheticAudio();
+
+  log("\nEngine coverage items");
+  const coverage = await buildCoverage();
+  const coverageAudio = await buildCoverageAudio();
+
+  log("\nTranscode bench ladder");
+  const bench = await buildBench();
+
+  log("\nSlipstream drill items");
+  const slipstream = await buildSlipstream();
+
+  log("\nChaptered item");
+  const chaptered = await buildChapters();
+  sources.chaptered = chaptered.map((item) => ({ id: item.id, title: item.title }));
+
+  log("\nSidecar index shift item");
+  await buildSidecarShift();
+
+  log("\nForced + SDH PGS item");
+  await buildForcedSdh();
+
+  log("\nSpoken item");
+  const spoken = await buildSpoken();
+
+  let downloaded = [];
+  let atmos = [];
+  let lyrics = [];
+  if (!flag("--no-download")) {
+    log("\nLyric items (Jellyfin test data, LRCLIB)");
+    lyrics = await buildLyrics();
+    log("\nReal encoder output (samples.ffmpeg.org)");
+    downloaded = await buildDownloads(sources);
+    log("\nReal Atmos (Apple HLS example)");
+    atmos = await buildAtmos(sources);
+  }
+
+  fs.mkdirSync(path.dirname(SOURCES_PATH), { recursive: true });
+  fs.writeFileSync(SOURCES_PATH, `${JSON.stringify(sources, null, 2)}\n`);
+
+  if (flag("--with-library")) {
+    const env = loadEnv();
+    if (!env) {
+      console.warn(`\nSkipping library step: ${ENV_PATH} missing or incomplete.`);
+    } else {
+      log("\nJellyfin libraries");
+      // Each of these indexes empty if a wider library already covers its path:
+      // Jellyfin gives a nested library no items. The regression driver does not
+      // need them, it anchors on the directories themselves.
+      await ensureLibrary(env, "Development Videos", "movies", VIDEO_DIR);
+      await ensureLibrary(env, "Development Videos Audio", "music", AUDIO_DIR);
+      await ensureLibrary(env, "Development Surround", "music", SURROUND_DIR);
+      await jf(env, "/Library/Refresh", { method: "POST" }).catch((e) => console.warn(`  refresh failed: ${e.message}`));
+
+      // Posters attach to items, so they need the scan to have picked the files
+      // up first. Poll rather than sleep a fixed amount: a cold scan of the
+      // whole folder takes far longer than an incremental one.
+      const posterItems = [...video, ...coverage, ...bench, ...downloaded, ...atmos];
+      if (posterItems.length) {
+        log("\nPosters");
+        const probe = posterItems[posterItems.length - 1].title;
+        for (let i = 0; i < 30; i++) {
+          const found = await (await jf(env, `/Items?recursive=true&limit=5&searchTerm=${encodeURIComponent(probe)}`)).json().catch(() => ({}));
+          if (found.Items?.some((it) => it.Name === probe)) break;
+          await new Promise((r) => setTimeout(r, 4000));
+        }
+        await applyPosters(env, posterItems);
+      }
+    }
+  }
+
+  const total = video.length + audio.length + coverage.length + coverageAudio.length + bench.length + slipstream.length + downloaded.length + atmos.length + lyrics.length + spoken.length;
+  log(`\n${total} items ready`);
+  log(`  ${VIDEO_DIR}`);
+  log(`  ${SURROUND_DIR}`);
+  log(`  sources recorded in ${path.relative(ROOT, SOURCES_PATH)}`);
+  if (failures.length) {
+    console.warn(`\n${failures.length} item(s) did not build cleanly:`);
+    for (const f of failures) console.warn(`  ${f}`);
+    process.exitCode = 1;
+  }
+}
+
+main().catch((e) => fail(e.stack || e.message));

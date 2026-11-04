@@ -1,0 +1,398 @@
+# Slipstream: player-native adaptive streaming through the loopback gateway
+
+**Category:** On for every eligible item in 2.2.7, no flag. Read this before touching the master
+playlist, the link measurement or the variant cap.
+**Keywords:** slipstream, adaptive, ABR, gateway, variants, master playlist, quality
+
+The engine's loopback server is a full HLS gateway: ONE master playlist per
+session, declaring the device's own stream copy beside server-fed rungs, with
+audio and subtitles as rendition groups. AVPlayer's own ABR moves between them
+on a shared segment grid. The app never switches variants itself; it measures
+the link and tells AVPlayer what the link can carry.
+
+## Why this is ours to build (competitive facts, sourced 2026-08-18)
+
+- Jellyfin's server HLS is SINGLE-VARIANT (probed live; `DynamicHlsHelper.cs`).
+- No Jellyfin client adapts mid-stream: jellyfin-web measures once and pins
+  (source-read); jellyfin-androidtv's "Auto" is a startup speed test (#1569);
+  Swiftfin has no in-player quality control at all (#184, #769, #807 open).
+- Plex is the only home-media ecosystem with mid-stream adaptation, and it is
+  client-driven with session reloads.
+- Emby: startup auto-detection only.
+
+We are the only client architecture that IS the HLS server. That is the moat.
+
+## The master (RemuxSession+Playlists.swift)
+
+```
+#EXT-X-MEDIA TYPE=AUDIO GROUP-ID="audio"     one rendition per track, the engine's own bits
+#EXT-X-MEDIA TYPE=AUDIO GROUP-ID="audio-lo"  the same tracks at 96 kb/s AAC, up to stereo, from the server
+#EXT-X-MEDIA TYPE=SUBTITLES GROUP-ID="subs"  one rendition per text track, shared by every variant
+#EXT-X-STREAM-INF BANDWIDTH=<source> AUDIO="audio"    → media.m3u8   the on-device copy
+#EXT-X-STREAM-INF BANDWIDTH=<video+AAC> AUDIO="audio-lo" → media.m3u8
+#EXT-X-STREAM-INF BANDWIDTH=260000   AUDIO="audio-lo" → t0.m3u8      the server ladder, ascending
+...
+```
+
+- **The first variant listed is where AVPlayer starts**, and `startsOnFirstEligibleVariant` makes
+  that ours to decide (RNV patch; since tvOS 13 AVPlayer otherwise picks its own).
+  - The copy stays listed on thin links unless its producer is permanently unavailable.
+  - **A link that carries the copy never touches a server rung.** At `source * 1.2 <= measured link`
+    (`copyLeadsMargin`) the master names the copy alone: no rung, no `audio-lo`, no opening-rung or
+    `probeTier` transcode, and the tier report says `copy`. The server is the file host there. The
+    old 3x lead with the rungs listed beside the copy let AVPlayer drop to them: on a 200+ Mb/s
+    link T105 (91 Mb/s) opened on rung 6, fell to t1 at 15.9s and played at 23.5s.
+  - Under 1.2x a rung leads and the copy stays listed for AVPlayer to climb to.
+  - One video job and one audio job at open: `probeTier` proves the rung `chooseOpeningRung` picks,
+    and another rung's init is refused (503) while the opening segment is still coming, since a hold
+    plus a cold start would pass the 6 s AVPlayer allows a map request; the opening rung's own init
+    keeps its hold (`openingInitHoldSeconds`). Six 4K decodes at once on one serving MacBook ran at 0.5x to 1.4x each and
+    the late opening segment sent AVPlayer to segment 0 (measured 2026-10-16); one alone runs 1.4x
+    to 1.8x at start and 3x to 6x after.
+  - A rung the player left, idle 12 s with two segments served elsewhere since (`rungIdleSeconds`)
+    and no fetch of its own still running,
+    gets its own kill (`TierConfig.stopRequest`, the rung's play session) on the stop schedule; a
+    request for it again ends the repeats and opens it cold at the playhead. Before this, a left
+    rung ran two segments plus 60 s until Jellyfin's own timer (four orphans in one six-minute run).
+  - The rung that leads is the biggest whose segment lands in about a second: `bandwidth * 6 <=
+link` (`openingRungShare`, `chooseOpeningRung`), so t0 up to 2 Mb/s and 480p at 12 Mb/s.
+    Opening on the biggest rung that FIT cost 12.7s at 1.5 Mb/s. Opening everyone on t0 showed
+    144p for the first 42s of media at 12 Mb/s: AVPlayer read 0.69 Mb/s off the tiny segments and
+    fetched thirteen of them in 7s once the forward buffer opened. Off a 480p opening it reads
+    the wire (12 Mb/s) and reaches the copy at 75 to 79s (four runs, both fixtures).
+  - The leading rung's opening segment is fetched the moment the link is known, since its server
+    transcode is a second or two of spin-up. NEVER beside a copy that leads: at 30 Mb/s the 3 MB
+    of t5 took the link from the copy's first segment and AVPlayer opened on t0.
+- The initial producer decision remains measured (`decideCopy`). An unknown rate is slow.
+- A ladder master lists the full eligible ladder. Admission defers unaffordable routes with
+  HTTP 503 before sending media headers; a permanently unavailable copy returns 410. A copy-only
+  master never defers its copy (`copyOnlyMaster`): there is no other variant.
+- A copy-only session that starves on the link hands over to the server lane at the playhead
+  (`handOverToServer` takes a read-bound sample only under `copyOnlyRef`); a source lost under it
+  fails the session instead of handing over to rungs it never listed.
+- Rungs ride `audio-lo`; the copy has both `audio` and `audio-lo` associations: the ladder is the degraded
+  path, and 96 kb/s stereo is what a link in trouble can spare. Subtitles are
+  one group for every variant, so no switch moves the viewer's track.
+- `CLOSED-CAPTIONS` is mirrored across variants (RFC 8216 4.3.4.2): NONE
+  everywhere, or the `cc` group when the copied packets carry A/53 captions.
+- `CODECS` and audio `CHANNELS` describe the output streams, using native
+  declarations when available.
+- `SCORE` ranks the original above original video with server audio, then
+  the server-converted variants.
+- `BANDWIDTH` declares peak demand separately from `AVERAGE-BANDWIDTH`,
+  including the associated audio group. For seekable MKV/WebM and MOV/MP4
+  stream copies, source indexes provide a conservative whole-source bound;
+  produced segments provide measured output rates. The index bound is not
+  an exact measurement of every output segment. Paths without a usable
+  index use available segment measurements and metadata.
+
+## The ladder (services/localRemux.ts)
+
+`SLIPSTREAM_LADDER`, ascending: 140k and 240k at 256x144, 400k at 426x240,
+800k at 640x360, 1.5M at 854x480, 4M at 1280x720, 6M at 1920x1080. A rung is
+offered when `rung + 120k < primaryBandwidth * 0.85`: 96k for AAC plus a
+24k video-carrier allowance. Unknown primary bandwidth keeps the candidate
+rungs; server-only playback retains the full ladder if filtering removes
+every rung. Server video-transcoding permission is required. The 140k rung is
+sized for STARTUP, not for the steady state: AVPlayer buffers about two
+segments before the first frame, and on a 0.6 Mb/s link those bytes are the
+whole budget.
+
+Eligibility (`slipstreamEligible`): video and audio, including HDR and server-backed
+audio tracks, a server source (never a held file), not a live channel.
+HDR originals retain their range; server rungs declare SDR.
+
+## The source is let go when the rungs carry the session (RemuxSession+Lifecycle.swift)
+
+The pipeline waits for the link's verdict BEFORE it opens the input at all. An open stream nobody
+reads still fills the socket's buffers: it took 40% of the link out from under the probe (12 Mb/s
+read as 7.4), the copy was withheld, the repeat probe read 12, the app rebuilt, and the new
+session read low again, eight times in 90s. And a link that cannot carry the copy has no use for
+the source: `find_stream_info` alone pulled 573 KB, 5.8s of a 0.6 Mb/s first frame.
+`releaseSource` leaves it dormant, and the session runs as a gateway over the server's rungs, when
+the link is thin, the grid is adopted, and every audio track has a server rendition
+(`audioLoActive`). A subtitle never keeps the source open: a track inside the file pauses while
+the rungs carry the session (its image set on screen is closed at the read head, a text window
+ahead of the read answers without cues at once) and resumes with the copy.
+
+The pipeline thread stays alive without opening the source. When the wire carries the copy
+at `source * 1.2`, it warms the producer in that same session. It reads the original
+timeline anchor before seeking to the rung's current segment. Permanent startup failures
+leave the source unavailable instead; they must never be treated as recoverable dormancy.
+`copyListed` now describes whether the master actually announced the copy, not whether JS
+should rebuild. The network-triggered rebuild timer has been removed.
+
+## The producer under a rung (RemuxSession+Pipeline.swift, RemuxSession+Tier.swift)
+
+While AVPlayer plays a rung, the producer does one of two things (`copyFollowsLocked`):
+
+- **Follows**, when the master names the copy and the wire carries it beside the rung being
+  played (`wire >= source * 1.2 + rung`): it keeps `followSegments` of the copy just past
+  AVPlayer's latest rung fetch (`followLocked`), moving at most once per segment length, so
+  AVPlayer's next try at the copy lands on disk and not on a cold seek of the source. A move that
+  fails to seek ends following for the session, never the session.
+- **Holds** otherwise: a link with no room is not shared with a pull nobody plays.
+
+A rung that leads the master has the link to itself until its opening segment lands
+(`openingHoldLocked`). Every rung request marks where AVPlayer is, a segment served from disk
+included (`tierSegmentResponse`).
+
+## A segment AVPlayer gave up (LocalHTTPServer.swift, RemuxSession+Tier.swift)
+
+Measured: when AVPlayer abandons a segment it resets the connection, and the server's
+`NWConnection` goes `.failed` within half a second; a half-closed client never looks like that.
+`sendStreamed` hands each `.segment` provider a `SegmentRequest` and marks it abandoned on
+`.failed`, `.cancelled` or a failed padding send. A rung fetch is cancelled when the last live
+request for its segment is gone (`withFetchInterest`; a cancelled fetch is status 0, never a tier
+failure, and the engine's own opening fetch is never cancelled). The copy's wait loop ends the
+same way, and a rung asked for after an abandoned copy request counts as riding at once
+(`ridingTierLocked`), not after ten seconds.
+
+## A source lost mid-play (RemuxSession+Lifecycle.swift `handOverToRungs`)
+
+Transient source open/read failures reopen the producer in the same session with capped backoff.
+For permanent producer failures, `fail()` no longer ends a session the ladder can carry: the
+source is marked released and unusable, `failed` stays false, and the copy's routes (segments,
+init, engine audio) answer **410**. Measured, and Apple says it of permanent errors (WWDC17 514):
+AVPlayer does not retry a 410 and moves to another variant of the same master. A gone copy is
+not demand on the source. A session with no producer prunes its rungs from the rung path.
+
+## Subtitles inside the file never reach the server (RemuxSession+ServerImageSubtitles.swift)
+
+A request for any subtitle track inside a media file makes Jellyfin extract every subtitle
+track from the whole file in one ffmpeg pass, uncancellable by the client, bounded only by its
+30-minute `SubtitleExtractionTimeoutMinutes`, and restarted by the next waiting request after a
+failure (its issue #17499; `SubtitleEncoder.cs` `GetReadableFile`). Measured 2026-10-15 on a
+102.7 GB Interstellar remux off a USB disk at 39 to 48 MB/s: three 30-minute runs in a row,
+and the first one took the disk out from under the play. So no code path asks the server for a
+track inside the file: not the engine (`services/localRemux.ts` sets no `serverVttUrl` and no
+`serverSupUrl` for one), not the server-only lane (no `SubtitleMethod=Hls`, no text burn-in),
+not downloads (`cacheSubtitles` and `convertedItem` keep text sidecars only). A `.mks` sidecar
+triggers the same pass and is treated as in-file. `RemuxSession+ServerImageSubtitles.swift`
+remains for an image sidecar named through `DeliveryUrl`, which the app's GET PlaybackInfo
+never fills, so today it serves no track; it stays as the route for one.
+
+A text sidecar rides the master as a rendition the engine serves from Jellyfin's `Stream.vtt`,
+with its ASS markup rendered (`cleanWebVttCues`). On the server-video gateway (`serverVideoOnly`) the session lists
+sidecars alone, since it never opens the file.
+
+## Server audio on the rungs (services/localRemux.ts, RemuxSession+AudioLo.swift)
+
+One server audio group, `audio-lo`: 96 kb/s AAC, up to stereo, with every track
+available. `CHANNELS` reflects the output; mono remains mono. Every rung uses
+this group. Original-quality audio retains supported surround, and the engine
+group declares output channels when known. Files and routes are `a{p}s-*`.
+
+Measured on the Apple TV (a surround output): with the rungs from 480p up also listed with a 5.1
+AAC group, AVPlayer took only the surround entries, whatever the link. At 1.5 Mb/s it opened on
+480p, 16.3s to the first frame, then -16172 and a reload; at 12 Mb/s it never reached the copy.
+With stereo on every rung: first frame at 4.8s, the copy at 7.4s.
+
+The group is fetched from `/Videos/{id}/main.m3u8` with a 64px, 20 kb/s picture, never from
+`/Audio/{id}/main.m3u8`. Measured on Jellyfin 12.0.0: the audio route builds FFmpeg with no `-map`,
+so every `AudioStreamIndex` returned the same stream (T102 tracks 1 and 2 both gave `#0:1`), and
+it exits 134 on T09. The video route maps the track (`-map 0:0 -map 0:2`), costs 16 to 18 KB a
+segment (`AUDIO_CARRIER_BITRATE`, counted in each rung's BANDWIDTH), and `TierRewrapper` keeps
+only the audio.
+
+## Measuring the link (RemuxSession+LinkProbe.swift)
+
+AVPlayer measures the loopback, which says nothing about the wire, so the
+engine measures it itself. Two kinds of evidence, kept apart:
+
+- **The wire**: a range read of the source (the probe), and the copy pipeline's own reads WHILE
+  NOTHING ELSE TRANSFERS. A read times `av_read_frame`, which mostly returns what the socket already
+  holds (0.7 MB in 0.01s on the Apple TV), so reads only ever LOWER a rate a probe measured and never
+  set one; one over 1.25x asks for a probe only while a faster link could still admit the copy. A
+  source read beside a rung, an audio transfer or a probe is that read's share of the link: its own
+  bytes over the wall clock, as a floor. A restart or a hold starts a fresh sample. A mid-session
+  probe under one window (1s of delivery) is discarded: it times a burst (0.01 to 0.26s probes read
+  275 to 752 Mb/s on a 150 to 237 Mb/s link, T105).
+- **The copy's buffer** (Netflix's buffer-based rule, SIGCOMM 2014): the app reports AVPlayer's
+  seconds past the playhead each second (`setPlayerBuffer`). While AVPlayer plays the copy (not
+  riding a rung), the producer's reads may not lower the rate until that buffer has reached the 12s
+  reservoir and drained back under it; before it fills (startup, before the first report, or a
+  seek: the app's onSeek or a copy request outside the producer's window) the probe decides. A
+  report older than 3s leaves the reads in charge. A full reservoir admits the copy whatever the rate reads, and the reply
+  to each report is the cap floor: the copy's declared BANDWIDTH while the copy is admitted (rate
+  at least 1.2x the source, or a full reservoir), else 0. The reservoir is a rung's measured start
+  (3.1 to 4.55s) plus the 6s copy segment in flight. Measured before this: T105 (91 Mb/s DV) whole
+  segments read at about 200 Mb/s while single ~50 ms windows set the rate to 37-96, and 46 of 55
+  media requests went to the server's 1080p rung.
+- **A floor**: rung and server audio transfers (`fetchTier`, the opening `TierSegmentFetch`). The server sends a segment whole once it is encoded
+  (measured: 3.2 MB in 2 ms after a 1.06 s wait) and only the body is timed, so delivery is never
+  encoder-paced; a short body still reads under a fast wire on TCP's ramp (a recovered 30 Mb/s
+  link read 2.59 Mb/s from rungs). So a recovery shows as rungs outrunning the last wire reading.
+  A floor over 1.25x the rate requests a confirming probe. It supplies capacity directly only
+  while the source is unusable, retrying, or refused the probe (401/403, 404/410, 405/416); the
+  canonical playlist's transfer does the same when nothing else has set the rate. Its time is the
+  UNION of overlapping transfers in the last 8s.
+- **A probe counts what ran beside it** (`TransferLedger`): the URLSession transfers (rungs, server
+  audio) by their received bytes; alone it reads its share of a busy link. Measured on 0.6 Mb/s:
+  0.20 alone, 0.59 with the bytes beside it; on 1.5: 0.75 and 1.50. The producer's demuxed packets
+  are never counted: they crossed the wire before the probe (a 7.5 Mb/s link read 18.7 to 28.8).
+- A probe (`RateProbe`, `RateMeter`) reads the source for its whole 1.5s budget from its first byte:
+  every byte over the time since the first (NDT7's cumulative rate), stalls included, no early stop.
+  A first byte may take 3s. The startup probe reads on the pipeline's three ranged connections
+  (`linkProbeConnections`), each its own range, summed by the meter: one connection read 65.6,
+  142 and 153 Mb/s on three runs of one Apple TV on a link the pipeline's three connections then
+  read at 150 to 320 (measured 2026-10-16), and the 65.6 withheld a copy the link carried. A
+  mid-session probe beside a rung keeps one connection. A connection refused past a small file's
+  end ends quietly; only the first connection's answer classifies a failure. The link is the lower of a fast and a slow EWMA of probe readings
+  weighted by their seconds (hls.js and Shaka, half-lives 3s and 9s): a drop is followed at once, a
+  rise once it holds. A drained player buffer resets it.
+- Verified against ground truth: an Oracle box's own NIC counter (`/sys/class/net/*/statistics/
+tx_bytes`) sent 43 then 106 Mb/s during a TV probe that read 89.3, and Cloudflare's
+  `__down?bytes=25000000` read 540.0 Mb/s against 675 MB the OS counted in the same 10s. SSH from
+  the Mac read that box at 7.5 Mb/s: the Mac's path, not the box, and never a ground truth.
+- **While a rung plays** the wire is re-read every 30s, except while rungs arrive at the pace it
+  last read (they ARE the wire then, and a probe takes half a thin link for its length: at
+  750 kb/s the segment beside it ran past 6s and AVPlayer stepped down). A probe is asked for at
+  once, rung or copy, when a floor or a source read outruns the last reading by 1.25x (a
+  recovery) or a rung segment AVPlayer asked for takes over 80% of its own length to arrive (a
+  drop), never closer than 8s apart.
+- A move of more than 15% is reported to the app (`onEngineLink`), carrying the rate, whether this
+  session's master lists the copy, and its `source`. None of it is stored: the engine's 1.5s probes
+  are a burst allowance's length, never the sustained wire.
+- **Between plays** the app times 10s of the newest library file not held on the device, its
+  `/Videos/{id}/stream?Static=true` (`services/jellyfin/bitrateTest.ts`), never Jellyfin's
+  synthetic `/Playback/BitrateTest`. A read cut off before 9s is dropped, and playback taking the
+  link (or any engine session starting) cancels it and keeps nothing. The reading is kept per
+  server and subnet; playback start
+  never waits on a probe, and a cold server-lane start takes the floor preset.
+
+## What the app does with it (hooks/useVideoPlayback.ts)
+
+- **Cap**: `max(measured * 0.8, smallest listed variant, copy floor)` applied live through
+  RNV's `maxBitRate` (preferredPeakBitRate). The floor matters: a cap under
+  every variant leaves AVPlayer nothing it may play and it shows no frame at
+  all. The copy floor is the engine's reply to each buffer report (above); a rise to it ignores
+  the 15% hysteresis. A pinned quality preset is the cap instead, and no report moves it.
+- **Climb**: the native producer wakes in the existing gateway; the app only changes the cap.
+  Quality settings are read before engine startup, so they cannot erase an early link report.
+  Link reports are cached per token and replayed to the first subscriber; stopped sessions
+  cannot update a later attempt's cap.
+- **Startup cushion**: a session asks for 12s of forward buffer (two rung segments, which ride
+  out the server encoder's warm-up). Handed back to AVPlayer the moment the picture is up. Holding it for the whole session costs what it buys: a 30 to
+  1.5 Mb/s drop found 6s buffered and stalled 37s.
+- **Chapter pictures** made on the device wait for a link measured to carry the copy with the
+  master's margin (`linkAffordsChapterFrames`). The gate used to be "a ladder is listed", which is
+  true of every eligible session, so no streamed file ever got a picture.
+- The session's audio and subtitle tracks survive every step, including the
+  hand-over to the server: AVPlayer's own auto-selection is not read as the
+  viewer's choice, and a rebuilt stream re-applies the viewer's track by position on the FIRST
+  report of its manifest only (`freshManifest`): any later report is the viewer moving, and
+  re-applying there pushed them back. A track the viewer chose no longer narrows the server lane
+  to that one track (`serverLaneCarriesEveryTrack`), and the multi-audio stream opens at the
+  preset the measured link carries.
+
+## Segments and the grid
+
+- The grid is the SERVER'S segment list, adopted from the canonical rung's
+  playlist: Jellyfin cuts at the source's keyframes, ignores the requested
+  SegmentLength, and cold random access is byte-identical (16/16 in
+  `scripts/probe-slipstream.mjs`, which is kept for re-proving that against a
+  hardware-encoder server). Stream copy cuts at those same keyframes, so both
+  variants are IDR-aligned by construction.
+- Only the canonical rung's playlist is fetched before the master. Every other rung is listed
+  unfetched and adopted when AVPlayer asks for it (`adoptRung`): each playlist is 48 KB, and two
+  of them are 1.3s of a 0.6 Mb/s first frame. One cut on another grid is retired then and answers
+  404, which AVPlayer steps over (measured: -12938 in its error log, the next rung played, no stall).
+- Rung 0's opening segment is ONE transfer (`TierSegmentFetch`): the init is cut from its first
+  64 KB the moment they land, the segment is written when the rest arrives, and the player's own
+  requests wait on it. Its init is held up to 4s for the segment, because AVPlayer starts on one
+  segment that arrives at once and waits for two when it watches one download; 4s keeps clear of
+  the 6s it allows a map request (-12889 "No response for map", measured at 0.6 Mb/s).
+- A rung or audio-lo segment is fetched whole before it can be sent, so its response leads with
+  the segment's own `styp` box and pads with empty `free` boxes every 2s until the body is ready.
+  AVPlayer fails a segment it hears nothing from in 6s, which is what made every rung above the
+  opening one unusable at 750 kb/s (-12889 on each attempt, then back to t0).
+- The rung lane is NOT read ahead. Tried and measured: segments that arrive instantly make
+  AVPlayer climb on a thin buffer and stall (15s, 21s and 7s across three links). Its own clock on
+  segments fetched as it asks is what keeps a thin link smooth.
+- The audio-lo init is fetched once a session, not once a segment, and after the segment: a
+  header request Jellyfin finds no file for starts its job at 0:00 (`DynamicHlsController`,
+  `segmentId == -1`), killing the one already at the resume point, and hlsenc writes the header
+  before any segment. A cold rung's header is cut from the playhead's segment for the same
+  reason, and the release prefetch of audio-lo asks for the playhead's segment, not the
+  resume point's (measured 2026-10-15: a 41 s job at 0:00 and three rungs started at 0:00).
+- The stop's DELETEs (`/Videos/ActiveEncodings` per PlaySessionId) are sent at 0, 5, 15, 30 and
+  60 s (`stopRepeatDelays`): Jellyfin holds a queued segment request under its playlist lock, so
+  the request lands after the first kill and starts a new job, and a header request after it
+  deletes the job's files (1.5 s after the kill) starts one at 0:00. A repeat with no job is a
+  no-op; an orphan otherwise lives two segments plus 60 s on the ping timer.
+- A request more than 2 segments ahead of the producer is a seek (`seekAheadSegments`), whatever
+  the read-ahead depth. It used to be the 20-segment window, so a rebuild or a resume inside a
+  film's first two minutes waited for every segment between to be pulled at link speed (measured:
+  13.8s for a rebuild at 63s on a 30 Mb/s link, 3s after).
+- Original video and engine-audio responses wait for real media; they do not
+  send placeholder `styp` or `free` boxes while preparing. Server-rung and
+  server-audio responses retain their preparation keepalives.
+- Starting on a rung holds the engine's source pull, so the slow link goes
+  wholly to the server renditions; any copy request resumes it.
+- A session riding a rung has no cues for a text track inside the file: the engine's own
+  cues come from a source pull that is being held, and AVPlayer drops the item if a subtitle
+  window misses its 6s deadline, so a window ahead of the read answers without cues at once
+  while the source is let go, retrying or held (`sourceNotReading` in `subtitleSegment`). A
+  window answered empty is fetched again only after a seek or a re-selection; the ones not yet
+  asked fill once the copy returns.
+
+## The acceptance matrix (scripts/abr-drill.mjs)
+
+`scripts/netsim-proxy.mjs` shapes one token bucket in front of Jellyfin; the
+drill plays a fixture through it and scores the timeline
+(`scripts/lib/abr-score.mjs`).
+
+| Scenario | Link                              | Asserts                                     |
+| -------- | --------------------------------- | ------------------------------------------- |
+| S1       | unthrottled                       | opens on the copy and stays there           |
+| S2       | 1.5 Mb/s                          | opens on a rung, no stall                   |
+| S3       | 30 → 1.5 at 60s                   | steps down, no stall                        |
+| S4       | 1.5 → 30 at 60s                   | climbs back to the copy                     |
+| S5       | 0.6 Mb/s                          | plays at all, no stall                      |
+| S6       | 3 ↔ 6 every 20s                   | does not flap                               |
+| S7       | down then up, two audio tracks    | steps down, climbs back, keeps both tracks  |
+| S8       | rung playlists refused            | plays to the end, no player replacement     |
+| S9       | 750 kb/s, 150 ms round trip       | the slow-start gate; rides a rung, no stall |
+| S10      | 12 Mb/s, 40 ms round trip         | opens at 480p, ends on the copy (150s run)  |
+| S11      | the source refused outright       | the rungs carry the session, no rebuild     |
+| S12      | 1.5 Mb/s, one rung's playlist 404 | the ladder goes on without it               |
+
+Startup targets are 4.5s on a fast link and 8s on a slow one, not hard playback deadlines.
+Every scenario asserts no stall, no player item replaced, playback to
+the end of the run, and every audio and subtitle track still listed. On every steady stretch of a
+profile (60s or more) it asserts what the engine owes and what AVPlayer does with it, apart:
+
+- **offers**: the variant the link carries (the copy past `source * 1.2`, else the biggest rung
+  inside 0.8 of the link) is named in the master AND inside the cap in force. That part is ours.
+- **rides**: AVPlayer's standing choice is never under what HALF the link carries, and is the
+  copy whenever the copy is what the link deserves. How high it climbs above that is its own
+  call on its own clock, and on a thin link a careful one.
+- **opens at**: thirty seconds in, the picture is at least the rung the engine opens that link on.
+- **holds steady**: at most one correction of picture size after 45s. A step away and back is
+  one. Requests are ordered by when AVPlayer ASKED: they are stamped when they end, and a segment
+  that took 20s to die after a drop otherwise reads as a switch made 20s later.
+
+S7's thin stretch is 150s, not 300: AVPlayer buffers a 240p rung several times faster than it
+plays, had all of a 12-minute fixture by 341s, and a file it has all of is never re-evaluated.
+
+The copy's start at 30 Mb/s is 2.6s or 3.6s on identical engine timings (first segment complete at
+1.9s in every run): fifteen runs at a 6, 4 and 2s forward buffer split the same way, so the second
+is AVPlayer's own and the buffer is not the lever.
+
+```bash
+node scripts/abr-drill.mjs --host                       # macOS AVPlayer + the real engine
+node scripts/abr-drill.mjs --device "Main Bedroom"      # the app on the Apple TV
+#   --items T101,T102  --scenarios S1,S4  --link 1500000  --buffer 12  --no-window  --no-cap
+```
+
+Host and device both run 15/15 (T101 and T102, S1-S8) as of 2026-09-17: copy in
+1.1s unthrottled, 0.6 Mb/s to first frame in about 20s, climb back within 19 to
+86s of recovery, no stalls, no dropped tracks.
+
+## What Slipstream does NOT change
+
+Offline and live lane selection, reporter
+semantics (one PlaySessionId per SESSION for reporting; rung PlaySessionIds are
+transcode plumbing and are never reported), Top Shelf, the audio player. The
+gateway adds variants to a master that already existed.

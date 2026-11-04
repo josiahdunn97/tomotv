@@ -1,0 +1,394 @@
+import { AccountPill } from "@/components/settings/AccountPill";
+import { GLYPH_INK, glyphSize, LeadingTile, useTileHeight } from "@/components/settings/LeadingTile";
+import { MoreBelowHint } from "@/components/settings/MoreBelowHint";
+import { goldRowShadow, IS_PAD, POSTER_MARK_SIDE, ROW_CONTENT_MIN_HEIGHT, SUBTITLE_GAP, SUBTITLE_LINE_HEIGHT, settingsStyles, useSettingsAccentStyles } from "@/components/settings/styles";
+import { COLORS } from "@/constants/colors";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { Ionicons } from "@expo/vector-icons";
+import { forwardRef, ReactNode } from "react";
+import { AccessibilityRole, AccessibilityState, ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextStyle, View } from "react-native";
+
+type IoniconName = keyof typeof Ionicons.glyphMap;
+
+/** A drawn mark in place of a glyph; the row hands it the ink its focus state calls for, and it owns its own box. */
+type LeadingMark = (ink: { color: string }) => ReactNode;
+
+const IS_TV = Platform.isTV;
+/** One trailing-mark size on every row. Exported so a drawn mark matches the plain glyphs. */
+export const TRAILING_SIZE = IS_TV ? 28 : 20;
+const LEFT_GAP = IS_TV ? 16 : 12;
+/** A folder member's step in from the rows around it. */
+const NESTED_INSET = LEFT_GAP;
+/** Apple's minimum target, on the row's full height. */
+const ACTION_WIDTH = 44;
+/** Touch alone must not fill the row: a swipe starts as one, and the pan needs its 10px to claim it. */
+const PRESS_DELAY = IS_TV ? undefined : 120;
+/** The unread dot, centred on the dead space between the section's edge and the leading glyph. */
+const UNREAD_SIZE = IS_TV ? 13 : 10;
+/** The fresh dot, inline before the subtitle. */
+const FRESH_SIZE = IS_TV ? 11 : 8;
+const FRESH_GAP = IS_TV ? 8 : 5;
+const GUTTER = settingsStyles.listItem.paddingHorizontal + (POSTER_MARK_SIDE - GLYPH_INK) / 2;
+const UNREAD_LEFT = GUTTER / 2 - settingsStyles.listItem.paddingHorizontal - UNREAD_SIZE / 2;
+
+interface ListRowProps {
+  /** Leading glyph, or a function drawing one (QualityMark). Omit for text-only rows (Acknowledgements). */
+  icon?: IoniconName | LeadingMark;
+  title: string;
+  /** A tight pill after the title: which device a Diagnostics row speaks for. */
+  titlePill?: { icon?: IoniconName; label: string };
+  /** A red dot in the gutter before the leading mark: the SyncPlay row while in a group. */
+  unread?: boolean;
+  /** Second line: a URL, a preset description, or the value an informational row states. */
+  subtitle?: string;
+  /** Lines the subtitle may take before it truncates; 0 wraps it whole (a full URL). */
+  subtitleLines?: number;
+  /** Lead-in on the subtitle in the row's accent ink (ServerRow's "New · "). */
+  subtitleAccent?: string;
+  /** A green dot before the subtitle: a Diagnostics session from the last few minutes. */
+  subtitleDot?: boolean;
+  /** 0..1: a thin bar under the labels, how much of something the row's subject covers (a guide's channels). */
+  meter?: number;
+  /** Trailing mark, inked to match the fill, or a function drawing one (a green tick). Omit
+   *  for a row that only states a value. */
+  trailingIcon?: IoniconName | LeadingMark;
+  /** A second press target before the trailing mark, a glyph or a short thin-lettered word. Phone and iPad only: on tvOS it would be a focusable of its own. */
+  trailingAction?: ({ icon: IoniconName; text?: undefined } | { text: string; icon?: undefined }) & { label: string; hint?: string; onPress: () => void };
+  /** A short thin-lettered word before the trailing mark that only states something (a licence name on tvOS). Ignored when trailingAction is set. */
+  trailingText?: string;
+  /** A folder member: stepped in from the rows around it (Downloads). */
+  nested?: boolean;
+  /** Trailing mark in the row's accent ink rather than grey: a play or pause that acts, not a chevron that points. */
+  trailingAccent?: boolean;
+  /** The last visible row of a capped list: true shows the more-below chevron in its bottom padding. */
+  moreBelow?: boolean;
+  /** Replaces the trailing mark with a spinner. Does not disable the row. */
+  isLoading?: boolean;
+  /** Wears the gold at rest (the quality list's current preset). Focus on it shows a step lighter. */
+  selected?: boolean;
+  /** Destructive rows ink their glyph and label red at rest (Sign Out). */
+  tone?: "default" | "destructive";
+  /** Omit for an informational row: it still takes focus, it just has nowhere to go. */
+  onPress?: () => void;
+  onLongPress?: () => void;
+  /** A long press has no gesture for VoiceOver, so a row offering one names it here too. */
+  accessibilityActions?: readonly Readonly<{ name: string; label?: string }>[];
+  onAccessibilityAction?: (event: { nativeEvent: { actionName: string } }) => void;
+  /**
+   * tvOS focus arrival. Only used by rows at the ends of a capped, internally-scrolling list,
+   * which pin the scroll offset so focus can leave it, see NotConnectedSection and the
+   * quality list in app/(tabs)/settings.tsx.
+   */
+  onFocus?: () => void;
+  onBlur?: () => void;
+  disabled?: boolean;
+  hasTVPreferredFocus?: boolean;
+  isFirst?: boolean;
+  isLast?: boolean;
+  /** The row's right edge meets the people panel, not the card wall: no right rim on the gold fill. */
+  flushRight?: boolean;
+  /** Per-surface metrics: the quality list pins its line heights for the section's height cap. */
+  titleStyle?: StyleProp<TextStyle>;
+  subtitleStyle?: StyleProp<TextStyle>;
+  accessibilityRole?: AccessibilityRole;
+  accessibilityLabel?: string;
+  accessibilityHint?: string;
+  accessibilityState?: AccessibilityState;
+}
+
+/**
+ * ListRow: the one row for a grouped, sunken settings-style section: leading
+ * glyph, flexible label column, trailing mark. Focus (and `selected`) fills
+ * the row with the action gold, a press deepens it; the state machine lives
+ * here and nowhere else.
+ *
+ * It sits inside `settingsStyles.section`, which paints the sunken surface;
+ * the row stays transparent at rest so the card's inset shadow shows through,
+ * and nothing is ever layered above it: on tvOS a view covering a focusable
+ * occludes it and the focus engine refuses to enter.
+ *
+ * Rows with no `onPress` are still focusable, with a neutral wash instead of
+ * gold. Deliberate on tvOS: a column of unfocusable text is a column the
+ * remote skips over and cannot scroll, and the gold fill is the app's "this
+ * acts" mark, so a row that only takes focus to be readable must not wear it.
+ *
+ * No magnification: a scaled row drifts its glyph and trailing mark out of
+ * column with its neighbours. The background fill carries focus.
+ *
+ * Every structural wrapper here is `collapsable={false}`. A View with only
+ * layout props fails `formsView` (ViewShadowNode.cpp) and is dropped from the
+ * native tree, which hoists the glyph, title, subtitle and trailing mark into
+ * one flat sibling list under the Pressable; an optional one of them then
+ * renumbers the others and Fabric aborts on the bad unmount index.
+ *
+ * Forwards its ref to the Pressable so a host can requestTVFocus on a row.
+ */
+export const ListRow = forwardRef<View, ListRowProps>(function ListRow(
+  {
+    icon,
+    title,
+    subtitle,
+    subtitleLines = 1,
+    subtitleAccent,
+    subtitleDot = false,
+    meter,
+    titlePill,
+    unread = false,
+    trailingIcon,
+    trailingAction,
+    trailingText,
+    nested = false,
+    trailingAccent = false,
+    moreBelow,
+    isLoading = false,
+    selected = false,
+    tone = "default",
+    onPress,
+    onLongPress,
+    accessibilityActions,
+    onAccessibilityAction,
+    onFocus,
+    onBlur,
+    disabled = false,
+    hasTVPreferredFocus = false,
+    isFirst = false,
+    isLast = false,
+    flushRight = false,
+    titleStyle,
+    subtitleStyle,
+    accessibilityRole,
+    accessibilityLabel,
+    accessibilityHint,
+    accessibilityState,
+  }: ListRowProps,
+  ref,
+) {
+  const palette = useCardPalette();
+  const accentStyles = useSettingsAccentStyles();
+  const actionable = Boolean(onPress);
+  const stacked = subtitle != null;
+  const [tileHeight, onTileLayout] = useTileHeight();
+  const labelsBox = { minHeight: icon ? POSTER_MARK_SIDE : ROW_CONTENT_MIN_HEIGHT };
+
+  return (
+    <Pressable
+      ref={ref}
+      onPress={onPress}
+      onLongPress={onLongPress}
+      accessibilityActions={accessibilityActions}
+      onAccessibilityAction={onAccessibilityAction}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      disabled={disabled}
+      isTVSelectable={!disabled}
+      hasTVPreferredFocus={hasTVPreferredFocus}
+      accessibilityRole={accessibilityRole ?? (actionable ? "button" : "text")}
+      accessibilityLabel={accessibilityLabel ?? (subtitle ? `${title}, ${subtitle}` : title)}
+      accessibilityHint={accessibilityHint}
+      accessibilityState={accessibilityState}
+      tvParallaxProperties={{ enabled: false }}
+      unstable_pressDelay={PRESS_DELAY}
+      style={({ focused, pressed }) => {
+        const gold = actionable && (focused || pressed || selected);
+        return [
+          settingsStyles.listItem,
+          nested && styles.nested,
+          isFirst && settingsStyles.listItemFirst,
+          isLast && settingsStyles.listItemLast,
+          actionable && (focused || selected) && !pressed && accentStyles.listItemFocused,
+          actionable && focused && selected && !pressed && accentStyles.listItemFocusedSelected,
+          actionable && pressed && accentStyles.listItemPressed,
+          // A gold row covers the card's inset shadow; re-paint the parts it hides
+          // (side rim always, plus the lip at whichever card edge it sits on).
+          gold && goldRowShadow(isFirst, isLast, flushRight),
+          !actionable && (focused || pressed) && styles.rowFocusedNeutral,
+          disabled && styles.rowDisabled,
+        ];
+      }}>
+      {({ focused, pressed }) => {
+        // Every mark on the row is gold at rest; on the gold fill they all take the bar's ink.
+        // Red only survives at rest: on the gold fill it sits at 2.2:1. The softer red is what
+        // clears 4.5:1 against the card at this size.
+        const onGold = actionable && (focused || pressed || selected);
+        const restInk = tone === "destructive" ? COLORS.DESTRUCTIVE_SOFT : palette.accent;
+        const accentInk = onGold ? palette.ink : restInk;
+        const trailingInk = trailingAccent ? accentInk : onGold ? palette.ink : COLORS.TEXT_TERTIARY;
+        return (
+          <View style={settingsStyles.listItemContent} collapsable={false}>
+            <View style={styles.left} collapsable={false}>
+              {unread ? <View style={[styles.unread, { top: (tileHeight - UNREAD_SIZE) / 2 }]} /> : null}
+              {icon ? (
+                <LeadingTile height={tileHeight}>{typeof icon === "function" ? icon({ color: accentInk }) : <Ionicons name={icon} size={glyphSize(icon)} color={accentInk} />}</LeadingTile>
+              ) : null}
+              <View style={[styles.labels, labelsBox]} onLayout={icon ? onTileLayout : undefined} collapsable={false}>
+                <View style={styles.titleRow} collapsable={false}>
+                  <Text
+                    style={[
+                      settingsStyles.listItemTitle,
+                      stacked && settingsStyles.listItemTitleStacked,
+                      stacked && styles.titleStacked,
+                      titleStyle,
+                      tone === "destructive" && !onGold && { color: COLORS.DESTRUCTIVE_SOFT },
+                      onGold && accentStyles.listItemTitleFocused,
+                      styles.titleText,
+                    ]}
+                    numberOfLines={1}>
+                    {title}
+                  </Text>
+                  {titlePill ? <AccountPill label={titlePill.label} icon={titlePill.icon} onGold={onGold} /> : null}
+                </View>
+                {subtitle != null ? (
+                  <View style={styles.subtitleRow} collapsable={false}>
+                    {subtitleDot ? <View style={[styles.fresh, { backgroundColor: onGold ? palette.ink : COLORS.SUCCESS }]} /> : null}
+                    <Text style={[settingsStyles.listItemSubtitle, styles.subtitle, subtitleStyle, onGold && accentStyles.listItemSubtitleFocused]} numberOfLines={subtitleLines}>
+                      {subtitleAccent ? <Text style={{ color: accentInk }}>{subtitleAccent}</Text> : null}
+                      {subtitle}
+                    </Text>
+                  </View>
+                ) : null}
+                {meter !== undefined ? (
+                  <View style={styles.meterTrack} collapsable={false}>
+                    <View style={[styles.meterFill, { width: `${Math.round(Math.min(1, Math.max(0, meter)) * 100)}%`, backgroundColor: onGold ? palette.ink : palette.accent }]} />
+                  </View>
+                ) : null}
+              </View>
+            </View>
+            {trailingAction ? (
+              <Pressable
+                onPress={trailingAction.onPress}
+                style={[trailingAction.text ? styles.actionText : styles.action, !trailingIcon && !isLoading && styles.actionAlone]}
+                accessibilityRole="button"
+                accessibilityLabel={trailingAction.label}
+                accessibilityHint={trailingAction.hint}>
+                {trailingAction.text ? (
+                  <Text style={[styles.actionWord, { color: accentInk }]} numberOfLines={1}>
+                    {trailingAction.text}
+                  </Text>
+                ) : (
+                  <Ionicons name={trailingAction.icon} size={TRAILING_SIZE} color={accentInk} />
+                )}
+              </Pressable>
+            ) : trailingText ? (
+              <View style={styles.trailingWord} collapsable={false}>
+                <Text style={[styles.actionWord, { color: accentInk }]} numberOfLines={1}>
+                  {trailingText}
+                </Text>
+              </View>
+            ) : null}
+            {isLoading || trailingIcon ? (
+              <View style={styles.trailing} collapsable={false}>
+                {isLoading ? (
+                  <ActivityIndicator color={accentInk} size="small" />
+                ) : typeof trailingIcon === "function" ? (
+                  trailingIcon({ color: trailingInk })
+                ) : (
+                  <Ionicons name={trailingIcon!} size={TRAILING_SIZE} color={trailingInk} />
+                )}
+              </View>
+            ) : null}
+            {moreBelow !== undefined ? <MoreBelowHint visible={moreBelow} color={onGold ? palette.ink : COLORS.TEXT_TERTIARY} /> : null}
+          </View>
+        );
+      }}
+    </Pressable>
+  );
+});
+
+const styles = StyleSheet.create({
+  left: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    flex: 1,
+    gap: LEFT_GAP,
+  },
+  nested: {
+    paddingLeft: settingsStyles.listItem.paddingHorizontal + NESTED_INSET,
+  },
+  unread: {
+    position: "absolute",
+    left: UNREAD_LEFT,
+    width: UNREAD_SIZE,
+    height: UNREAD_SIZE,
+    borderRadius: UNREAD_SIZE / 2,
+    backgroundColor: COLORS.DESTRUCTIVE,
+  },
+  // A lone title centres against the tile; a stacked pair is as tall and sits at the top.
+  labels: {
+    flex: 1,
+    justifyContent: "center",
+  },
+  // A stacked pair runs tighter than the shared title leading so both lines sit inside the tile.
+  titleStacked: {
+    lineHeight: IS_TV ? undefined : IS_PAD ? 24 : 22,
+  },
+  // The shared listItemSubtitle sits almost at title size, which reads as two
+  // competing lines when stacked. Drop it a step and give it room.
+  subtitle: {
+    fontSize: IS_TV ? 22 : IS_PAD ? 14 : 13,
+    lineHeight: SUBTITLE_LINE_HEIGHT,
+    marginTop: SUBTITLE_GAP,
+    flexShrink: 1,
+  },
+  subtitleRow: { flexDirection: "row", alignItems: "center" },
+  meterTrack: {
+    height: IS_TV ? 4 : 3,
+    marginTop: IS_TV ? 10 : 6,
+    borderRadius: 2,
+    overflow: "hidden",
+    backgroundColor: "rgba(255, 255, 255, 0.12)",
+  },
+  meterFill: {
+    height: "100%",
+    borderRadius: 2,
+  },
+  fresh: {
+    width: FRESH_SIZE,
+    height: FRESH_SIZE,
+    borderRadius: FRESH_SIZE / 2,
+    marginRight: FRESH_GAP,
+    marginTop: IS_TV ? 4 : 1,
+  },
+  // One line, never wrapping: what does not fit is clipped, the way the subtitle truncates.
+  titleRow: { flexDirection: "row", alignItems: "center", gap: IS_TV ? 12 : 8 },
+  titleText: { flexShrink: 1 },
+  // The spinner box is narrower than the checkmark's, so the slot is fixed at the
+  // mark's width and centres whichever it holds, on the row's full height.
+  trailing: {
+    width: TRAILING_SIZE,
+    alignSelf: "stretch",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  action: {
+    width: ACTION_WIDTH,
+    alignSelf: "stretch",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  actionText: {
+    alignSelf: "stretch",
+    justifyContent: "center",
+    paddingHorizontal: (ACTION_WIDTH - TRAILING_SIZE) / 2,
+  },
+  actionWord: {
+    fontSize: IS_TV ? 22 : IS_PAD ? 14 : 13,
+    fontWeight: "300",
+    letterSpacing: 0.4,
+  },
+  trailingWord: {
+    alignSelf: "stretch",
+    justifyContent: "center",
+    marginLeft: LEFT_GAP,
+  },
+  // Alone at the trailing edge, its glyph centres on the trailing mark's column: the target
+  // box overhangs into the row's padding by the difference.
+  actionAlone: {
+    marginRight: -(ACTION_WIDTH - TRAILING_SIZE) / 2,
+  },
+  rowFocusedNeutral: {
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+  },
+  rowDisabled: {
+    opacity: 0.5,
+  },
+});

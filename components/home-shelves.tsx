@@ -1,0 +1,267 @@
+import { AmbientBackground } from "@/components/ambient-background";
+import { CardZoomPinch } from "@/components/card-zoom-pinch";
+import { ContinueWatchingRow } from "@/components/continue-watching-row";
+import { FocusableButton } from "@/components/FocusableButton";
+import { LoadingRow } from "@/components/loading-row";
+import { FolderGridItem } from "@/components/folder-grid-item";
+import { ItemShelf } from "@/components/item-shelf";
+import { MediaShelf } from "@/components/media-shelf";
+import { VideoGridItem } from "@/components/video-grid-item";
+import { sideInsets } from "@/components/settings/styles";
+import { ArtworkSlotShape, GRID, gridEdgePadding, itemSlotShape } from "@/constants/app";
+import { COLORS } from "@/constants/colors";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { useItemLongPress } from "@/hooks/useItemLongPress";
+import { useIsRecording } from "@/hooks/useRecordingStatus";
+import { getRecoveryStatus, RecoveryStatus, subscribeRecoveryStatus } from "@/services/connectionRecovery";
+import { fetchFavoriteItems, fetchLatestItems, isFolder, signOut } from "@/services/jellyfinApi";
+import { JellyfinItem } from "@/types/jellyfin";
+import { cardResumeProgress } from "@/utils/resumeProgress";
+import { Ionicons } from "@expo/vector-icons";
+import { useIsFocused, useRouter } from "expo-router";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { GestureResponderEvent, Platform, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { t } from "@/services/i18n";
+
+const IS_TV = Platform.isTV;
+/** Padding around the centred status block, on top of the side insets. */
+const CENTER_PAD = 40;
+
+// TV tab bar is at the top and already inside insets.top; phone bar is ~49px at the bottom.
+const TAB_BAR_HEIGHT = IS_TV ? 210 : 49;
+
+/** A gliding shelf's scroll events stop here, so the page never takes the touch from the shelf under the finger. */
+export function stopShelfScrollClaim(event: GestureResponderEvent): boolean {
+  event.stopPropagation();
+  return false;
+}
+const SHELF_SCROLL_CLAIM = { onScrollShouldSetResponder: stopShelfScrollClaim };
+
+interface HomeShelvesProps {
+  /** The user's library views, loaded by the host route (useFolderContents(null)). */
+  libraries: JellyfinItem[];
+  isLoading: boolean;
+  error: string | null;
+  /** Re-runs the libraries load from the error state's Retry button. */
+  onRetry: () => void;
+  /** Press on a Libraries-row card — navigation belongs to the route screen. */
+  onLibraryPress: (item: JellyfinItem) => void;
+}
+
+/**
+ * The Home tab body: four horizontal shelves — Libraries, Continue, New, Favorites — over the
+ * static ambient canvas. Libraries lead because they load synchronously from cache, so the top
+ * of the screen and the launch focus target never jump while the async shelves arrive; empty
+ * shelves below collapse to nothing.
+ */
+export function HomeShelves({ libraries, isLoading, error, onRetry, onLibraryPress }: HomeShelvesProps) {
+  const router = useRouter();
+  const palette = useCardPalette();
+  const insets = useSafeAreaInsets();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  // iPadOS floats the tab bar at the TOP, below insets.top, so a tablet clears it at the top
+  // and reserving a bottom bar leaves a dead band under the last shelf.
+  const isTablet = !IS_TV && Math.min(windowWidth, windowHeight) >= GRID.PHONE_WIDE_MIN_WIDTH;
+
+  // Gates the first card's mount-time focus claim: a covered screen must never take the
+  // app-wide preferred-focus slot (see library-grid.tsx's isScreenFocused notes).
+  const isScreenFocused = useIsFocused();
+
+  // One-shot latch: once focus is inside the screen, the first card's mount-time claim is
+  // retired — a claim left standing is re-requested by UIKit on later layout passes and
+  // would yank focus back on every reveal (e.g. returning from the player).
+  const [focusClaimed, setFocusClaimed] = useState(false);
+
+  // Connection recovery runs in the background after a network-classified load failure;
+  // while it is looking for the server the error state shows progress instead of dead-end
+  // actions. A recovered connection refreshes the load via the auth-change subscription.
+  const [recoveryStatus, setRecoveryStatus] = useState<RecoveryStatus>(getRecoveryStatus());
+  useEffect(() => subscribeRecoveryStatus(setRecoveryStatus), []);
+
+  // Switching servers from the error state is an explicit choice to leave this server, so no
+  // extra confirmation. dismissTo, not navigate — see hooks/useFinishLogin.ts.
+  const handleSwitchServer = useCallback(async () => {
+    await signOut();
+    router.dismissTo("/");
+  }, [router]);
+
+  // Retires the first card's mount-time claim the moment focus is inside the screen.
+  // Phone has no focus engine (this same handler is the press-in path there).
+  const handleItemFocus = useCallback(() => {
+    if (!IS_TV) return;
+    setFocusClaimed(true);
+  }, []);
+
+  // The shared card menu (View Info / Show In Folder / favorite / watched) — every home
+  // row carries it; on a library root Show In Folder alerts gracefully (no ancestor path).
+  const onItemLongPress = useItemLongPress();
+
+  // A recording in progress marks the Libraries heading and the Live TV card.
+  const recording = useIsRecording();
+  const recordingShelf = recording && libraries.some((item) => item.CollectionType === "livetv");
+
+  const renderLibrary = useCallback(
+    (item: JellyfinItem, index: number, cardHeight: number) => {
+      const claimsFocusOnMount = index === 0 && isScreenFocused && !focusClaimed;
+      return isFolder(item) ? (
+        <FolderGridItem
+          folder={item}
+          onPress={onLibraryPress}
+          onLongPress={onItemLongPress}
+          index={index}
+          onItemFocus={handleItemFocus}
+          hasTVPreferredFocus={claimsFocusOnMount}
+          cardHeight={cardHeight}
+          fitArtwork
+          slotOrientation="landscape"
+          recording={recording && item.CollectionType === "livetv"}
+        />
+      ) : (
+        <VideoGridItem
+          video={item}
+          onPress={onLibraryPress}
+          onLongPress={onItemLongPress}
+          index={index}
+          onItemFocus={handleItemFocus}
+          hasTVPreferredFocus={claimsFocusOnMount}
+          cardHeight={cardHeight}
+          fitArtwork
+          slotOrientation="landscape"
+          progressPercent={cardResumeProgress(item)}
+          hideAiring
+        />
+      );
+    },
+    [onLibraryPress, onItemLongPress, handleItemFocus, isScreenFocused, focusClaimed, recording],
+  );
+
+  const keyExtractor = useCallback((item: JellyfinItem) => item.Id, []);
+
+  // Same mapping the cards render with (square no-art fallback) — see itemSlotShape.
+  const slotShapeFor = useCallback((item: JellyfinItem): ArtworkSlotShape => itemSlotShape(item.PrimaryImageAspectRatio), []);
+
+  // Edge padding subsumes the safe-area inset so shelves fill the safe area; the shelves
+  // derive their card widths from the same formula, keeping every row on one column grid.
+  // Bottom clearance: the tab bar is at the BOTTOM only on phone — padding the TV scroll
+  // by the bar height creates a phantom band of scrollable space below the last shelf.
+  const scrollContentStyle = useMemo(
+    () => ({
+      paddingTop: (IS_TV || isTablet ? 20 : 8) + insets.top,
+      paddingBottom: (IS_TV || isTablet ? 40 : TAB_BAR_HEIGHT + 20) + insets.bottom,
+      paddingLeft: gridEdgePadding(insets.left, IS_TV),
+      paddingRight: gridEdgePadding(insets.right, IS_TV),
+    }),
+    [insets.top, insets.bottom, insets.left, insets.right, isTablet],
+  );
+
+  // Centred in the safe area, not the screen: iPhone Duo's side column is a right inset.
+  const centered = useMemo(() => [styles.centerContainer, sideInsets(insets, CENTER_PAD)], [insets]);
+  const status = useMemo(() => {
+    if (isLoading) {
+      return (
+        <View style={centered}>
+          <LoadingRow label={t("library.loadingLibraries")} />
+        </View>
+      );
+    }
+    if (error) {
+      if (recoveryStatus === "running") {
+        return (
+          <View style={centered}>
+            <LoadingRow label={t("common.lookingForServer")} />
+            <Text style={styles.errorText}>{t("common.checkingNetwork")}</Text>
+          </View>
+        );
+      }
+      return (
+        <View style={centered}>
+          <Ionicons name="alert-circle-outline" size={64} color={COLORS.DESTRUCTIVE} />
+          <Text style={styles.errorTitle}>{t("common.unableToLoad")}</Text>
+          <Text style={styles.errorText}>{error}</Text>
+
+          <View style={styles.buttonGroup}>
+            <FocusableButton
+              title={t("common.retry")}
+              variant="primary"
+              onPress={onRetry}
+              icon={<Ionicons name="refresh-outline" size={IS_TV ? 24 : 20} color={palette.onAccent} />}
+              hasTVPreferredFocus={true}
+            />
+            <FocusableButton
+              title={t("common.switchServer")}
+              variant="secondary"
+              onPress={handleSwitchServer}
+              icon={<Ionicons name="swap-horizontal-outline" size={IS_TV ? 24 : 20} color={palette.accent} />}
+            />
+          </View>
+        </View>
+      );
+    }
+    return (
+      <View style={centered}>
+        <Ionicons name="folder-open-outline" size={64} color={COLORS.TEXT_SECONDARY} />
+        <Text style={styles.emptyText}>{t("library.noLibraries")}</Text>
+      </View>
+    );
+  }, [centered, isLoading, error, recoveryStatus, onRetry, handleSwitchServer, palette]);
+
+  return (
+    <View style={styles.container}>
+      <AmbientBackground />
+      {libraries.length === 0 ? (
+        status
+      ) : (
+        <CardZoomPinch>
+          <ScrollView contentContainerStyle={scrollContentStyle} contentInsetAdjustmentBehavior="never" showsVerticalScrollIndicator={false}>
+            <View {...SHELF_SCROLL_CLAIM}>
+              <MediaShelf title={t("library.libraries")} dot={recordingShelf} data={libraries} slotShapeFor={slotShapeFor} renderItem={renderLibrary} keyExtractor={keyExtractor} />
+              <ContinueWatchingRow onItemFocus={handleItemFocus} />
+              <ItemShelf title={t("library.favorites")} fetch={fetchFavoriteItems} refreshOnFavoriteChange onItemFocus={handleItemFocus} />
+              <ItemShelf title={t("library.new")} fetch={fetchLatestItems} onItemFocus={handleItemFocus} />
+            </View>
+          </ScrollView>
+        </CardZoomPinch>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  centerContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: CENTER_PAD,
+  },
+  errorTitle: {
+    marginTop: 16,
+    fontSize: 24,
+    fontWeight: "700",
+    color: COLORS.TEXT_PRIMARY,
+    textAlign: "center",
+  },
+  errorText: {
+    marginTop: 18,
+    fontSize: 17,
+    color: COLORS.TEXT_SECONDARY,
+    textAlign: "center",
+    lineHeight: 24,
+  },
+  emptyText: {
+    marginTop: 16,
+    fontSize: 20,
+    color: COLORS.TEXT_SECONDARY,
+    textAlign: "center",
+  },
+  buttonGroup: {
+    gap: IS_TV ? 16 : 12,
+    marginTop: IS_TV ? 32 : 24,
+    width: "100%",
+    maxWidth: 400,
+    alignItems: "center",
+  },
+});

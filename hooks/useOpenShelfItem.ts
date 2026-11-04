@@ -1,0 +1,111 @@
+import { useLoadingActions } from "@/contexts/LoadingContext";
+import { usePlayQueue } from "@/contexts/PlayQueueContext";
+import { isAudioItem, isBook, isFolder, isLiveChannel, isPhoto } from "@/services/jellyfinApi";
+import { isJoined, playForGroup } from "@/services/syncPlayManager";
+import { FolderStackEntry, JellyfinItem, JellyfinVideoItem } from "@/types/jellyfin";
+import { programInfoParams } from "@/utils/programInfo";
+import { useRouter } from "expo-router";
+import { useCallback } from "react";
+import { Platform } from "react-native";
+
+/**
+ * One press handler for every home shelf card. Folder kinds (Series, MusicAlbum, BoxSet,
+ * playlists...) navigate into their browse screen; a photo opens the viewer over the folder
+ * it lives in; playable leaves play with a binge queue built from SeriesId ?? ParentId (folder
+ * siblings for non-episodes, audio included); audio opens the native queue player. Playback
+ * params trust the state the shelf just displayed over the player's own item refetch: the
+ * item endpoint can answer with stale UserData (see the Continue Watching row's history).
+ */
+export function useOpenShelfItem() {
+  const router = useRouter();
+  const { showGlobalLoader } = useLoadingActions();
+  const { buildQueue } = usePlayQueue();
+
+  return useCallback(
+    // replace: swap the CURRENT route for the player instead of stacking. Required when the
+    // caller is a presented modal (video-info sheet): react-native-screens gives a screen
+    // pushed after a modal a zero-frame modal presentation, and AVKit presenting out of that
+    // crashes the app.
+    // fromStart: open at 0 even when the item has a resume point.
+    (item: JellyfinItem, options?: { replace?: boolean; fromStart?: boolean }) => {
+      // The Live TV view is a screen of its own (the guide), not a folder.
+      if (item.CollectionType === "livetv") {
+        if (Platform.isTV) router.navigate("/livetv");
+        else router.push({ pathname: "/live-tv", params: { viewId: item.Id, name: item.Name } });
+        return;
+      }
+      // A programme from search follows the guide's rule: on now tunes its channel, later opens its panel.
+      if (item.Type === "Program" && item.ChannelId) {
+        const startMs = Date.parse(item.StartDate ?? "");
+        const endMs = Date.parse(item.EndDate ?? "");
+        const nowMs = Date.now();
+        if (startMs <= nowMs && nowMs < endMs) {
+          showGlobalLoader();
+          router.push({ pathname: "/player", params: { videoId: item.ChannelId, videoName: item.ChannelName ?? item.Name, live: "1" } });
+        } else {
+          router.push({ pathname: "/video-info", params: programInfoParams(item, { Id: item.ChannelId, Name: item.ChannelName ?? item.Name }) });
+        }
+        return;
+      }
+      if (isFolder(item)) {
+        const type = item.Type === "Playlist" ? "playlist" : "folder";
+        const crumb: FolderStackEntry = { id: item.Id, name: item.Name, type, parentId: item.ParentId };
+        router.push({
+          pathname: "/[folderId]",
+          params: { folderId: item.Id, name: item.Name, type, crumbs: JSON.stringify([crumb]) },
+        });
+        return;
+      }
+
+      // A photo has no media source: routed to the player it renders "Failed to load video".
+      // Without a ParentId there is no set to step through, so the viewer opens on the photo alone.
+      if (isPhoto(item)) {
+        router.push({ pathname: "/photo-viewer", params: { photoId: item.Id, ...(item.ParentId ? { folderId: item.ParentId } : {}) } });
+        return;
+      }
+
+      // A book opens the reader; the player has nothing to play.
+      if (isBook(item)) {
+        router.push({ pathname: "/book-reader", params: { itemId: item.Id, name: item.Name } });
+        return;
+      }
+
+      // A live channel has no queue, no resume and no SyncPlay: the player opens the stream.
+      if (isLiveChannel(item)) {
+        showGlobalLoader();
+        const destination = { pathname: "/player" as const, params: { videoId: item.Id, videoName: item.Name, live: "1" } };
+        if (options?.replace) router.replace(destination);
+        else router.push(destination);
+        return;
+      }
+
+      // In a SyncPlay group, hand a video to the server: its queue push opens the player
+      // for everyone, us included. Audio has its own native player and stays local.
+      if (!isAudioItem(item) && isJoined()) {
+        void playForGroup([item as JellyfinVideoItem], 0, options?.fromStart ? 0 : (item.UserData?.PlaybackPositionTicks ?? 0));
+        return;
+      }
+      showGlobalLoader();
+      const queueParent = item.SeriesId ?? item.ParentId;
+      if (queueParent) {
+        buildQueue(queueParent, item.SeriesName ?? item.Name, item.Id);
+      }
+      const destination = {
+        pathname: isAudioItem(item) ? ("/audio-player" as const) : ("/player" as const),
+        params: {
+          videoId: item.Id,
+          videoName: item.Name,
+          ...(queueParent ? { queueMode: "true" } : {}),
+          ...(options?.fromStart ? { startTicks: "0" } : item.UserData?.PlaybackPositionTicks ? { startTicks: String(item.UserData.PlaybackPositionTicks) } : {}),
+          played: item.UserData?.Played ? "true" : "false",
+        },
+      };
+      if (options?.replace) {
+        router.replace(destination);
+      } else {
+        router.push(destination);
+      }
+    },
+    [router, showGlobalLoader, buildQueue],
+  );
+}

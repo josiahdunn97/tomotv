@@ -1,0 +1,370 @@
+/**
+ * The live ring owns every session it starts: neighbours heat only while the center plays, a
+ * session is bindable only once the engine cut a segment, and whatever leaves the ring is stopped.
+ */
+import { closeLiveStream, noteOpenFailed, resolveChannel } from "@/services/jellyfinApi";
+import { channelOnOneConnection, isHotChannel, recenterLiveRing, releaseLiveRing, retainLiveSession, ringAround, takeRingSession, takeWarmDetails, yieldLiveRing } from "@/services/liveRing";
+import { setLiveSessionPriority, setLiveWindow, startLocalRemux, stopLocalRemux } from "@/services/localRemux";
+import { originConnectionLimit } from "@keiver/tomo-engine";
+
+jest.mock("@/utils/logger", () => ({ logger: { error: jest.fn(), info: jest.fn(), debug: jest.fn(), warn: jest.fn() } }));
+
+jest.mock("@keiver/tomo-live/src/openFailures", () => ({
+  noteOpenFailed: jest.fn(),
+  openRecentlyFailed: jest.fn(() => false),
+}));
+const mockPlaylistRows = new Map<string, string>();
+jest.mock("@keiver/tomo-live/src/playlistChannels", () => ({
+  ...jest.requireActual("@keiver/tomo-live/src/playlistChannels"),
+  playlistChannelById: (id: string) => (mockPlaylistRows.has(id) ? { id, originKey: mockPlaylistRows.get(id) } : null),
+}));
+jest.mock("@/services/jellyfinApi", () => ({
+  resolveChannel: jest.fn((id: string) => Promise.resolve({ Id: id, Name: id, LiveStreamId: `ls-${id}`, liveStreamUrl: `https://origin/${id}.m3u8` })),
+  closeLiveStream: jest.fn(() => Promise.resolve()),
+  noteOpenFailed: jest.requireMock("@keiver/tomo-live/src/openFailures").noteOpenFailed,
+  openRecentlyFailed: jest.requireMock("@keiver/tomo-live/src/openFailures").openRecentlyFailed,
+}));
+
+const mockThroughput = new Map<string, () => void>();
+const mockFailures = new Map<string, (failure: { message: string }) => void>();
+jest.mock("@keiver/tomo-engine", () => ({
+  ...jest.requireActual("@keiver/tomo-engine"),
+  stopLocalRemux: jest.fn(() => Promise.resolve()),
+  localRemuxToken: (url: string | null) => url?.split("/").at(-2) ?? null,
+  setLiveWindow: jest.fn(() => Promise.resolve()),
+  setLiveSessionPriority: jest.fn(() => Promise.resolve()),
+  originConnectionLimit: jest.fn(() => null),
+  subscribeEngineThroughput: jest.fn((token: string, listener: () => void) => {
+    mockThroughput.set(token, listener);
+    return jest.fn();
+  }),
+  subscribeEngineFailure: jest.fn((token: string, listener: (failure: { message: string }) => void) => {
+    mockFailures.set(token, listener);
+    return jest.fn();
+  }),
+}));
+jest.mock("@/services/localRemux", () => ({
+  ...jest.requireMock("@keiver/tomo-engine"),
+  canRemuxLocally: jest.fn(() => Promise.resolve(true)),
+  startLocalRemux: jest.fn((details: { Id: string }) => Promise.resolve(`http://127.0.0.1:1/${details.Id}-s/master.m3u8`)),
+}));
+
+const RING = Array.from({ length: 30 }, (_, i) => ({ Id: `c${i}` }));
+const flush = async () => {
+  for (let hop = 0; hop < 12; hop++) await Promise.resolve();
+};
+const segmentCut = (token: string) => mockThroughput.get(token)!();
+
+describe("liveRing", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockThroughput.clear();
+    mockFailures.clear();
+  });
+  afterEach(async () => {
+    await releaseLiveRing();
+  });
+
+  it("names the ring either way round, wrapping, without the center", () => {
+    expect(ringAround(RING, "c0", 2)).toEqual(["c1", "c2", "c29", "c28"]);
+  });
+
+  it("heats both neighbours while the center plays, bindable once two segments are cut", async () => {
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+
+    expect(resolveChannel).toHaveBeenCalledWith("c6", undefined, { quiet: true });
+    expect(resolveChannel).toHaveBeenCalledWith("c4", undefined, { quiet: true });
+    expect(startLocalRemux).toHaveBeenCalledWith(expect.objectContaining({ Id: "c6" }), undefined, undefined, { prewarm: true, liveWindowSeconds: 20 });
+    expect(isHotChannel("c6")).toBe(false);
+
+    segmentCut("c6-s");
+    expect(isHotChannel("c6")).toBe(false);
+    segmentCut("c6-s");
+    expect(isHotChannel("c6")).toBe(true);
+    await expect(takeRingSession("c6")).resolves.toEqual({
+      channelId: "c6",
+      details: expect.objectContaining({ Id: "c6" }),
+      url: "http://127.0.0.1:1/c6-s/master.m3u8",
+      token: "c6-s",
+      ready: true,
+    });
+    expect(setLiveWindow).toHaveBeenCalledWith("c6-s", 300);
+    expect(setLiveSessionPriority).toHaveBeenCalledWith("c6-s", "playback");
+    expect(isHotChannel("c6")).toBe(false);
+  });
+
+  it("hands a flip the neighbour still cutting its first segments, so the player never opens the origin twice", async () => {
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+    segmentCut("c6-s");
+
+    await expect(takeRingSession("c6")).resolves.toMatchObject({ channelId: "c6", token: "c6-s", ready: false });
+    recenterLiveRing(RING, "c6", false);
+    await flush();
+    expect(stopLocalRemux).not.toHaveBeenCalledWith("c6-s");
+    expect(setLiveWindow).toHaveBeenCalledWith("c6-s", 300);
+    expect(setLiveSessionPriority).toHaveBeenCalledWith("c6-s", "playback");
+  });
+
+  it("hands a start still in flight to the flip waiting on it instead of stopping it", async () => {
+    let started!: (url: string) => void;
+    (startLocalRemux as jest.Mock).mockImplementationOnce(() => new Promise<string>((resolve) => (started = resolve)));
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+
+    const taken = takeRingSession("c6");
+    recenterLiveRing(RING, "c6", false);
+    started("http://127.0.0.1:1/c6-s/master.m3u8");
+    await expect(taken).resolves.toMatchObject({ channelId: "c6", token: "c6-s", ready: false });
+    await flush();
+    expect(stopLocalRemux).not.toHaveBeenCalledWith("c6-s");
+    expect(setLiveWindow).toHaveBeenCalledWith("c6-s", 300);
+    expect(setLiveSessionPriority).toHaveBeenCalledWith("c6-s", "playback");
+    expect(isHotChannel("c6")).toBe(false);
+  });
+
+  it("keeps a start that finishes after its channel became the center, before any flip asked for it", async () => {
+    let started!: (url: string) => void;
+    (startLocalRemux as jest.Mock).mockImplementationOnce(() => new Promise<string>((resolve) => (started = resolve)));
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+
+    // The flip recenters at once; its player asks only once the swipes settle.
+    recenterLiveRing(RING, "c6", false);
+    started("http://127.0.0.1:1/c6-s/master.m3u8");
+    await flush();
+    expect(stopLocalRemux).not.toHaveBeenCalledWith("c6-s");
+
+    await expect(takeRingSession("c6")).resolves.toMatchObject({ channelId: "c6", token: "c6-s", ready: false });
+    expect(setLiveWindow).toHaveBeenCalledWith("c6-s", 300);
+    expect(setLiveSessionPriority).toHaveBeenCalledWith("c6-s", "playback");
+  });
+
+  it("stops that start once the ring moves on without its player taking it", async () => {
+    let started!: (url: string) => void;
+    (startLocalRemux as jest.Mock).mockImplementationOnce(() => new Promise<string>((resolve) => (started = resolve)));
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+    recenterLiveRing(RING, "c6", false);
+    started("http://127.0.0.1:1/c6-s/master.m3u8");
+    await flush();
+
+    recenterLiveRing(RING, "c20", false);
+    await flush();
+    expect(stopLocalRemux).toHaveBeenCalledWith("c6-s");
+    await expect(takeRingSession("c6")).resolves.toBeNull();
+  });
+
+  it("gives a flip waiting on a start that fails nothing, so it opens its own", async () => {
+    (resolveChannel as jest.Mock).mockImplementationOnce(() => Promise.reject(new Error("timeout")));
+    recenterLiveRing(RING, "c5", true);
+    const taken = takeRingSession("c6");
+    await expect(taken).resolves.toBeNull();
+  });
+
+  it("gives a waiting flip nothing when the player leaves", async () => {
+    (startLocalRemux as jest.Mock).mockImplementationOnce(() => new Promise<string>(() => {}));
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+    const taken = takeRingSession("c6");
+    await releaseLiveRing();
+    await expect(taken).resolves.toBeNull();
+  });
+
+  it("has nothing to hand over for a channel the ring never touched", async () => {
+    await expect(takeRingSession("c20")).resolves.toBeNull();
+  });
+
+  it("opens nothing on the server and starts no engine session while the center loads", async () => {
+    recenterLiveRing(RING, "c5", false);
+    await flush();
+
+    expect(startLocalRemux).not.toHaveBeenCalled();
+    expect(resolveChannel).not.toHaveBeenCalled();
+  });
+
+  it("stops a neighbour that falls off the ring when the center moves", async () => {
+    recenterLiveRing(RING, "c5", true);
+    await flush();
+    segmentCut("c4-s");
+    segmentCut("c6-s");
+
+    recenterLiveRing(RING, "c6", true);
+    await flush();
+
+    expect(stopLocalRemux).toHaveBeenCalledWith("c4-s");
+    expect(closeLiveStream).toHaveBeenCalledWith("ls-c4");
+    expect(stopLocalRemux).not.toHaveBeenCalledWith("c6-s");
+    expect(startLocalRemux).toHaveBeenCalledWith(expect.objectContaining({ Id: "c7" }), undefined, undefined, expect.anything());
+  });
+
+  it("keeps the channel just left hot beside the new center, and releases everything with the player", async () => {
+    recenterLiveRing(RING, "c10", true);
+    await flush();
+    const left = { channelId: "c10", details: { Id: "c10", Name: "c10", LiveStreamId: "ls-c10" } as never, url: "http://127.0.0.1:1/c10-s/master.m3u8", token: "c10-s" };
+
+    expect(retainLiveSession(left)).toBe(true);
+    expect(setLiveWindow).toHaveBeenCalledWith("c10-s", 20);
+    expect(setLiveSessionPriority).toHaveBeenCalledWith("c10-s", "ring");
+    recenterLiveRing(RING, "c11", true);
+    await flush();
+    expect(stopLocalRemux).not.toHaveBeenCalledWith("c10-s");
+    expect(isHotChannel("c10")).toBe(true);
+
+    await releaseLiveRing();
+    expect(stopLocalRemux).toHaveBeenCalledWith("c10-s");
+    expect(closeLiveStream).toHaveBeenCalledWith("ls-c10");
+    expect(retainLiveSession({ ...left, channelId: "c12", token: "c12-x" })).toBe(false);
+  });
+
+  it("resolves nothing, starts no neighbour and keeps no channel left on a provider set to one connection", async () => {
+    (originConnectionLimit as jest.Mock).mockImplementation((key: string) => (key === "provider-one" ? 1 : null));
+    // The server's relay URL names the Jellyfin host: the playlist row is what names the provider.
+    const relayed = (id: string) => ({ Id: id, Name: id, LiveStreamId: `ls-${id}`, liveStreamUrl: `https://jellyfin/LiveTv/LiveStreamFiles/${id}/stream.ts` });
+    (resolveChannel as jest.Mock).mockImplementation((id: string) => Promise.resolve(relayed(id)));
+    try {
+      for (const id of ["c4", "c5", "c6"]) mockPlaylistRows.set(id, "provider-one");
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+      expect(resolveChannel).not.toHaveBeenCalled();
+      expect(startLocalRemux).not.toHaveBeenCalled();
+      expect(isHotChannel("c6")).toBe(false);
+
+      const left = { channelId: "c5", details: relayed("c5") as never, url: "http://127.0.0.1:1/c5-s/master.m3u8", token: "c5-s" };
+      expect(retainLiveSession(left)).toBe(false);
+      expect(isHotChannel("c5")).toBe(false);
+      mockPlaylistRows.set("c5", "provider-two");
+      expect(retainLiveSession(left)).toBe(true);
+    } finally {
+      mockPlaylistRows.clear();
+      (originConnectionLimit as jest.Mock).mockImplementation(() => null);
+      (resolveChannel as jest.Mock).mockImplementation((id: string) => Promise.resolve({ Id: id, Name: id, LiveStreamId: `ls-${id}`, liveStreamUrl: `https://origin/${id}.m3u8` }));
+    }
+  });
+
+  it("names a channel on one connection from its playlist row's provider", () => {
+    (originConnectionLimit as jest.Mock).mockImplementation((key: string) => (key === "provider-one" ? 1 : key === "provider-two" ? 2 : null));
+    try {
+      mockPlaylistRows.set("one", "provider-one");
+      mockPlaylistRows.set("two", "provider-two");
+      expect(channelOnOneConnection("one")).toBe(true);
+      expect(channelOnOneConnection("two")).toBe(false);
+      expect(channelOnOneConnection("unlisted")).toBe(false);
+    } finally {
+      mockPlaylistRows.clear();
+      (originConnectionLimit as jest.Mock).mockImplementation(() => null);
+    }
+  });
+
+  it("leaves a neighbour whose engine failed cold instead of starting it again", async () => {
+    recenterLiveRing(RING, "c20", true);
+    await flush();
+    mockFailures.get("c21-s")!({ message: "open_input: I/O error" });
+
+    expect(stopLocalRemux).toHaveBeenCalledWith("c21-s");
+    recenterLiveRing(RING, "c20", true);
+    await flush();
+    expect((startLocalRemux as jest.Mock).mock.calls.filter(([details]) => details.Id === "c21")).toHaveLength(1);
+  });
+
+  it("notes a neighbour whose open failed", async () => {
+    (resolveChannel as jest.Mock).mockImplementationOnce(() => Promise.reject(new Error("timeout")));
+    recenterLiveRing(RING, "c25", true);
+    await flush();
+
+    expect(noteOpenFailed).toHaveBeenCalledWith("c26");
+  });
+
+  describe("surf window", () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it("releases every neighbour when the window closes, and a flip re-arms it", async () => {
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+      segmentCut("c6-s");
+      segmentCut("c6-s");
+
+      jest.advanceTimersByTime(30_000);
+      expect(stopLocalRemux).toHaveBeenCalledWith("c6-s");
+      expect(stopLocalRemux).toHaveBeenCalledWith("c4-s");
+      expect(isHotChannel("c6")).toBe(false);
+
+      // A lane retry recenters on the same channel and heats nothing.
+      (startLocalRemux as jest.Mock).mockClear();
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+      expect(startLocalRemux).not.toHaveBeenCalled();
+
+      recenterLiveRing(RING, "c6", true);
+      await flush();
+      expect(startLocalRemux).toHaveBeenCalledWith(expect.objectContaining({ Id: "c7" }), undefined, undefined, expect.anything());
+    });
+
+    it("abandons a start still in flight when the window closes", async () => {
+      let started!: (url: string) => void;
+      (startLocalRemux as jest.Mock).mockImplementationOnce(() => new Promise<string>((resolve) => (started = resolve)));
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+
+      jest.advanceTimersByTime(30_000);
+      started("http://127.0.0.1:1/c6-s/master.m3u8");
+      await flush();
+      expect(stopLocalRemux).toHaveBeenCalledWith("c6-s");
+      expect(isHotChannel("c6")).toBe(false);
+    });
+
+    it("refuses to retain a channel left after the window closed", async () => {
+      recenterLiveRing(RING, "c10", true);
+      await flush();
+      jest.advanceTimersByTime(30_000);
+
+      const left = { channelId: "c10", details: { Id: "c10", Name: "c10", LiveStreamId: "ls-c10" } as never, url: "http://127.0.0.1:1/c10-s/master.m3u8", token: "c10-s" };
+      expect(retainLiveSession(left)).toBe(false);
+    });
+
+    it("yields every neighbour to a starving playing channel, until the next flip", async () => {
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+
+      yieldLiveRing();
+      expect(stopLocalRemux).toHaveBeenCalledWith("c6-s");
+      expect(stopLocalRemux).toHaveBeenCalledWith("c4-s");
+
+      (startLocalRemux as jest.Mock).mockClear();
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+      expect(startLocalRemux).not.toHaveBeenCalled();
+
+      recenterLiveRing(RING, "c6", true);
+      await flush();
+      expect(startLocalRemux).toHaveBeenCalled();
+    });
+  });
+
+  describe("warm details", () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it("keeps a manifest resolve for one flip, fresh only", async () => {
+      const manifest = (id: string) => Promise.resolve({ Id: id, Name: id, liveStreamUrl: `https://origin/${id}.m3u8` });
+      (resolveChannel as jest.Mock).mockImplementationOnce(manifest).mockImplementationOnce(manifest);
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+
+      expect(takeWarmDetails("c6")).toMatchObject({ Id: "c6" });
+      expect(takeWarmDetails("c6")).toBeNull();
+
+      jest.advanceTimersByTime(61_000);
+      expect(takeWarmDetails("c4")).toBeNull();
+    });
+
+    it("never keeps a resolve that opened a stream on the server", async () => {
+      recenterLiveRing(RING, "c5", true);
+      await flush();
+
+      expect(takeWarmDetails("c6")).toBeNull();
+    });
+  });
+});

@@ -1,0 +1,145 @@
+import { FocusableButton } from "@/components/FocusableButton";
+import { GlassButton } from "@/components/glass-button";
+import { LoadingRow } from "@/components/loading-row";
+import { QuickConnectCode } from "@/components/settings/QuickConnectCode";
+import { COLORS } from "@/constants/colors";
+import { Ionicons } from "@expo/vector-icons";
+import React, { useEffect, useRef, useState } from "react";
+import { AccessibilityInfo, Clipboard, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { settingsStyles } from "./styles";
+import { t } from "@/services/i18n";
+
+const COPIED_MS = 1600;
+
+interface QuickConnectSectionProps {
+  code: string | null;
+  status: string;
+  error: string | null;
+  onCancel: () => void;
+  onSwitchToPassword: () => void;
+}
+
+export function QuickConnectSection({ code, status, error, onCancel, onSwitchToPassword }: QuickConnectSectionProps) {
+  // Read the code digit-by-digit with context when it appears
+  const spokenCode = code ? code.split("").join(" ") : "";
+  useEffect(() => {
+    if (status === "SHOWING_CODE" && spokenCode) {
+      AccessibilityInfo.announceForAccessibility(t("settings.quickConnectSpoken").replace("{code}", spokenCode));
+    }
+  }, [status, spokenCode]);
+
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  const handleCopy = () => {
+    if (!code) return;
+    Clipboard.setString(code);
+    setCopied(true);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), COPIED_MS);
+  };
+
+  const canCopy = !Platform.isTV && status === "SHOWING_CODE" && !!code;
+
+  const cardContent = (
+    <>
+      {status === "INITIATING" && (
+        <View style={styles.centeredContent}>
+          <LoadingRow label={t("connect.quickConnectStarting")} />
+        </View>
+      )}
+
+      {status === "SHOWING_CODE" && code && (
+        <View style={styles.centeredContent}>
+          <QuickConnectCode code={code} spokenCode={spokenCode} />
+        </View>
+      )}
+
+      {/* Absolute so the confirmation never nudges the dead-centered code. */}
+      {copied && (
+        <Text style={styles.copiedCaption} importantForAccessibility="no">
+          {t("connect.quickConnectCopied")}
+        </Text>
+      )}
+
+      {status === "ERROR" && (
+        <View style={styles.centeredContent}>
+          <Ionicons name="alert-circle" size={Platform.isTV ? 48 : 36} color={COLORS.DESTRUCTIVE} />
+          <Text style={styles.errorText}>{error}</Text>
+        </View>
+      )}
+    </>
+  );
+
+  const cardStyle = [settingsStyles.listItem, settingsStyles.listItemFirst, settingsStyles.listItemLast, styles.quickConnectContainer];
+
+  return (
+    <>
+      <View style={settingsStyles.section}>
+        {/* The whole card is the copy target on touch platforms; TV keeps a plain view so
+            nothing here competes with the focus engine. */}
+        {canCopy ? (
+          <Pressable style={cardStyle} onPress={handleCopy} accessibilityRole="button" accessibilityLabel={`Quick Connect code: ${spokenCode}`} accessibilityHint={t("connect.quickConnectCopyHint")}>
+            {cardContent}
+          </Pressable>
+        ) : (
+          <View style={cardStyle}>{cardContent}</View>
+        )}
+      </View>
+
+      {/* Not a fill: the task this step waits on happens on the server, so the one action here is
+          the way OUT of it. TV: a glass pill. Phone: an outline pill at the primary CTA's width. */}
+      <View style={[settingsStyles.buttonGroup, Platform.isTV && styles.glassGroup]}>
+        {Platform.isTV ? (
+          <GlassButton title={t("connect.useUsernamePassword")} onPress={onSwitchToPassword} />
+        ) : (
+          <FocusableButton title={t("connect.useUsernamePassword")} variant="secondary" onPress={onSwitchToPassword} style={settingsStyles.fullWidthButton} />
+        )}
+      </View>
+
+      {/* Phone: Cancel is the nav bar's back button (app/_layout.tsx). TV has no bar. */}
+      {Platform.isTV && (
+        <View style={settingsStyles.secondaryActions}>
+          <GlassButton title={t("common.cancel")} onPress={onCancel} />
+        </View>
+      )}
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  // A column stretches its children, which would widen the glass capsule into a slab.
+  glassGroup: {
+    alignItems: "center",
+  },
+  quickConnectContainer: {
+    minHeight: Platform.isTV ? 280 : 200,
+    justifyContent: "center",
+  },
+  centeredContent: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: Platform.isTV ? 20 : 14,
+  },
+  copiedCaption: {
+    position: "absolute",
+    bottom: 12,
+    alignSelf: "center",
+    fontSize: 13,
+    fontWeight: "600",
+    color: COLORS.TEXT_SECONDARY,
+  },
+  errorText: {
+    fontSize: Platform.isTV ? 28 : 17,
+    // Lighter red than #FF3B30: needs 4.5:1 on the #2C2C2E card behind it
+    color: COLORS.DESTRUCTIVE_SOFT,
+    textAlign: "center",
+    paddingHorizontal: Platform.isTV ? 24 : 16,
+  },
+});

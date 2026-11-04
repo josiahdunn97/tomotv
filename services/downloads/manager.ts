@@ -1,0 +1,706 @@
+/**
+ * manager.ts
+ *
+ * Singleton lifecycle for offline downloads, in the same shape as audioPlayerManager:
+ * everything with a lifetime lives here and screens subscribe for display state.
+ *
+ * Transfers are expo-file-system DownloadTasks on a background URLSession, so they survive
+ * the app being suspended. They do NOT survive the app being terminated: the completion
+ * delegate belongs to the JS runtime, so a transfer in flight when the app dies is lost and
+ * restarts. Every entry is therefore re-checked against the file on disk at launch.
+ */
+
+import { File, Paths } from "expo-file-system";
+
+import { createDownload, isPartedState, restoreDownload, type AnyDownload, type AnyPauseState } from "./partedDownload";
+import { API_TIMEOUTS } from "@/services/jellyfin/constants";
+import { fetchWithTimeout } from "@/services/jellyfin/http";
+import { getPosterUrl, hasPoster } from "@/services/jellyfin/images";
+import { networkLyrics } from "@/services/lyrics/pipeline";
+import { generatePlaySessionId, getAuthHeader, getConfig } from "@/services/jellyfin/session";
+import { getConvertedDownloadUrl, getRemoteVideoStreamUrl } from "@/services/jellyfin/streamUrls";
+import { getRemoteSubtitleUrl, getTextSubtitleStreams, isTextSidecar } from "@/services/jellyfin/subtitles";
+import { wantsPosterFrame } from "@/services/itemArtwork";
+import { cancelPosterFrame, requestPosterFrame } from "@/services/localRemux";
+import { isPlaybackHeld, onPlaybackHoldReleased } from "@/services/playbackHold";
+import { conversionAudioIndex, convertedItem, type ConversionRung } from "./convert";
+import type { JellyfinVideoItem } from "@/types/jellyfin";
+import { logger } from "@/utils/logger";
+import { flushManifest, loadManifest, manifestEntries, manifestEntry, patchEntry, putEntry, removeEntry, resetManifestCache, type DownloadEntry } from "./manifest";
+import {
+  artworkFile,
+  lyricsFile,
+  subtitleFile,
+  DISK_HEADROOM_BYTES,
+  downloadsSupported,
+  ensureDownloadsRoot,
+  ensureItemDirectory,
+  mediaFile,
+  removeItemDirectory,
+  repackagedFile,
+  resolveItemFile,
+} from "./paths";
+import { cancelRepackage, containerOf, needsRepackage, repackageDownload, rewrapLeftNothingPlayable } from "./repackage";
+
+/** Concurrent transfers. Two keeps a phone's link busy without starving playback. */
+const MAX_ACTIVE = 2;
+/** Free space kept clear of downloads, so a full disk cannot wedge the OS. */
+/** Progress arrives at 10 Hz per transfer; the row drawing it does not need it that often. */
+const PROGRESS_INTERVAL_MS = 400;
+/** Each running transfer's counter is read once a second for the rate the Downloads heading shows. */
+const RATE_INTERVAL_MS = 1000;
+/** The one failure a sign-in undoes, so hydrate can tell it from a failure that stands. */
+const NO_SESSION_ERROR = "Not connected to a server";
+/** Waited after playback lets go before the heal sweep believes it: the next session takes the
+ *  hold again across a native await, and a rewrap must not start inside that gap. */
+export const HEAL_SETTLE_MS = 2000;
+
+export interface DownloadsUIState {
+  entries: DownloadEntry[];
+  activeCount: number;
+  /** False until the manifest has been read; the Downloads screen shows nothing before then. */
+  hydrated: boolean;
+}
+
+export interface DownloadProgress {
+  bytesWritten: number;
+  totalBytes: number;
+}
+
+type Listener = (state: DownloadsUIState) => void;
+type ProgressListener = (progress: DownloadProgress) => void;
+type ThroughputListener = (bytesPerSecond: number) => void;
+type SideKind = "art" | "subs";
+
+class DownloadManager {
+  private tasks = new Map<string, AnyDownload>();
+  /** Process-lifetime only; see the note on DownloadEntry for why it never reaches disk. */
+  private resumeStates = new Map<string, AnyPauseState>();
+  private listeners = new Set<Listener>();
+  private progressListeners = new Map<string, Set<ProgressListener>>();
+  private progressTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private throughputListeners = new Set<ThroughputListener>();
+  private rateTimer: ReturnType<typeof setInterval> | null = null;
+  private rateSampledAt = 0;
+  /** Each running transfer's counter at the last sample. */
+  private rateBytes = new Map<string, number>();
+  private throughput = 0;
+  private hydrated = false;
+  private hydrating: Promise<void> | null = null;
+  private healOnRelease: (() => void) | null = null;
+  /** Poster and subtitle fetches, each kind MAX_ACTIVE at a time so a whole folder does not fetch at
+   *  once; apart, so a subtitle never waits behind a keyframe decode. */
+  private sideQueues: Record<SideKind, { itemId: string; run: () => Promise<void> }[]> = { art: [], subs: [] };
+  private sideRunning: Record<SideKind, number> = { art: 0, subs: 0 };
+
+  isSupported(): boolean {
+    return downloadsSupported();
+  }
+
+  /**
+   * Reads the manifest and reconciles every entry with what is actually on disk. Runs once;
+   * concurrent callers share the same promise.
+   */
+  hydrate(): Promise<void> {
+    if (this.hydrating) return this.hydrating;
+    this.hydrating = (async () => {
+      if (!downloadsSupported()) {
+        this.hydrated = true;
+        this.notify();
+        return;
+      }
+      await loadManifest();
+      for (const entry of manifestEntries()) {
+        if (entry.state === "failed") {
+          // A row a sign-out failed before transfers learned to park. Rewound so the list
+          // offers a resume rather than an error a sign-in has already answered.
+          if (entry.error === NO_SESSION_ERROR) patchEntry(entry.itemId, { state: "paused", error: undefined });
+          continue;
+        }
+        // Nothing in JS hears about a transfer that ended while the app was dead, so the
+        // file is the only witness. An unknown size can never be called complete.
+        const file = resolveItemFile(entry.itemId, entry.fileUri);
+        if (entry.state === "ready") {
+          // A reinstall leaves ready rows pointing into the previous container. Demoted here
+          // so the screen offers a re-download instead of the row failing at play time.
+          if (!file.exists) patchEntry(entry.itemId, { state: "failed", error: "No longer on this device" });
+          else {
+            this.queueSide("subs", entry.itemId, () => this.cacheSubtitles(entry.item));
+            this.queueSide("subs", entry.itemId, () => this.cacheLyrics(entry.item));
+            if (!entry.artworkUri) this.queueSide("art", entry.itemId, () => this.cacheArtwork(entry.item));
+          }
+          continue;
+        }
+        // A repackage never survives the app dying, and its output is incomplete. The
+        // source it was reading is still whole, so the row goes ready on that.
+        if (entry.state === "repackaging") {
+          const target = repackagedFile(entry.itemId);
+          if (target.exists && target.uri !== file.uri) {
+            try {
+              target.delete();
+            } catch (error) {
+              logger.warn("Could not clear a half-written repackage", error, { service: "Downloads", itemId: entry.itemId });
+            }
+          }
+          patchEntry(entry.itemId, file.exists ? { state: "ready" } : { state: "failed", error: "No longer on this device" });
+          continue;
+        }
+        const complete = file.exists && entry.totalBytes > 0 && file.size >= entry.totalBytes;
+        patchEntry(entry.itemId, complete ? { state: "ready", bytesWritten: entry.totalBytes } : { state: "paused" });
+      }
+      this.hydrated = true;
+      this.notify();
+      // Detached: the Downloads screen renders off `hydrated`, and a sweep can run for
+      // as long as the files it finds need.
+      void this.healRepackages();
+    })();
+    return this.hydrating;
+  }
+
+  getState(): DownloadsUIState {
+    return {
+      entries: manifestEntries().sort((a, b) => b.addedAt - a.addedAt),
+      activeCount: this.tasks.size,
+      hydrated: this.hydrated,
+    };
+  }
+
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    listener(this.getState());
+    return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * One transfer's byte counts, for the row drawing them. Separate from `subscribe` because it
+   * fires for minutes: routing it through the screen's state re-rendered every row 2.5 times a
+   * second, and each render re-registers Reanimated worklets the runtime never releases.
+   */
+  subscribeProgress(itemId: string, listener: ProgressListener): () => void {
+    const listeners = this.progressListeners.get(itemId) ?? new Set<ProgressListener>();
+    listeners.add(listener);
+    this.progressListeners.set(itemId, listeners);
+    const entry = manifestEntry(itemId);
+    if (entry) listener({ bytesWritten: entry.bytesWritten, totalBytes: entry.totalBytes });
+    return () => {
+      const current = this.progressListeners.get(itemId);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.progressListeners.delete(itemId);
+    };
+  }
+
+  /** Bytes per second summed over the running transfers, 0 while none runs. Fires once on subscribe. */
+  subscribeThroughput(listener: ThroughputListener): () => void {
+    this.throughputListeners.add(listener);
+    listener(this.throughput);
+    return () => {
+      this.throughputListeners.delete(listener);
+    };
+  }
+
+  /** True once the item's media is complete on disk. The playback path's only question. */
+  isReady(itemId: string): boolean {
+    return manifestEntry(itemId)?.state === "ready";
+  }
+
+  /** Known at all, in any state. A folder download uses this to offer only the difference. */
+  has(itemId: string): boolean {
+    return manifestEntry(itemId) !== undefined;
+  }
+
+  /**
+   * Queue an item for download. Re-queuing something already known is a no-op, so a
+   * double-tap on the download button cannot start two transfers for one item.
+   */
+  async enqueue(item: JellyfinVideoItem, options: { group?: { id: string; name: string }; convert?: ConversionRung; audioIndex?: number; burnSubtitleIndex?: number } = {}): Promise<void> {
+    if (!downloadsSupported()) throw new Error("Downloads need an iPhone or iPad");
+    await this.hydrate();
+    if (manifestEntry(item.Id)) return;
+
+    // A conversion's size is only known once it lands; the caller checks the estimate. It keeps
+    // one audio track, the one picked for it.
+    const rung = options.convert;
+    const stored = rung ? convertedItem(item, rung, options.audioIndex) : item;
+    const size = rung ? -1 : (item.MediaSources?.[0]?.Size ?? -1);
+    if (size > 0 && Paths.availableDiskSpace - size < DISK_HEADROOM_BYTES) {
+      throw new Error("Not enough free space for this download");
+    }
+
+    await ensureDownloadsRoot();
+    ensureItemDirectory(item.Id);
+
+    putEntry({
+      itemId: item.Id,
+      fileUri: mediaFile(item.Id, stored.MediaSources?.[0]?.Container ?? stored.Container).uri,
+      artworkUri: null,
+      bytesWritten: 0,
+      totalBytes: size,
+      state: "queued",
+      addedAt: Date.now(),
+      group: options.group,
+      converted: rung,
+      burnedSubtitle: rung ? options.burnSubtitleIndex : undefined,
+      item: stored,
+    });
+    this.notify();
+    this.queueSide("art", item.Id, () => this.cacheArtwork(item));
+    this.queueSide("subs", item.Id, () => this.cacheSubtitles(stored));
+    this.queueSide("subs", item.Id, () => this.cacheLyrics(item));
+    this.pump();
+  }
+
+  /** Pause an in-flight transfer, keeping the bytes already on disk. */
+  async pause(itemId: string): Promise<void> {
+    // A conversion streams with Accept-Ranges: none, so a pause leaves nothing to resume from.
+    if (manifestEntry(itemId)?.converted) return;
+    const task = this.tasks.get(itemId);
+    if (!task) return;
+    await task.pauseAsync();
+    this.tasks.delete(itemId);
+    this.syncRateSampler();
+    const saved = task.savable();
+    // A pause before any byte landed carries no resume data; the next start opens a fresh request.
+    if (isPartedState(saved) ? saved.states.some((part) => part.done || part.savable) : Boolean(saved.resumeData)) this.resumeStates.set(itemId, saved);
+    this.clearProgressTimer(itemId);
+    patchEntry(itemId, { state: "paused" });
+    this.notify();
+    this.pump();
+  }
+
+  resume(itemId: string): void {
+    const entry = manifestEntry(itemId);
+    if (!entry || entry.state === "ready" || entry.state === "downloading") return;
+    patchEntry(itemId, { state: "queued", error: undefined });
+    this.notify();
+    this.pump();
+  }
+
+  /** Cancel and delete: the item's whole directory goes, media and poster together. */
+  async remove(itemId: string): Promise<void> {
+    const task = this.tasks.get(itemId);
+    if (task) {
+      task.cancel();
+      this.tasks.delete(itemId);
+      this.syncRateSampler();
+    }
+    this.resumeStates.delete(itemId);
+    for (const kind of ["art", "subs"] as const) this.sideQueues[kind] = this.sideQueues[kind].filter((task) => task.itemId !== itemId);
+    cancelRepackage(itemId);
+    this.clearProgressTimer(itemId);
+    removeEntry(itemId);
+    try {
+      removeItemDirectory(itemId);
+    } catch (error) {
+      logger.warn("Could not delete download directory", error, { service: "Downloads", itemId });
+    }
+    this.notify();
+    this.pump();
+  }
+
+  /**
+   * Every transfer stops and every file goes. Downloads outlive sign-out and server switches
+   * on purpose, so the storage gauge is the only thing allowed to call this.
+   *
+   * `hydrated` stays true: the disk has been read, and the empty manifest left behind is the
+   * truth. Clearing it renders the screen blank, which nothing re-hydrates.
+   */
+  async removeAll(): Promise<void> {
+    for (const entry of manifestEntries()) {
+      await this.remove(entry.itemId);
+    }
+    await flushManifest();
+    resetManifestCache();
+    resetDownloadPolicyCache();
+    this.notify();
+  }
+
+  // MARK: - Internals
+
+  /**
+   * Starts queued entries up to the concurrency cap, oldest request first.
+   *
+   * The entry flips to `downloading` here rather than inside start(), which only reaches its
+   * first assignment several awaits later, long enough for this loop to pick the same
+   * still-queued entry twice.
+   */
+  private pump(): void {
+    let active = manifestEntries().filter((entry) => entry.state === "downloading").length;
+    while (active < MAX_ACTIVE) {
+      const next = manifestEntries()
+        .filter((entry) => entry.state === "queued")
+        .sort((a, b) => a.addedAt - b.addedAt)[0];
+      if (!next) break;
+      patchEntry(next.itemId, { state: "downloading" });
+      active += 1;
+      void this.start(next);
+    }
+    this.notify();
+  }
+
+  private async start(entry: DownloadEntry): Promise<void> {
+    // Signed out there is no server to ask, so the transfer parks instead of failing: a failed
+    // row wears an error the session outlives and offers a retry that cannot work.
+    if (!(await connectedToServer())) {
+      patchEntry(entry.itemId, { state: "paused" });
+      this.notify();
+      this.pump();
+      return;
+    }
+
+    const saved = this.resumeStates.get(entry.itemId);
+    let task: AnyDownload;
+    try {
+      const options = {
+        headers: await authHeaders(),
+        onProgress: ({ bytesWritten, totalBytes }: { bytesWritten: number; totalBytes: number }) => {
+          // false: byte counts ride the manifest's interval write instead of forcing one.
+          patchEntry(entry.itemId, totalBytes > 0 ? { bytesWritten, totalBytes } : { bytesWritten }, false);
+          this.emitProgressSoon(entry.itemId);
+        },
+      };
+      // A conversion streams with Accept-Ranges: none; only a Static original runs parted.
+      task = saved ? restoreDownload(saved, options) : await createDownload(await downloadUrl(entry), resolveItemFile(entry.itemId, entry.fileUri), options, !entry.converted);
+    } catch (error) {
+      this.fail(entry.itemId, error);
+      return;
+    }
+
+    // A remove that landed during the awaits above already dropped the entry; registering
+    // this task now would orphan a transfer nothing tracks or cancels.
+    if (!manifestEntry(entry.itemId)) {
+      task.cancel();
+      return;
+    }
+    this.tasks.set(entry.itemId, task);
+    this.syncRateSampler();
+    // Consumed: the blob is single-use, and a failed resume has to start a fresh request.
+    this.resumeStates.delete(entry.itemId);
+    this.notify();
+
+    try {
+      const file = saved ? await task.resumeAsync() : await task.downloadAsync();
+      this.tasks.delete(entry.itemId);
+      this.syncRateSampler();
+      // null means the transfer was paused; pause() has already recorded that state.
+      if (file) {
+        // Rewrapped before the row goes ready, so nothing ever plays the source container
+        // and a kill mid-pass leaves a `repackaging` row rather than a half file called ready.
+        patchEntry(entry.itemId, { state: "repackaging", fileUri: file.uri, bytesWritten: file.size, totalBytes: file.size });
+        this.notify();
+        await this.runRepackage(entry, file);
+        logger.info("Download complete", { service: "Downloads", itemId: entry.itemId });
+      }
+    } catch (error) {
+      this.tasks.delete(entry.itemId);
+      this.syncRateSampler();
+      this.fail(entry.itemId, error);
+    }
+    this.clearProgressTimer(entry.itemId);
+    this.notify();
+    this.pump();
+  }
+
+  /**
+   * One rewrap attempt, recording what it decided. `repackaging` is entered first so a
+   * kill mid-pass leaves a state hydrate can recognise instead of a file called ready.
+   */
+  private async runRepackage(entry: DownloadEntry, file: File): Promise<void> {
+    patchEntry(entry.itemId, { state: "repackaging" });
+    this.notify();
+    const outcome = await repackageDownload(entry, file);
+    patchEntry(entry.itemId, {
+      state: "ready",
+      fileUri: outcome.file.uri,
+      bytesWritten: outcome.file.size,
+      totalBytes: outcome.file.size,
+      repackaged: outcome.repackaged,
+      repackageDeclined: outcome.declinedPermanently || undefined,
+      repackageAttempts: outcome.repackaged ? undefined : outcome.skipped ? entry.repackageAttempts : (entry.repackageAttempts ?? 0) + 1,
+      subtitleStreamIndices: outcome.subtitleStreamIndices,
+      imageSubtitleIndices: outcome.imageSubtitleIndices,
+    });
+    this.notify();
+  }
+
+  /**
+   * Rewraps whatever earlier runs left behind: a pass the app was killed during, one that
+   * ran out of background time, and every file a build without the subtitle encoder had to
+   * decline. Serial and last-first, so a launch never spends the device on all of them at once.
+   */
+  private async healRepackages(): Promise<void> {
+    let requeued = 0;
+    for (const entry of manifestEntries()) {
+      const emptied = rewrapLeftNothingPlayable(entry);
+      if (!emptied && !needsRepackage(entry)) continue;
+      // A rewrap deletes its source, and a live queue holds file URLs resolved at start:
+      // the pass waits for playback to let go rather than pulling a file out from under it.
+      if (isPlaybackHeld()) {
+        this.healWhenReleased();
+        break;
+      }
+      if (emptied) {
+        if (this.requeueEmptiedRewrap(entry)) requeued += 1;
+        continue;
+      }
+      const file = resolveItemFile(entry.itemId, entry.fileUri);
+      if (!file.exists) continue;
+      logger.info("Healing a download that never got rewrapped", { service: "Downloads", itemId: entry.itemId });
+      await this.runRepackage(entry, file);
+    }
+    if (requeued > 0) {
+      logger.info("Re-downloading files a rewrap left with nothing playable", { service: "Downloads", count: requeued });
+      this.notify();
+      this.pump();
+    }
+  }
+
+  /**
+   * Puts an item back on the wire. The rewrap that emptied it deleted the source, so the file
+   * it points at is the only copy and it plays nothing: it goes, and the transfer runs again.
+   */
+  private requeueEmptiedRewrap(entry: DownloadEntry): boolean {
+    const dead = resolveItemFile(entry.itemId, entry.fileUri);
+    try {
+      if (dead.exists) dead.delete();
+    } catch (error) {
+      logger.warn("Could not clear a rewrap that plays nothing", error, { service: "Downloads", itemId: entry.itemId });
+      return false;
+    }
+    // Both counters go, not just the written one: they describe the MP4 that was just deleted,
+    // and hydrate calls a transfer complete by measuring the file on disk against totalBytes.
+    patchEntry(entry.itemId, {
+      state: "queued",
+      fileUri: mediaFile(entry.itemId, containerOf(entry)).uri,
+      bytesWritten: 0,
+      totalBytes: 0,
+      repackaged: undefined,
+      repackageAttempts: undefined,
+      error: undefined,
+    });
+    return true;
+  }
+
+  private healWhenReleased(): void {
+    if (this.healOnRelease) return;
+    logger.info("Heal sweep waiting for playback to end", { service: "Downloads" });
+    this.healOnRelease = onPlaybackHoldReleased(() => {
+      this.healOnRelease?.();
+      this.healOnRelease = null;
+      // Not on the release itself: it runs inside setPlaybackHold, and a queue advance releases
+      // and re-takes the hold around a native await. The hold is re-read before the sweep runs.
+      setTimeout(() => {
+        if (isPlaybackHeld()) {
+          this.healWhenReleased();
+          return;
+        }
+        void this.healRepackages();
+      }, HEAL_SETTLE_MS);
+    });
+  }
+
+  private fail(itemId: string, error: unknown): void {
+    logger.warn("Download failed", error, { service: "Downloads", itemId });
+    patchEntry(itemId, { state: "failed", error: error instanceof Error ? error.message : String(error) });
+    this.notify();
+  }
+
+  /** The poster, fetched once so the Downloads list works with no server. */
+  private async cacheArtwork(item: JellyfinVideoItem): Promise<void> {
+    try {
+      const file = hasPoster(item) ? await File.downloadFileAsync(getPosterUrl(item.Id, 600), artworkFile(item.Id), { idempotent: true }) : await this.copyPosterFrame(item);
+      if (!file) return;
+      // Not a state transition: a lost artwork URI is refetched at the next hydrate, so it
+      // rides the interval write instead of forcing one per poster in a folder enqueue.
+      patchEntry(item.Id, { artworkUri: file.uri }, false);
+      this.notify();
+    } catch (error) {
+      logger.warn("Could not cache download artwork", error, { service: "Downloads", itemId: item.Id });
+    }
+  }
+
+  /** The engine's keyframe, copied out of the frame pool: the pool trims, a download does not. */
+  private async copyPosterFrame(item: JellyfinVideoItem): Promise<File | null> {
+    if (!wantsPosterFrame(item)) return null;
+    try {
+      const frame = await requestPosterFrame(item);
+      if (!frame) return null;
+      const file = artworkFile(item.Id);
+      if (!file.exists) await new File(frame).copy(file);
+      return file;
+    } finally {
+      // Every request owes one, or the count never falls to the card that cancels the job.
+      cancelPosterFrame(item.Id);
+    }
+  }
+
+  /**
+   * Every text sidecar, converted to WebVTT by the server while it is still reachable. The engine
+   * reads one it has no copy of from the server at play time, so a held file without them plays
+   * offline with no subtitles. Tracks inside the file are never asked of the server (it reads the
+   * whole film to answer); an original's are decoded from the media, a conversion has none.
+   */
+  private async cacheSubtitles(item: JellyfinVideoItem): Promise<void> {
+    const text = getTextSubtitleStreams(item).filter((stream) => stream.Index !== undefined && isTextSidecar(stream));
+    for (const stream of text) {
+      const index = stream.Index as number;
+      if (subtitleFile(item.Id, index).exists) continue;
+      try {
+        await File.downloadFileAsync(getRemoteSubtitleUrl(item.Id, index, "vtt"), subtitleFile(item.Id, index), { idempotent: true });
+      } catch (error) {
+        logger.warn("Could not cache a download subtitle track", error, { service: "Downloads", itemId: item.Id, index });
+      }
+    }
+  }
+
+  /** A song's lyrics from the server or lrclib.net, kept so the song has them with no network. */
+  private async cacheLyrics(item: JellyfinVideoItem): Promise<void> {
+    if (item.Type !== "Audio" || lyricsFile(item.Id).exists) return;
+    const lyrics = await networkLyrics(item);
+    if (!lyrics) return;
+    try {
+      ensureItemDirectory(item.Id);
+      lyricsFile(item.Id).write(JSON.stringify(lyrics));
+    } catch (error) {
+      logger.warn("Could not cache a download's lyrics", error, { service: "Downloads", itemId: item.Id });
+    }
+  }
+
+  private queueSide(kind: SideKind, itemId: string, run: () => Promise<void>): void {
+    this.sideQueues[kind].push({ itemId, run });
+    this.drainSide(kind);
+  }
+
+  private drainSide(kind: SideKind): void {
+    while (this.sideRunning[kind] < MAX_ACTIVE) {
+      const task = this.sideQueues[kind].shift();
+      if (!task) return;
+      this.sideRunning[kind] += 1;
+      void task.run().finally(() => {
+        this.sideRunning[kind] -= 1;
+        this.drainSide(kind);
+      });
+    }
+  }
+
+  private notify(): void {
+    const state = this.getState();
+    this.listeners.forEach((listener) => listener(state));
+  }
+
+  /** Coalesces one transfer's feed and reaches only the row watching that item. */
+  private emitProgressSoon(itemId: string): void {
+    if (this.progressTimers.has(itemId)) return;
+    const timer = setTimeout(() => {
+      this.progressTimers.delete(itemId);
+      const entry = manifestEntry(itemId);
+      const listeners = this.progressListeners.get(itemId);
+      if (!entry || !listeners) return;
+      const progress = { bytesWritten: entry.bytesWritten, totalBytes: entry.totalBytes };
+      listeners.forEach((listener) => listener(progress));
+    }, PROGRESS_INTERVAL_MS);
+    this.progressTimers.set(itemId, timer);
+  }
+
+  /** Drops a pending tick, so a finished or deleted transfer cannot emit after the fact. */
+  private clearProgressTimer(itemId: string): void {
+    const timer = this.progressTimers.get(itemId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.progressTimers.delete(itemId);
+  }
+
+  /** Runs while a task is in flight and stops with the last one, so an idle app keeps no timer. */
+  private syncRateSampler(): void {
+    if (this.tasks.size > 0) {
+      if (this.rateTimer) return;
+      this.rateSampledAt = Date.now();
+      this.rateTimer = setInterval(() => this.sampleRates(), RATE_INTERVAL_MS);
+      (this.rateTimer as unknown as { unref?: () => void }).unref?.();
+      return;
+    }
+    if (!this.rateTimer) return;
+    clearInterval(this.rateTimer);
+    this.rateTimer = null;
+    this.rateBytes.clear();
+    this.emitThroughput(0);
+  }
+
+  private sampleRates(): void {
+    const now = Date.now();
+    const seconds = (now - this.rateSampledAt) / 1000;
+    this.rateSampledAt = now;
+    for (const itemId of this.rateBytes.keys()) if (!this.tasks.has(itemId)) this.rateBytes.delete(itemId);
+    let total = 0;
+    for (const itemId of this.tasks.keys()) {
+      const bytes = manifestEntry(itemId)?.bytesWritten ?? 0;
+      const last = this.rateBytes.get(itemId);
+      this.rateBytes.set(itemId, bytes);
+      // A transfer's first sample has nothing to count from; one restarted from zero counts nothing.
+      if (last !== undefined && seconds > 0) total += Math.max(0, bytes - last) / seconds;
+    }
+    this.emitThroughput(total);
+  }
+
+  private emitThroughput(bytesPerSecond: number): void {
+    this.throughput = bytesPerSecond;
+    this.throughputListeners.forEach((listener) => listener(bytesPerSecond));
+  }
+}
+
+/** The same Authorization header every other request in the app carries. */
+async function authHeaders(): Promise<Record<string, string>> {
+  const config = await getConfig();
+  return { Authorization: getAuthHeader(config.deviceId, config.apiKey) };
+}
+
+/**
+ * Which endpoint serves the original file.
+ *
+ * `/Items/{id}/Download` is the semantic one and the OpenAPI spec gates it on the `Download`
+ * policy, which `/Users/Me` reports as `Policy.EnableContentDownloading`. Asking the policy
+ * costs one small JSON response; range-probing the media endpoint does not, because React
+ * Native's fetch resolves only after the whole body has arrived (whatwg-fetch resolves on
+ * xhr.onload), so a server that ignored the Range header would buffer the entire file.
+ * Cached per server, so switching servers re-asks.
+ */
+let downloadPolicy: { server: string; allowed: boolean } | null = null;
+
+export function resetDownloadPolicyCache(): void {
+  downloadPolicy = null;
+}
+
+async function contentDownloadingAllowed(server: string): Promise<boolean> {
+  if (downloadPolicy?.server === server) return downloadPolicy.allowed;
+  let allowed = false;
+  try {
+    const response = await fetchWithTimeout(`${server}/Users/Me`, { headers: await authHeaders() }, API_TIMEOUTS.QUICK);
+    if (response.ok) {
+      const user = (await response.json()) as { Policy?: { EnableContentDownloading?: boolean } };
+      allowed = user.Policy?.EnableContentDownloading === true;
+    }
+  } catch (error) {
+    logger.warn("Could not read the download policy, using the stream endpoint", error, { service: "Downloads" });
+  }
+  downloadPolicy = { server, allowed };
+  logger.info("Download policy resolved", { service: "Downloads", allowed });
+  return allowed;
+}
+
+/** Whether a transfer has a session to run against: server plus token, the pair downloadUrl needs. */
+async function connectedToServer(): Promise<boolean> {
+  const config = await getConfig();
+  return Boolean(config.server && config.apiKey);
+}
+
+async function downloadUrl(entry: DownloadEntry): Promise<string> {
+  const config = await getConfig();
+  if (!config.server || !config.apiKey) throw new Error(NO_SESSION_ERROR);
+  const { item } = entry;
+  if (entry.converted) {
+    return getConvertedDownloadUrl(item.Id, item, entry.converted, conversionAudioIndex(item), { playSessionId: generatePlaySessionId(), burnSubtitleIndex: entry.burnedSubtitle });
+  }
+  return (await contentDownloadingAllowed(config.server)) ? `${config.server}/Items/${item.Id}/Download` : getRemoteVideoStreamUrl(item.Id, item);
+}
+
+export const downloadManager = new DownloadManager();

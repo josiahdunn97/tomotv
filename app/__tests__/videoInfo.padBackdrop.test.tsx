@@ -1,0 +1,138 @@
+/**
+ * iPad presents the panel over the app, so the backdrop belongs to the screen: it arrives and
+ * leaves with the route, and tapping it is a way out. Nothing outside the route may own it,
+ * a backdrop held by app state survives the panel and blurs the whole app.
+ */
+import React from "react";
+import TestRenderer, { act } from "react-test-renderer";
+import { Platform } from "react-native";
+import { fetchItemDetails } from "@/services/jellyfinApi";
+import type { JellyfinItem } from "@/types/jellyfin";
+
+// Patched before the screen is required: the branch is a module constant, read at import.
+Object.defineProperty(Platform, "isPad", { get: () => true, configurable: true });
+
+const VideoInfoScreen = require("@/app/video-info").default as React.ComponentType;
+
+const item = {
+  Id: "item-1",
+  Name: "Arrival",
+  Type: "Movie",
+  MediaStreams: [],
+  UserData: { PlaybackPositionTicks: 0, Played: false },
+} as unknown as JellyfinItem;
+
+const mockBack = jest.fn();
+jest.mock("expo-router", () => ({
+  useLocalSearchParams: () => ({ videoId: "item-1" }),
+  useRouter: () => ({ back: mockBack, push: jest.fn(), replace: jest.fn() }),
+}));
+
+jest.mock("expo-blur", () => {
+  const { View } = require("react-native");
+  return { BlurView: (props: Record<string, unknown>) => <View testID="pad-blur" {...props} /> };
+});
+
+jest.mock("@/utils/logger", () => ({ logger: { error: jest.fn(), info: jest.fn(), debug: jest.fn(), warn: jest.fn() } }));
+jest.mock("@/hooks/useSubtitlePanel", () => ({ useSubtitlePanel: () => ({ available: true, open: jest.fn(), offsetMs: 0 }) }));
+jest.mock("react-native-gesture-handler", () => {
+  const { View } = require("react-native");
+  const chain: any = new Proxy(() => chain, { get: () => () => chain, apply: () => chain });
+  return { Gesture: { Pan: () => chain, Native: () => chain }, GestureDetector: ({ children }: { children: React.ReactNode }) => children, GestureHandlerRootView: View };
+});
+jest.mock("@/services/localRemux", () => ({
+  predictPlaybackLane: jest.fn(async () => null),
+  posterFrameIfCached: jest.fn(() => undefined),
+  posterFrameRevision: jest.fn(() => 0),
+  requestPosterFrame: jest.fn(async () => null),
+  cancelPosterFrame: jest.fn(),
+}));
+jest.mock("@/hooks/useFolderPlay", () => ({ useFolderPlay: () => jest.fn() }));
+jest.mock("@/hooks/useShowInFolder", () => ({ useShowInFolder: () => jest.fn() }));
+jest.mock("@/hooks/useOpenShelfItem", () => ({ useOpenShelfItem: () => jest.fn() }));
+jest.mock("@/services/nextUp", () => ({ containerKey: () => null, dismissNextUpContainer: jest.fn() }));
+jest.mock("@/contexts/LoadingContext", () => ({ useLoadingActions: () => ({ showGlobalLoader: jest.fn(), hideGlobalLoader: jest.fn() }) }));
+jest.mock("@/components/ambient-background", () => ({ AmbientBackground: () => null }));
+jest.mock("@/components/close-overlay-button", () => ({ CloseOverlayButton: () => null }));
+jest.mock("@/components/info-action-row", () => ({ InfoActionRow: () => null }));
+jest.mock("@/components/info-focus-row", () => ({ InfoFocusRow: () => null }));
+jest.mock("@/components/FocusableButton", () => ({ FocusableButton: () => null }));
+jest.mock("@/components/progress-button", () => ({ ProgressButton: () => null }));
+jest.mock("expo-image", () => ({ Image: Object.assign(() => null, { loadAsync: async () => ({ width: 16, height: 9 }) }) }));
+jest.mock("@expo/vector-icons", () => ({ Ionicons: () => null }));
+
+jest.mock("@/services/jellyfinApi", () => ({
+  subscribeSubtitlesChanged: jest.fn(() => () => {}),
+  subscribeAuthChange: jest.fn(() => () => {}),
+  clearResumePosition: jest.fn(async () => {}),
+  deleteItem: jest.fn(async () => {}),
+  fetchIsAdministrator: jest.fn(async () => false),
+  isLiveChannel: () => false,
+  fetchItemDetails: jest.fn(),
+  fetchFolderMediaKinds: jest.fn(async () => null),
+  fetchItemFolderPath: jest.fn(async () => []),
+  getBackdropUrl: () => null,
+  getLogoUrl: () => null,
+  getPersonImageUrl: () => null,
+  getPosterUrl: () => null,
+  hasPoster: () => false,
+  isAudioItem: () => false,
+  isFolder: () => false,
+  isPhoto: () => false,
+  isBook: () => false,
+  notifyResumeChange: jest.fn(),
+  setVideoFavorite: jest.fn(async () => {}),
+  setVideoPlayed: jest.fn(async () => {}),
+}));
+
+const mockFetchItemDetails = fetchItemDetails as jest.Mock;
+
+async function mountPanel() {
+  let tree: TestRenderer.ReactTestRenderer;
+  await act(async () => {
+    tree = TestRenderer.create(<VideoInfoScreen />);
+  });
+  return tree!;
+}
+
+describe("Video info on iPad", () => {
+  beforeEach(() => {
+    mockBack.mockClear();
+    mockFetchItemDetails.mockResolvedValue(item);
+  });
+
+  it("draws its own blurred backdrop", async () => {
+    const tree = await mountPanel();
+    expect(tree.root.findAllByProps({ testID: "pad-blur" }).length).toBeGreaterThan(0);
+  });
+
+  it("closes on a tap outside the card", async () => {
+    const tree = await mountPanel();
+    const backdrop = tree.root.findAllByProps({ accessibilityLabel: "Close the video info panel" }).find((node) => typeof node.props.onPress === "function");
+    await act(async () => {
+      backdrop!.props.onPress();
+    });
+    expect(mockBack).toHaveBeenCalled();
+  });
+
+  it("keeps the centred card still under a drag", async () => {
+    const tree = await mountPanel();
+    expect(tree.root.findAllByType(require("@/components/card-drag").CardDragView)).toHaveLength(0);
+  });
+
+  it("hides the content still being measured without setting its opacity to zero", async () => {
+    const tree = await mountPanel();
+    const scroll = tree.root.findAll((node) => typeof node.props.onContentSizeChange === "function" && node.props.pointerEvents === "none")[0];
+    const style = require("react-native").StyleSheet.flatten(scroll.props.style);
+    expect(style.opacity).not.toBe(0);
+    expect(style.transform).toEqual([{ translateY: expect.any(Number) }]);
+  });
+
+  it("takes the backdrop with it when the route leaves", async () => {
+    const tree = await mountPanel();
+    await act(async () => {
+      tree.unmount();
+    });
+    expect(tree.toJSON()).toBeNull();
+  });
+});

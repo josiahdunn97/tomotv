@@ -1,0 +1,124 @@
+/** The info panel's group band lists Favorites and every group, ticking the channel's own, and a press toggles it. */
+import { ChannelGroupBand } from "@/components/live-tv/channel-group-band";
+import { GuideGroupCell } from "@/components/live-tv/guide-group-cell";
+import { GuideGroupPlaceholder } from "@/components/live-tv/guide-group-placeholder";
+import { getLiveTvPreferences, isChannelInGroup, updateLiveTvPreferences } from "@/services/liveTvPreferences";
+import React from "react";
+import TestRenderer, { act } from "react-test-renderer";
+
+jest.mock("expo-router", () => ({ useRouter: () => ({ push: jest.fn() }) }));
+jest.mock("@expo/vector-icons", () => ({ Ionicons: () => null }));
+jest.mock("@/components/sf-symbol-icon", () => ({ SfSymbolIcon: () => null }));
+jest.mock("@/services/channelFavorites", () => ({ toggleFavoriteChannel: jest.fn() }));
+jest.mock("@/hooks/useTunerGroups", () => ({
+  useTunerGroups: () => [
+    { name: "General", channelIds: ["c1"] },
+    { name: "Shop", channelIds: ["c2"] },
+  ],
+}));
+jest.mock("@/hooks/useCategoryChannelIds", () => ({ useCategoryChannelIds: () => ({ news: [], kids: ["c9"], movie: ["c1"] }) }));
+
+const channel = { Id: "c1", Name: "One", ChannelNumber: "7" };
+
+function cells(tree: TestRenderer.ReactTestRenderer) {
+  return tree.root
+    .findAll((node) => typeof node.type !== "string" && node.props.accessibilityRole === "checkbox" && node.props.isTVSelectable)
+    .map((node) => ({ label: node.props.accessibilityLabel as string, checked: node.props.accessibilityState.checked as boolean, press: node.props.onPress as () => void }));
+}
+
+describe("ChannelGroupBand", () => {
+  beforeEach(() => {
+    updateLiveTvPreferences({
+      favorites: [],
+      playlistEdits: {},
+      categoryEdits: {},
+      groups: [
+        { id: "g1", name: "Sports", channels: [{ number: "7", name: "One" }] },
+        { id: "g2", name: "Movies", channels: [] },
+        { id: "g3", name: "Kids", channels: [] },
+      ],
+    });
+  });
+
+  it("lists every group, the server's non-empty categories included, the channel's ticked and the rest unticked", () => {
+    let tree!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      tree = TestRenderer.create(<ChannelGroupBand channel={channel} />);
+    });
+    expect(cells(tree).map(({ label, checked }) => [label, checked])).toEqual([
+      ["Favorites", false],
+      ["Sports", true],
+      ["Movies", false],
+      ["Kids", false],
+      ["General", true],
+      ["Shop", false],
+      ["Kids", false],
+      ["Movies", true],
+    ]);
+  });
+
+  it("adds the channel to a category it is not in, takes it out of one it is, and undoes each on a second press", () => {
+    let tree!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      tree = TestRenderer.create(<ChannelGroupBand channel={channel} />);
+    });
+    act(() => cells(tree)[6].press());
+    act(() => cells(tree)[7].press());
+    expect(
+      cells(tree)
+        .slice(6)
+        .map(({ checked }) => checked),
+    ).toEqual([true, false]);
+    expect(getLiveTvPreferences().categoryEdits).toEqual({ kids: { added: ["c1"], removed: [] }, movie: { added: [], removed: ["c1"] } });
+    act(() => cells(tree)[6].press());
+    act(() => cells(tree)[7].press());
+    expect(
+      cells(tree)
+        .slice(6)
+        .map(({ checked }) => checked),
+    ).toEqual([false, true]);
+  });
+
+  it("adds the channel to a playlist group it is not in, and takes it out of one it is", () => {
+    let tree!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      tree = TestRenderer.create(<ChannelGroupBand channel={channel} />);
+    });
+    act(() => cells(tree)[5].press());
+    act(() => cells(tree)[4].press());
+    expect(
+      cells(tree)
+        .slice(4, 6)
+        .map(({ label, checked }) => [label, checked]),
+    ).toEqual([
+      ["General", false],
+      ["Shop", true],
+    ]);
+    expect(getLiveTvPreferences().playlistEdits).toEqual({ Shop: { added: ["c1"], removed: [] }, General: { added: [], removed: ["c1"] } });
+  });
+
+  it("rounds the last group cell only when the cells reach the band's end", () => {
+    let tree!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      tree = TestRenderer.create(<ChannelGroupBand channel={channel} cornerRadius={28} />);
+    });
+    const radii = () => tree.root.findAllByType(GuideGroupCell).map((cell) => cell.props.bottomRightRadius);
+    const layOutPlaceholder = (width: number) => act(() => tree.root.findByType(GuideGroupPlaceholder).props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width, height: 40 } } }));
+    const square = Array(8).fill(undefined);
+    expect(radii()).toEqual(square);
+    layOutPlaceholder(0);
+    expect(radii()).toEqual([...square.slice(1), 28]);
+    layOutPlaceholder(120);
+    expect(radii()).toEqual(square);
+  });
+
+  it("adds the channel to an unticked group on press", () => {
+    let tree!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      tree = TestRenderer.create(<ChannelGroupBand channel={channel} />);
+    });
+    act(() => cells(tree)[2].press());
+    expect(isChannelInGroup(getLiveTvPreferences().groups[1], channel)).toBe(true);
+    expect(cells(tree)[2].checked).toBe(true);
+  });
+});

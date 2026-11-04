@@ -1,0 +1,559 @@
+/**
+ * audioPlayerManager.ts
+ *
+ * Singleton lifecycle for native audio queue playback. Background music
+ * outlives the player screen, so everything with a lifetime — the native
+ * queue, per-track Jellyfin reporting, UI-visibility state — lives here, not
+ * in a hook. Screens subscribe for display state only.
+ *
+ * Reporting mirrors usePlaybackReporter's contract per track: one session
+ * snapshot per track (new PlaySessionId each), serialized server writes,
+ * close-exactly-once, Stopped at full duration on natural end (server
+ * auto-marks Played), gate-free UserData persist for mid-track exits inside
+ * the resume window.
+ */
+
+import {
+  generatePlaySessionId,
+  getVideoStreamUrl,
+  JELLYFIN_TIME,
+  markItemPlayed,
+  PlaybackReportBody,
+  reportPlaybackProgress,
+  reportPlaybackStart,
+  reportPlaybackStopped,
+  updateUserItemData,
+} from "@/services/jellyfinApi";
+import * as audioQueuePlayer from "@/services/audioQueuePlayer";
+import { playbackArtworkUri, playsFromDisk } from "@/services/downloads/localSource";
+import { t } from "@/services/i18n";
+import { listenable } from "@/services/lyrics/listener";
+import { resolveLyrics } from "@/services/lyrics/pipeline";
+import { getUiPreferences, subscribeUiPreferences, updateUiPreferences } from "@/services/uiPreferences";
+import { recordLocalPosition, recordOfflinePosition } from "@/services/downloads/offlineProgress";
+import type { JellyfinVideoItem } from "@/types/jellyfin";
+import { probeEmit, probeFirstPlaying, probeProgress, setPlaybackProbeEnabled, sourceSummary } from "@/services/playbackProbe";
+import { setPlaybackHold } from "@/services/playbackHold";
+import { logger } from "@/utils/logger";
+import { formatIndexLine, joinMeta } from "@/utils/mediaInfo";
+import { playerTitleLines } from "@/utils/seasonEpisode";
+import { Platform } from "react-native";
+
+// Same resume policy as usePlaybackReporter: under 2s isn't worth resuming,
+// past 95% the track counts as finished.
+const MIN_PERSIST_POSITION_SECONDS = 2;
+const COMPLETION_THRESHOLD = 0.95;
+// Report Progress after this much positional advancement (the video path's
+// 8s poll cadence, driven here by the native 1 Hz progress events).
+const PROGRESS_REPORT_DELTA_SECONDS = 8;
+
+interface TrackSession {
+  itemId: string;
+  mediaSourceId: string;
+  playSessionId: string;
+  playedAtStart: boolean;
+  durationSeconds: number;
+  /** Start is on the wire, so this session has to be closed rather than dropped. */
+  startSent: boolean;
+  abandoned: boolean;
+  closed: boolean;
+}
+
+export interface AudioPlayerUIState {
+  active: boolean;
+  /** False once the user dismissed the native UI; the screen pops on this. */
+  uiVisible: boolean;
+  index: number;
+  queueLength: number;
+  /** Shuffle, in this queue's terms: the native skip wraps at the end and nowhere else. */
+  loop: boolean;
+  track: JellyfinVideoItem | null;
+  playing: boolean;
+  position: number;
+}
+
+interface StartOptions {
+  loop?: boolean;
+  startPositionSeconds?: number;
+  /** Queue identity (folder/playlist id) for background re-entry detection. */
+  sourceId?: string;
+}
+
+type Listener = (state: AudioPlayerUIState) => void;
+
+class AudioPlayerManager {
+  private items: JellyfinVideoItem[] = [];
+  private currentIndex = 0;
+  private loop = false;
+  private active = false;
+  private uiVisible = false;
+  private playing = false;
+  private position = 0;
+  private sourceId: string | null = null;
+
+  private session: TrackSession | null = null;
+  /** Index whose failure arrived before the track change that would open its session. */
+  private failedIndex: number | null = null;
+  /** Indices that failed since a track last played; the whole queue in here means nothing can. */
+  private deadIndices = new Set<number>();
+  private lastReportedPosition = 0;
+  private pendingStartPosition = 0;
+  private unsubscribeNative: (() => void) | null = null;
+  private unsubscribePreferences: (() => void) | null = null;
+  private lyricsEnabled = false;
+  private listeners = new Set<Listener>();
+
+  // Serialized server-write chain (same rationale as usePlaybackReporter):
+  // a stale mid-track persist must never land after the track-closing Stopped.
+  private writeChain: Promise<void> | null = null;
+
+  // MARK: - Public API
+
+  isAvailable(): boolean {
+    return audioQueuePlayer.isAudioQueuePlayerAvailable();
+  }
+
+  /**
+   * Start playback of an ordered audio queue, or re-attach to one already
+   * playing in the background: same source + same start track re-presents the
+   * native UI instead of restarting the stream.
+   */
+  async startQueue(items: JellyfinVideoItem[], startId: string, options: StartOptions = {}): Promise<void> {
+    const startIndex = Math.max(
+      0,
+      items.findIndex((item) => item.Id === startId),
+    );
+
+    if (this.active && this.sourceId !== null && this.sourceId === options.sourceId) {
+      const currentTrack = this.items[this.currentIndex];
+      if (currentTrack?.Id === startId) {
+        await audioQueuePlayer.present();
+        this.uiVisible = true;
+        this.notify();
+        return;
+      }
+      const targetIndex = this.items.findIndex((item) => item.Id === startId);
+      if (targetIndex >= 0) {
+        await audioQueuePlayer.present();
+        this.uiVisible = true;
+        await audioQueuePlayer.skipToIndex(targetIndex);
+        // The native onTrackChanged confirms this later; the snapshot must not
+        // hold the old track meanwhile.
+        this.currentIndex = targetIndex;
+        this.notify();
+        return;
+      }
+    }
+
+    await this.stop();
+
+    this.items = items;
+    this.currentIndex = startIndex;
+    this.sourceId = options.sourceId ?? null;
+    this.pendingStartPosition = options.startPositionSeconds ?? 0;
+    this.active = true;
+    setPlaybackHold("audio", true);
+    this.uiVisible = true;
+    this.playing = true;
+    this.position = this.pendingStartPosition;
+    this.lastReportedPosition = 0;
+    this.failedIndex = null;
+    this.deadIndices.clear();
+
+    this.unsubscribeNative = audioQueuePlayer.subscribeToEvents({
+      onTrackChanged: (event) => this.handleTrackChanged(event),
+      onProgress: (event) => this.handleProgress(event),
+      onQueueEnded: (event) => this.handleQueueEnded(event),
+      onDismiss: () => this.handleDismiss(),
+      onError: (event) => this.handleTrackError(event),
+      onLyricsEnabledChanged: (event) => updateUiPreferences({ showLyrics: event.enabled }),
+    });
+    this.lyricsEnabled = getUiPreferences().showLyrics;
+    this.unsubscribePreferences = subscribeUiPreferences(() => this.applyLyricsPreference());
+
+    logger.info("Audio queue starting", { service: "AudioPlayer", count: items.length, startIndex });
+    if (items[startIndex]) this.recordTrack(items[startIndex]);
+    try {
+      this.loop = options.loop ?? false;
+      await audioQueuePlayer.loadQueue({
+        tracks: items.map((item) => this.toTrack(item)),
+        startIndex,
+        startPositionSeconds: this.pendingStartPosition,
+        loop: this.loop,
+        lyricsEnabled: this.lyricsEnabled,
+        lyricsLabel: t("detail.lyrics"),
+      });
+    } catch (error) {
+      logger.error("Audio queue failed to start", error, { service: "AudioPlayer" });
+      probeEmit("error", { mode: "audio", message: String(error) });
+      this.teardownLocalState();
+      this.notify();
+      throw error;
+    }
+    this.notify();
+  }
+
+  /** Re-present the native UI for a queue playing in the background. */
+  async present(): Promise<void> {
+    if (!this.active) return;
+    await audioQueuePlayer.present();
+    this.uiVisible = true;
+    this.notify();
+  }
+
+  /**
+   * Transport for the in-app control bar, which is the only way to reach a queue whose
+   * native UI has been dismissed. State comes back through the native progress and
+   * track-change events, so nothing is mutated here.
+   */
+  async setPlaying(playing: boolean): Promise<void> {
+    if (!this.active) return;
+    if (playing) await audioQueuePlayer.play();
+    else await audioQueuePlayer.pause();
+  }
+
+  /** Relative seek for the hardware keyboard, clamped at the track's start. */
+  async seekBy(offsetSeconds: number): Promise<void> {
+    if (!this.getUIState().active) return;
+    await audioQueuePlayer.seekTo(Math.max(0, this.getUIState().position + offsetSeconds));
+  }
+
+  async next(): Promise<void> {
+    if (!this.active) return;
+    await audioQueuePlayer.next();
+  }
+
+  async previous(): Promise<void> {
+    if (!this.active) return;
+    await audioQueuePlayer.previous();
+  }
+
+  /**
+   * Stop playback and tear everything down. Safe to call when idle — every
+   * external "audio must not be playing anymore" path (video start, sign-out,
+   * queue end) funnels through here.
+   */
+  async stop(): Promise<void> {
+    if (!this.active) return;
+    this.closeSession(this.position);
+    this.teardownLocalState();
+    try {
+      await audioQueuePlayer.stop();
+    } catch (error) {
+      logger.warn("Native audio stop failed", error, { service: "AudioPlayer" });
+    }
+    this.notify();
+  }
+
+  getUIState(): AudioPlayerUIState {
+    return {
+      active: this.active,
+      uiVisible: this.uiVisible,
+      index: this.currentIndex,
+      queueLength: this.items.length,
+      loop: this.loop,
+      track: this.items[this.currentIndex] ?? null,
+      playing: this.playing,
+      position: this.position,
+    };
+  }
+
+  /** The track whose card is the player, off the fields: every mounted card asks on every tick,
+   *  and a snapshot object per card per tick is pure allocation. */
+  nowPlayingItemId(): string | null {
+    return this.active && !this.uiVisible ? (this.items[this.currentIndex]?.Id ?? null) : null;
+  }
+
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    listener(this.getUIState());
+    return () => this.listeners.delete(listener);
+  }
+
+  // MARK: - Native events
+
+  private handleTrackChanged(event: audioQueuePlayer.AudioTrackChangedEvent): void {
+    // Resolved BEFORE the close below. An index this queue does not have means the
+    // event belongs to a queue we have already replaced; closing first and then
+    // bailing left the manager active with no session, so nothing reported again
+    // while audio kept playing.
+    const item = this.items[event.index];
+    if (!item) {
+      logger.warn("Audio track change for an index outside the queue, ignoring", { service: "AudioPlayer", index: event.index, queueLength: this.items.length });
+      return;
+    }
+    // The queue's first change names the track recorded at start; recording it again would
+    // replace that session mid-startup.
+    if (event.previousIndex >= 0 || event.index !== this.currentIndex) this.recordTrack(item);
+
+    // Close the finished/skipped track first: natural end reports Stopped at
+    // full duration (server auto-marks Played), a skip reports the position it
+    // left off.
+    if (event.previousIndex >= 0 && this.session) {
+      const finalPosition = event.natural ? this.session.durationSeconds : event.previousPosition;
+      this.closeSession(finalPosition);
+    }
+
+    this.currentIndex = event.index;
+    this.position = event.previousIndex >= 0 ? 0 : this.pendingStartPosition;
+    this.lastReportedPosition = this.position;
+    // The track this index holds is already known broken; it plays nothing, so
+    // it reports nothing.
+    if (this.failedIndex === event.index) this.failedIndex = null;
+    else this.openSession(item, this.position);
+    void this.loadLyrics(item);
+    this.notify();
+  }
+
+  /** The current track's lyrics, each answer as it improves; one for a track the queue has left is dropped.
+   *  Apple TV takes them even while off: its player's toggle shows only for a song that has some. */
+  private async loadLyrics(item: JellyfinVideoItem): Promise<void> {
+    const wanted = () => this.lyricsEnabled || Platform.isTV;
+    if (!wanted()) return;
+    const current = () => this.active && this.items[this.currentIndex]?.Id === item.Id;
+    await resolveLyrics(item, (lyrics) => {
+      if (!current() || !wanted()) return;
+      void audioQueuePlayer.setLyrics(item.Id, lyrics).catch((error) => logger.warn("Could not hand lyrics to the audio player", error, { service: "AudioPlayer" }));
+    });
+    // The next song's are worked out while this one plays, so they are ready when it starts.
+    const next = this.items[this.currentIndex + 1];
+    if (next && current()) void resolveLyrics(next, () => {});
+  }
+
+  private applyLyricsPreference(): void {
+    const enabled = getUiPreferences().showLyrics;
+    if (enabled === this.lyricsEnabled) return;
+    this.lyricsEnabled = enabled;
+    void audioQueuePlayer.setLyricsEnabled(enabled).catch(() => {});
+    const item = this.items[this.currentIndex];
+    if (enabled && item) void this.loadLyrics(item);
+  }
+
+  /**
+   * A broken track reports nothing when its Start is still queued. Once Start is
+   * on the wire the session closes normally, so the server never holds it open.
+   */
+  private handleTrackError(event: audioQueuePlayer.AudioErrorEvent): void {
+    logger.warn("Audio track failed, skipping", { service: "AudioPlayer", index: event.index, message: event.message });
+    // A preloaded neighbour can fail too; only the current track's failure is this session's.
+    if (event.index === this.currentIndex) {
+      probeEmit("error", { mode: "audio", index: event.index, message: event.message });
+      this.deadIndices.add(event.index);
+      // The native skip wraps when the queue loops, so a queue with no playable track would
+      // cycle through its failures forever. Every index dead ends it here.
+      if (this.deadIndices.size >= this.items.length) {
+        logger.error("Every track in the audio queue failed, stopping", { service: "AudioPlayer", count: this.items.length });
+        void this.stop();
+        return;
+      }
+    }
+
+    const session = this.session;
+    if (!session || session.closed || event.index !== this.currentIndex) {
+      this.failedIndex = event.index;
+      return;
+    }
+    if (session.startSent) {
+      this.closeSession(this.position);
+      return;
+    }
+    session.abandoned = true;
+    session.closed = true;
+    this.session = null;
+  }
+
+  private handleProgress(event: audioQueuePlayer.AudioProgressEvent): void {
+    const pauseFlipped = this.playing !== event.playing;
+    if (event.playing && event.position > 0) {
+      probeFirstPlaying();
+      this.deadIndices.clear();
+    }
+    probeProgress(event.position);
+    this.position = event.position;
+    this.playing = event.playing;
+
+    const session = this.session;
+    if (session && !session.closed) {
+      if (pauseFlipped) {
+        // Immediate report on play/pause so the server dashboard tracks state.
+        this.enqueueWrite(async () => {
+          await reportPlaybackProgress(this.buildBody(session, event.position, !event.playing));
+        });
+        this.persistResume(session, event.position);
+      } else if (event.playing && Math.abs(event.position - this.lastReportedPosition) >= PROGRESS_REPORT_DELTA_SECONDS) {
+        this.lastReportedPosition = event.position;
+        this.enqueueWrite(async () => {
+          await reportPlaybackProgress(this.buildBody(session, event.position, false));
+        });
+        this.persistResume(session, event.position);
+      }
+    }
+
+    this.notify();
+  }
+
+  private handleQueueEnded(event: audioQueuePlayer.AudioQueueEndedEvent): void {
+    logger.info("Audio queue ended", { service: "AudioPlayer", natural: event.natural });
+    probeEmit("ended", { natural: event.natural });
+    const finalPosition = event.natural && this.session ? this.session.durationSeconds : this.position;
+    this.closeSession(finalPosition);
+    this.teardownLocalState();
+    void audioQueuePlayer.stop().catch(() => {});
+    this.notify();
+  }
+
+  /**
+   * Dismissing the native UI leaves the queue playing (Music-app behaviour): the screen
+   * pops on uiVisible, remote controls take over, and startQueue re-presents on re-entry.
+   */
+  private handleDismiss(): void {
+    this.uiVisible = false;
+    this.notify();
+  }
+
+  // MARK: - Reporting
+
+  private openSession(item: JellyfinVideoItem, positionSeconds: number): void {
+    const session: TrackSession = {
+      itemId: item.Id,
+      mediaSourceId: item.MediaSources?.[0]?.Id ?? item.Id,
+      playSessionId: generatePlaySessionId(),
+      playedAtStart: item.UserData?.Played ?? false,
+      durationSeconds: item.RunTimeTicks ? item.RunTimeTicks / JELLYFIN_TIME.TICKS_PER_SECOND : 0,
+      startSent: false,
+      abandoned: false,
+      closed: false,
+    };
+    this.session = session;
+    this.enqueueWrite(async () => {
+      if (session.abandoned) return;
+      // Flipped before the request leaves: a failure landing mid-flight closes
+      // the session instead of dropping it.
+      session.startSent = true;
+      await reportPlaybackStart(this.buildBody(session, positionSeconds, false));
+    });
+  }
+
+  /** Close the in-flight track session exactly once. */
+  private closeSession(finalPosition: number): void {
+    const session = this.session;
+    if (!session || session.closed) return;
+    session.closed = true;
+    this.session = null;
+
+    this.enqueueWrite(async () => {
+      await reportPlaybackStopped(this.buildBody(session, finalPosition, false));
+      const persisted = await this.persistResumeNow(session, finalPosition);
+      if (persisted === false) {
+        await this.persistResumeNow(session, finalPosition);
+      }
+      if (session.durationSeconds > 0 && finalPosition / session.durationSeconds >= COMPLETION_THRESHOLD) {
+        markItemPlayed(session.itemId, true);
+      }
+    });
+  }
+
+  private buildBody(session: TrackSession, positionSeconds: number, isPaused: boolean): PlaybackReportBody {
+    return {
+      ItemId: session.itemId,
+      MediaSourceId: session.mediaSourceId,
+      PlaySessionId: session.playSessionId,
+      PositionTicks: Math.round(positionSeconds * JELLYFIN_TIME.TICKS_PER_SECOND),
+      IsPaused: isPaused,
+      PlayMethod: "DirectStream",
+      CanSeek: true,
+    };
+  }
+
+  private persistResume(session: TrackSession, positionSeconds: number): void {
+    this.enqueueWrite(async () => {
+      await this.persistResumeNow(session, positionSeconds);
+    });
+  }
+
+  /**
+   * Gate-free UserData persist inside the resume window; restores the Played
+   * flag the track had at session start (same contract as usePlaybackReporter).
+   */
+  private async persistResumeNow(session: TrackSession, positionSeconds: number): Promise<boolean> {
+    if (session.durationSeconds <= 0) return true;
+    if (positionSeconds < MIN_PERSIST_POSITION_SECONDS || positionSeconds / session.durationSeconds >= COMPLETION_THRESHOLD) {
+      return true;
+    }
+    const ticks = Math.round(positionSeconds * JELLYFIN_TIME.TICKS_PER_SECOND);
+    const result = await updateUserItemData(session.itemId, { PlaybackPositionTicks: ticks, Played: session.playedAtStart });
+    // A downloaded track can be playing with no server at all; hold the position for the next
+    // foreground. An item the server answered 404 for is gone, so nothing is held.
+    recordLocalPosition(session.itemId, ticks, session.playedAtStart);
+    if (result === "unreachable") recordOfflinePosition(session.itemId, ticks, session.playedAtStart);
+    return result !== "unreachable";
+  }
+
+  private enqueueWrite(task: () => Promise<void>): void {
+    const prev = this.writeChain;
+    const run = (prev ? prev.then(task) : task()).catch(() => {
+      // Report functions swallow their own failures; this only keeps an
+      // unexpected throw from wedging the chain.
+    });
+    this.writeChain = run;
+    void run.then(() => {
+      if (this.writeChain === run) this.writeChain = null;
+    });
+  }
+
+  // MARK: - Internals
+
+  /** Audio owns its own player, so it has to feed the same probe the video lane does, or the
+   *  Diagnostics screen answers a music bug report with a stale video session. */
+  private recordTrack(item: JellyfinVideoItem): void {
+    setPlaybackProbeEnabled(null, item.Id);
+    probeEmit("mode", { mode: "audio", held: playsFromDisk(item.Id) });
+    probeEmit("source", sourceSummary(item));
+    probeEmit("stream", { mode: "audio", url: getVideoStreamUrl(item.Id, item) });
+  }
+
+  private toTrack(item: JellyfinVideoItem): audioQueuePlayer.AudioQueueTrack {
+    return {
+      id: item.Id,
+      url: getVideoStreamUrl(item.Id, item),
+      title: item.Name,
+      artist: item.Artists?.length ? item.Artists.join(", ") : (item.AlbumArtist ?? ""),
+      album: item.Album ?? "",
+      // The player's description line, which the panel's context line also carries.
+      description: joinMeta([item.Album, formatIndexLine(item)]),
+      subtitle: Platform.isTV ? (playerTitleLines(item)?.subtitle ?? "") : "",
+      // The image the lock screen and the Up Next panel draw.
+      artworkUrl: playbackArtworkUri(item, 600) ?? "",
+      durationSeconds: item.RunTimeTicks ? item.RunTimeTicks / JELLYFIN_TIME.TICKS_PER_SECOND : 0,
+      // The lyrics length gate: a set or a mix starts without reading ahead to the play point.
+      preciseTiming: listenable(item),
+    };
+  }
+
+  private teardownLocalState(): void {
+    this.unsubscribeNative?.();
+    this.unsubscribeNative = null;
+    this.unsubscribePreferences?.();
+    this.unsubscribePreferences = null;
+    this.active = false;
+    setPlaybackHold("audio", false);
+    this.uiVisible = false;
+    this.playing = false;
+    this.position = 0;
+    this.items = [];
+    this.currentIndex = 0;
+    this.loop = false;
+    this.sourceId = null;
+    this.session = null;
+    this.failedIndex = null;
+    this.lastReportedPosition = 0;
+    this.pendingStartPosition = 0;
+  }
+
+  private notify(): void {
+    const state = this.getUIState();
+    this.listeners.forEach((listener) => listener(state));
+  }
+}
+
+export const audioPlayerManager = new AudioPlayerManager();

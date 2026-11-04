@@ -1,0 +1,177 @@
+import { ArtworkSlotShape, gridEdgePadding, shelfSpacing, slotCardPadding, slotRowHeights, slotShapeRatio, STAND_HEIGHT, STAND_ROW_ROOM } from "@/constants/app";
+import { COLORS } from "@/constants/colors";
+import { useCardZoom } from "@/hooks/useCardZoom";
+import { useScrollToTop } from "expo-router";
+import React, { ReactElement, useCallback, useMemo, useRef, useState } from "react";
+import { findNodeHandle, FlatList, Platform, StyleSheet, Text, TVFocusGuideView, useWindowDimensions, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+const IS_TV = Platform.isTV;
+const CARD_PADDING = slotCardPadding(IS_TV);
+// Extra room around the list so the focused card's glow isn't clipped at the
+// FlatList bounds; negative margins cancel it out so the layout doesn't move.
+const GLOW_PAD = IS_TV ? 24 : 12;
+/** How far a card's base hangs below the card's own frame: on TV it overhangs the bottom padding. */
+const STAND_OVERHANG = STAND_ROW_ROOM === 0 ? STAND_HEIGHT - CARD_PADDING : 0;
+
+interface MediaShelfProps<T> {
+  title: string;
+  /** A red dot after the heading: something on the shelf is live. */
+  dot?: boolean;
+  data: readonly T[];
+  /** The item's snapped card shape, which decides its height in the row (see slotRowHeights). */
+  slotShapeFor: (item: T) => ArtworkSlotShape;
+  /** cardHeight is the item's own shape height; the card derives its width from it. */
+  renderItem: (item: T, index: number, cardHeight: number) => ReactElement;
+  keyExtractor: (item: T) => string;
+}
+
+/** The shelf's index-mark heading, exported so sibling sections can label themselves alike. */
+export function ShelfHeading({ title, dot = false }: { title: string; dot?: boolean }) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const spacing = shelfSpacing(IS_TV, windowWidth, windowHeight);
+  return (
+    <View style={[styles.headingRow, { marginBottom: spacing.headingGap }]}>
+      <Text style={[styles.heading, { fontSize: spacing.headingSize, lineHeight: spacing.headingLine }]}>{title}</Text>
+      {dot ? <View style={styles.headingDot} testID="shelf-dot" /> : null}
+    </View>
+  );
+}
+
+/**
+ * One horizontal shelf of the home screen: heading plus a card carousel of mixed-shape
+ * cards (see fitArtwork on the card components). ONE height per row, never uneven: the row
+ * takes the tallest shape present in its data and EVERY card renders at that height: wide
+ * cards in a poster row grow to match. An all-wide row stays at the wide height. Purely
+ * presentational: data loading, press routing and focus side effects belong to the wrapper
+ * that instantiates it. Renders null with no items so empty shelves collapse.
+ */
+export function MediaShelf<T>({ title, dot, data, slotShapeFor, renderItem, keyExtractor }: MediaShelfProps<T>) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+
+  const zoom = useCardZoom();
+  const heights = useMemo(() => slotRowHeights(windowWidth, windowHeight, insets.left, insets.right, IS_TV, "shelf", zoom), [windowWidth, windowHeight, insets.left, insets.right, zoom]);
+
+  // The tallest shape actually present rules the row; every card matches it.
+  const rowHeight = useMemo(() => data.reduce((max, item) => Math.max(max, heights[slotShapeFor(item)]), 0), [data, heights, slotShapeFor]);
+
+  // TV: every card sits in a native wrapper so the last one can be named as the end guide's destination without remounting.
+  const [lastCard, setLastCard] = useState<View | null>(null);
+  const renderListItem = useCallback(
+    ({ item, index }: { item: T; index: number }) =>
+      IS_TV ? (
+        <View ref={index === data.length - 1 ? setLastCard : undefined} collapsable={false}>
+          {renderItem(item, index, rowHeight)}
+        </View>
+      ) : (
+        renderItem(item, index, rowHeight)
+      ),
+    [renderItem, rowHeight, data.length],
+  );
+  // The empty tail of a shelf narrower than the screen leads to its last card; keyed by target, as Fabric ignores a changed destination.
+  const lastTarget = IS_TV && lastCard ? findNodeHandle(lastCard) : null;
+  const endGuide = lastTarget ? <TVFocusGuideView key={lastTarget} style={styles.endGuide} destinations={[lastTarget]} /> : null;
+
+  // The first commit carries the cards that fit the viewport and one more; the rest mount in
+  // batches of the same size, so a shelf arriving never holds the JS thread for the whole row.
+  const viewportCards = useMemo(() => {
+    let filled = 0;
+    let count = 0;
+    for (const item of data) {
+      if (filled >= windowWidth) break;
+      filled += (rowHeight - 2 * CARD_PADDING) * slotShapeRatio(slotShapeFor(item)) + 2 * CARD_PADDING;
+      count += 1;
+    }
+    return Math.max(1, Math.min(data.length, count + 1));
+  }, [data, rowHeight, windowWidth, slotShapeFor]);
+
+  // Pressing the Home tab again walks every shelf back to its first card. The hook reads focus
+  // synchronously, before the tab jump lands, so arriving from another tab scrolls nothing.
+  // Unattached on tvOS: moving focus up to the bar already counts as reselecting the tab there
+  // (app/(tabs)/_layout.tsx), which would fire this on the way out rather than on a press.
+  const listRef = useRef<FlatList<T>>(null);
+  useScrollToTop(listRef);
+
+  // Edge bleed: the host screen wraps shelves in its content padding, which would clip
+  // scrolling cards at the padded boundary. Negative margins push the list out to the
+  // physical screen edges; the same padding moves inside the list's content so resting
+  // cards still align to the screen's grid margin.
+  const edgeLeft = gridEdgePadding(insets.left, IS_TV);
+  const edgeRight = gridEdgePadding(insets.right, IS_TV);
+  const rowAreaStyle = useMemo(
+    () => ({ height: rowHeight + 2 * GLOW_PAD + STAND_ROW_ROOM * zoom + STAND_OVERHANG, marginVertical: -GLOW_PAD, marginLeft: -edgeLeft, marginRight: -edgeRight }),
+    [rowHeight, edgeLeft, edgeRight, zoom],
+  );
+  // A tablet gets a bigger heading and more air around the row; slotRowHeights sizes the cards
+  // against this same block, so the shelf still lands where the fill maths put it.
+  const spacing = shelfSpacing(IS_TV, windowWidth, windowHeight);
+  const containerStyle = useMemo(() => ({ marginBottom: spacing.rowGap }), [spacing]);
+  const rowContentStyle = useMemo(() => ({ paddingVertical: GLOW_PAD, paddingLeft: edgeLeft, paddingRight: edgeRight, flexGrow: IS_TV ? 1 : undefined }), [edgeLeft, edgeRight]);
+
+  if (data.length === 0) {
+    return null;
+  }
+
+  return (
+    <View style={[styles.container, containerStyle]}>
+      <ShelfHeading title={title} dot={dot} />
+      {/* Fixed height keeps the layout stable while a focus-triggered reload swaps items. */}
+      <View style={rowAreaStyle}>
+        <FlatList
+          ref={IS_TV ? undefined : listRef}
+          data={data as T[]}
+          renderItem={renderListItem}
+          keyExtractor={keyExtractor}
+          horizontal
+          // Unclipped, so a card's shadow and focus glow carry past the row instead of stopping at its edge.
+          style={styles.list}
+          showsHorizontalScrollIndicator={false}
+          removeClippedSubviews={false}
+          initialNumToRender={viewportCards}
+          maxToRenderPerBatch={viewportCards}
+          contentContainerStyle={rowContentStyle}
+          ListFooterComponent={endGuide}
+          ListFooterComponentStyle={endGuide ? styles.endGuideSlot : undefined}
+        />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  // marginBottom, the gap to the next shelf, is applied inline from SHELF_SPACING.
+  container: {},
+  list: {
+    overflow: "visible",
+  },
+  endGuideSlot: {
+    flexGrow: 1,
+  },
+  endGuide: {
+    flex: 1,
+  },
+  headingRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    marginLeft: CARD_PADDING,
+  },
+  headingDot: {
+    alignSelf: "center",
+    marginLeft: IS_TV ? 12 : 8,
+    width: IS_TV ? 14 : 8,
+    height: IS_TV ? 14 : 8,
+    borderRadius: IS_TV ? 7 : 4,
+    backgroundColor: COLORS.DESTRUCTIVE,
+  },
+  // A quiet index mark over the ambient canvas, not a display title: the artwork leads.
+  // TV stays at tvOS caption size so it still reads at 10 feet.
+  heading: {
+    fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: IS_TV ? 1.6 : 1.1,
+    width: "auto",
+    overflow: "visible",
+    color: COLORS.TEXT_SECONDARY,
+  },
+});

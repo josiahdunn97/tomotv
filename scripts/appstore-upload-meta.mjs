@@ -1,0 +1,247 @@
+#!/usr/bin/env node
+/**
+ * Sends the store listing's text to App Store Connect, one localization per
+ * language, so a new language is not left with screenshots and four empty
+ * fields under them.
+ *
+ * Usage:
+ *   npm run meta:upload                     every locale, every platform not held by a review
+ *   npm run meta:upload -- --dry-run        print the plan, write nothing
+ *   npm run meta:upload -- --locale de-DE,fr-FR   one language or a few
+ *   npm run meta:upload -- --platform IOS   one platform
+ *   npm run meta:upload -- --check          check the document offline, then stop
+ *   npm run meta:upload -- --check-online   also check editable versions and first-release rules
+ *
+ * The copy comes from the paste blocks in memories/CLAUDE-apple-store-metadata.md,
+ * which that file declares canonical. What's New is taken for the version in
+ * app.json and a missing one stops the run, so a release never ships the
+ * previous release's notes.
+ *
+ * Name and subtitle live on the app info, description, keywords, promotional
+ * text and What's New on the version. Only a version in PREPARE_FOR_SUBMISSION
+ * is touched.
+ *
+ * Apple opens every version with the promotional text empty. It is hand-written
+ * and carries across releases unchanged, so it is re-sent from the document each
+ * run rather than retyped into the new draft.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { ascEnv, client } from "./appstore/asc.mjs";
+import { DOC, INFO_FIELDS, PLATFORM_LABELS, VERSION_FIELDS, measure, overLimit, readMetadata, whatsNewVersions } from "./appstore/metadata.mjs";
+import { editableAppInfo, isFirstVersion, listingPlatforms, platformVersions, selectedPlatforms } from "./appstore/platforms.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const BUNDLE_ID = "dev.keiver.tomotv";
+
+const args = process.argv.slice(2);
+const flag = (n) => args.includes(n);
+const opt = (n) => {
+  const i = args.indexOf(n);
+  return i >= 0 && args[i + 1] ? args[i + 1] : null;
+};
+const DRY = flag("--dry-run");
+const CHECK = flag("--check");
+const CHECK_ONLINE = flag("--check-online");
+
+function fail(msg) {
+  console.error(`\n✗ ${msg}`);
+  process.exit(1);
+}
+
+/** The value the field should end up with, or null when there is nothing to say. */
+function wanted(copy, field, platform) {
+  return field === "whatsNew" ? (copy[`whatsNew.${platform}`] ?? null) : (copy[field] ?? null);
+}
+
+async function main() {
+  const version = JSON.parse(fs.readFileSync(path.join(ROOT, "app.json"), "utf8")).expo.version;
+  const meta = readMetadata(ROOT, version);
+  const locales = opt("--locale") ? opt("--locale").split(",") : Object.keys(meta);
+  const platforms = selectedPlatforms(opt("--platform"));
+  const versions = {};
+  const firstVersions = new Set();
+  let api, app;
+  if (!CHECK || CHECK_ONLINE) {
+    api = client(ascEnv(ROOT));
+    const apps = await api.get(`/v1/apps?filter[bundleId]=${BUNDLE_ID}`);
+    app = apps.data[0];
+    if (!app) fail(`No app with bundle id ${BUNDLE_ID} on this account`);
+    for (const platform of platforms) {
+      if (isFirstVersion(await platformVersions(api, app.id, platform), version)) firstVersions.add(platform);
+    }
+    for (const { platform, slot, version: found } of await listingPlatforms(api, app.id, version, opt("--platform"))) {
+      if (slot === "free" && !CHECK_ONLINE) {
+        if (!DRY) fail(`No ${platform} draft for ${version}. Open it with npm run shots:upload -- --platform ${platform} --create-version.`);
+        console.log(`  ${platform}: no draft for ${version} yet, nothing to plan`);
+        continue;
+      }
+      versions[platform] = found;
+    }
+  }
+
+  // Everything is measured before anything is written: a listing half over the
+  // limit is worse than one that never started.
+  const problems = [];
+  const missingNotes = [];
+  for (const locale of locales) {
+    const copy = meta[locale];
+    if (!copy) fail(`No "${locale}" section in ${DOC}. Have: ${Object.keys(meta).join(", ")}`);
+    for (const field of [...INFO_FIELDS, ...VERSION_FIELDS]) {
+      for (const platform of field === "whatsNew" ? platforms : [null]) {
+        if (field === "whatsNew" && firstVersions.has(platform)) continue;
+        const text = wanted(copy, field, platform);
+        if (!text) {
+          if (field === "whatsNew") missingNotes.push({ locale, platform });
+          else problems.push(`${locale}: no ${field} (version ${version})`);
+          continue;
+        }
+        const over = overLimit(field, text);
+        if (over) problems.push(`${locale} ${field}: ${over}`);
+      }
+    }
+  }
+  // The version bumped and its release notes were never written: say so in words
+  // and print the exact headings to add, rather than one cryptic line per slot.
+  if (missingNotes.length) {
+    const have = whatsNewVersions(ROOT);
+    const rows = missingNotes.map(({ locale, platform }) => {
+      const depth = locale === "en-US" ? "###" : "####";
+      return `    ${depth} What's New (${version}), ${PLATFORM_LABELS[platform]}`.padEnd(42) + locale;
+    });
+    fail(
+      [
+        CHECK ? `RELEASE NOTES MISSING for ${version}. Nothing was built or uploaded.` : `RELEASE NOTES MISSING for ${version} — nothing was uploaded.`,
+        ``,
+        `  app.json is on ${version}, but ${DOC}`,
+        `  has no "What's New" for it. Notes exist for: ${have.join(", ") || "no versions"}.`,
+        ``,
+        `  Add a block for each (heading, then a \`\`\`text ... \`\`\` fence), then re-run`,
+        CHECK ? `  npm run archive (with --notes, only the en-US blocks are needed):` : `  npm run meta:upload:`,
+        ``,
+        ...rows,
+      ].join("\n"),
+    );
+  }
+  if (problems.length) fail(`${DOC}\n  ${problems.join("\n  ")}`);
+  if (CHECK || CHECK_ONLINE) {
+    console.log(`Listing text for ${version} is complete: ${locales.join(", ")}`);
+    return;
+  }
+
+  console.log(`App Store Connect: ${BUNDLE_ID}, version ${version}${DRY ? " (dry run)" : ""}`);
+
+  // The app info is shared by all platforms: while any platform's submission holds it, the
+  // name and subtitle wait for that review to finish.
+  const infos = await api.get(`/v1/apps/${app.id}/appInfos`);
+  const info = editableAppInfo(infos.data);
+
+  // A new Mac platform has no previous English URLs to inherit. Reuse the
+  // existing iOS listing on this same app record, never an invented address.
+  const iosHistory = await platformVersions(api, app.id, "IOS");
+  let sharedUrls = {};
+  for (const iosVersion of iosHistory) {
+    const localizations = await api.get(`/v1/appStoreVersions/${iosVersion.id}/appStoreVersionLocalizations`);
+    const english = localizations.data.find((l) => l.attributes.locale === "en-US")?.attributes;
+    if (english?.supportUrl) {
+      sharedUrls = english;
+      break;
+    }
+  }
+
+  for (const platform of Object.keys(versions)) {
+    const versionId = versions[platform].id;
+    const existing = await api.get(`/v1/appStoreVersions/${versionId}/appStoreVersionLocalizations`);
+    // A new language inherits the URLs the English listing already carries,
+    // rather than a value from a document that can disagree with the listing.
+    const currentEnglish = existing.data.find((l) => l.attributes.locale === "en-US")?.attributes ?? {};
+    const english = { supportUrl: currentEnglish.supportUrl || sharedUrls.supportUrl, marketingUrl: currentEnglish.marketingUrl || sharedUrls.marketingUrl };
+    if (!english.supportUrl) fail(`${platform}: set the English support URL in App Store Connect before uploading metadata.`);
+
+    for (const locale of locales) {
+      const copy = meta[locale];
+      let current = existing.data.find((l) => l.attributes.locale === locale);
+      if (!current) {
+        if (DRY) {
+          console.log(`  ${platform} ${locale}: would create the localization`);
+        } else {
+          const created = await api.post("/v1/appStoreVersionLocalizations", {
+            data: {
+              type: "appStoreVersionLocalizations",
+              attributes: { locale, marketingUrl: english.marketingUrl, supportUrl: english.supportUrl },
+              relationships: { appStoreVersion: { data: { type: "appStoreVersions", id: versionId } } },
+            },
+          });
+          current = created.data;
+        }
+      }
+
+      const attributes = {};
+      for (const field of VERSION_FIELDS) {
+        if (field === "whatsNew" && firstVersions.has(platform)) continue;
+        const text = wanted(copy, field, platform);
+        if (text !== (current?.attributes?.[field] ?? null)) attributes[field] = text;
+      }
+      if (!current?.attributes?.supportUrl && english.supportUrl) attributes.supportUrl = english.supportUrl;
+      if (!current?.attributes?.marketingUrl && english.marketingUrl) attributes.marketingUrl = english.marketingUrl;
+
+      const summary = Object.keys(attributes).length
+        ? Object.entries(attributes)
+            .map(([f, t]) => `${f} ${typeof t === "string" ? measure(f, t) : t}`)
+            .join(", ")
+        : "unchanged";
+      console.log(`  ${platform} ${locale.padEnd(6)} ${summary}`);
+      if (DRY || !Object.keys(attributes).length || !current) continue;
+      await api.patch(`/v1/appStoreVersionLocalizations/${current.id}`, {
+        data: { type: "appStoreVersionLocalizations", id: current.id, attributes },
+      });
+    }
+  }
+
+  const done = DRY ? "\n--dry-run: nothing written" : "\nListing text uploaded. Read it in App Store Connect before submitting.";
+  if (!info) {
+    const held = infos.data.find((i) => i.attributes.state !== "READY_FOR_DISTRIBUTION")?.attributes.state ?? "live with no draft";
+    console.log(`  info: name and subtitle skipped, the app info is ${held}`);
+    console.log(done);
+    return;
+  }
+  const infoLocalizations = await api.get(`/v1/appInfos/${info.id}/appInfoLocalizations`);
+  const englishInfo = infoLocalizations.data.find((l) => l.attributes.locale === "en-US")?.attributes ?? {};
+  for (const locale of locales) {
+    const copy = meta[locale];
+    let current = infoLocalizations.data.find((l) => l.attributes.locale === locale);
+    if (!current) {
+      if (DRY) {
+        console.log(`  info ${locale}: would create the localization`);
+      } else {
+        const created = await api.post("/v1/appInfoLocalizations", {
+          data: {
+            type: "appInfoLocalizations",
+            attributes: { locale, privacyPolicyUrl: englishInfo.privacyPolicyUrl },
+            relationships: { appInfo: { data: { type: "appInfos", id: info.id } } },
+          },
+        });
+        current = created.data;
+      }
+    }
+    const attributes = {};
+    for (const field of INFO_FIELDS) {
+      if (copy[field] !== (current?.attributes?.[field] ?? null)) attributes[field] = copy[field];
+    }
+    if (!current?.attributes?.privacyPolicyUrl && englishInfo.privacyPolicyUrl) {
+      attributes.privacyPolicyUrl = englishInfo.privacyPolicyUrl;
+    }
+    const summary = Object.keys(attributes).length ? Object.keys(attributes).join(", ") : "unchanged";
+    console.log(`  info ${locale.padEnd(6)} ${summary}`);
+    if (DRY || !Object.keys(attributes).length || !current) continue;
+    await api.patch(`/v1/appInfoLocalizations/${current.id}`, {
+      data: { type: "appInfoLocalizations", id: current.id, attributes },
+    });
+  }
+
+  console.log(done);
+}
+
+main().catch((e) => fail(e.message));

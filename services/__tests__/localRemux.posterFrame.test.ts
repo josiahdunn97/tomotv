@@ -1,0 +1,479 @@
+/**
+ * Tests for the poster frame request: the seek rule, the settled cache, one shared job for
+ * callers asking at once, a cancel that settles nothing, and the held file's own path.
+ */
+const mockPosterFrame = jest.fn();
+const mockCancelPosterFrame = jest.fn();
+const mockSetPosterQueuePaused = jest.fn();
+const mockClearFramePool = jest.fn();
+const mockLocalMediaUri = jest.fn((_id: string): string | null => null);
+
+jest.mock("react-native", () => ({
+  Platform: { OS: "ios", isTV: true },
+  NativeModules: {
+    LocalRemuxer: {
+      startRemux: jest.fn(),
+      posterFrame: (config: unknown) => mockPosterFrame(config),
+      cancelPosterFrame: (itemId: string) => mockCancelPosterFrame(itemId),
+      setPosterQueuePaused: (paused: boolean) => mockSetPosterQueuePaused(paused),
+      clearFramePool: () => mockClearFramePool(),
+    },
+  },
+  NativeEventEmitter: jest.fn(),
+}));
+jest.mock("@/utils/logger", () => ({ logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } }));
+jest.mock("@/services/jellyfinApi", () => ({
+  JELLYFIN_TIME: { TICKS_PER_SECOND: 10_000_000 },
+  generatePlaySessionId: jest.fn(),
+  getVideoStreamUrl: jest.fn(),
+  getSubtitleUrl: jest.fn(),
+  isImageBasedSubtitleCodec: jest.fn(() => false),
+}));
+jest.mock("@/services/downloads/localSource", () => ({
+  localMediaUri: (id: string) => mockLocalMediaUri(id),
+  localSubtitleUri: jest.fn(() => null),
+  playsFromDisk: jest.fn(() => false),
+}));
+jest.mock("@/services/jellyfin/streamUrls", () => ({
+  getRemoteVideoStreamUrl: jest.fn((id: string) => `https://jf/Videos/${id}/stream?Static=true`),
+  getAudioRenditionUrl: jest.fn(),
+  getTierPlaylistUrl: jest.fn(),
+}));
+jest.mock("@/services/jellyfin/bitrateTest", () => ({ rememberedBitrate: jest.fn() }));
+jest.mock("@/services/playbackProbe", () => ({ probeEmit: jest.fn() }));
+
+import {
+  cancelPosterFrame,
+  clearFramePool,
+  clearPosterFrameCache,
+  POSTER_FRAME_ATTEMPTS,
+  POSTER_FRAME_OPEN_RETRY_CAP_MS,
+  POSTER_FRAME_RETRY_MS,
+  posterFrameGeneration,
+  posterFrameIfCached,
+  posterFrameRevision,
+  posterFrameSeconds,
+  posterFrameWorkInFlight,
+  requestPosterFrame,
+  setPosterFramesPaused,
+  subscribePosterFrames,
+} from "../localRemux";
+
+const TICKS = 10_000_000;
+
+describe("posterFrameSeconds", () => {
+  it("takes the frame a tenth of the way in, or ten seconds in without a runtime", () => {
+    expect(posterFrameSeconds({ RunTimeTicks: 3600 * TICKS })).toBe(360);
+    expect(posterFrameSeconds({ RunTimeTicks: 0 })).toBe(10);
+    expect(posterFrameSeconds({ RunTimeTicks: undefined as unknown as number })).toBe(10);
+  });
+});
+
+describe("requestPosterFrame", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearPosterFrameCache();
+    mockLocalMediaUri.mockReturnValue(null);
+    mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+  });
+
+  it("asks the engine for the original file a tenth of the way in, and confirms a settled answer with it", async () => {
+    const uri = await requestPosterFrame({ Id: "a", RunTimeTicks: 600 * TICKS });
+
+    expect(uri).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(mockPosterFrame).toHaveBeenCalledWith({ itemId: "a", inputUrl: "https://jf/Videos/a/stream?Static=true", seconds: 60 });
+    expect(posterFrameIfCached("a")).toBe(uri);
+
+    // The pool trims: a settled success goes back to the engine, which serves the file or decodes it again.
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 600 * TICKS })).toBe(uri);
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+    expect(posterFrameRevision("a")).toBe(0);
+  });
+
+  it("bumps the item's revision when a settled poster had to be decoded again", async () => {
+    mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false, fresh: true });
+
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(posterFrameRevision("a")).toBe(0);
+
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(posterFrameRevision("a")).toBe(1);
+
+    clearPosterFrameCache();
+    expect(posterFrameRevision("a")).toBe(0);
+  });
+
+  it("shares one job between callers asking at once", async () => {
+    const [first, second] = await Promise.all([requestPosterFrame({ Id: "a", RunTimeTicks: 0 }), requestPosterFrame({ Id: "a", RunTimeTicks: 0 })]);
+
+    expect(first).toBe(second);
+    expect(mockPosterFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a failure so a card never asks twice for a file the engine cannot open", async () => {
+    mockPosterFrame.mockRejectedValueOnce(new Error("open failed"));
+
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBeNull();
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBeNull();
+    expect(mockPosterFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks again for a job the engine dropped while a card still waits", async () => {
+    mockPosterFrame.mockResolvedValueOnce({ uri: null, cancelled: true });
+
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("settles nothing for a job the engine dropped with no card waiting, so the next card asks again", async () => {
+    let settle: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settle = resolve)));
+
+    const first = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    cancelPosterFrame("a");
+    settle({ uri: null, cancelled: true });
+    expect(await first).toBeNull();
+    expect(posterFrameIfCached("a")).toBeUndefined();
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives a card that came back before the engine reached the dropped job its frame", async () => {
+    let settle: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settle = resolve)));
+
+    const first = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    cancelPosterFrame("a");
+    const second = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    settle({ uri: null, cancelled: true });
+    expect(await second).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(await first).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(posterFrameIfCached("a")).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a held download by its own file", async () => {
+    mockLocalMediaUri.mockReturnValue("file:///downloads/a/media.mkv");
+
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+
+    expect(mockPosterFrame).toHaveBeenCalledWith(expect.objectContaining({ inputUrl: "file:///downloads/a/media.mkv" }));
+  });
+});
+
+describe("subscribePosterFrames", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearPosterFrameCache();
+    mockLocalMediaUri.mockReturnValue(null);
+    mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+  });
+
+  it("tells the listener when a poster settles to a file, until it unsubscribes", async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribePosterFrames(listener);
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(listener).toHaveBeenCalledWith("a");
+    unsubscribe();
+    clearPosterFrameCache();
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("says nothing for a failure, a dropped job or a job that outlived a clear", async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribePosterFrames(listener);
+    mockPosterFrame.mockResolvedValueOnce({ uri: null, cancelled: false, reason: "frame" });
+    await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    mockPosterFrame.mockResolvedValueOnce({ uri: null, cancelled: true });
+    const dropped = requestPosterFrame({ Id: "b", RunTimeTicks: 0 });
+    cancelPosterFrame("b");
+    await dropped;
+    let settle: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settle = resolve)));
+    const stale = requestPosterFrame({ Id: "c", RunTimeTicks: 0 });
+    clearPosterFrameCache();
+    settle({ uri: "file:///caches/chapter-frames/c/poster.jpg", cancelled: false });
+    await stale;
+    expect(listener).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
+  it("keeps the poster settled when a listener throws", async () => {
+    const unsubscribe = subscribePosterFrames(() => {
+      throw new Error("listener");
+    });
+    expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(posterFrameIfCached("a")).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    unsubscribe();
+  });
+});
+
+describe("clearPosterFrameCache", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearPosterFrameCache();
+    mockLocalMediaUri.mockReturnValue(null);
+    mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+  });
+
+  it("settles nothing from a job that outlived the clear", async () => {
+    let settle: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settle = resolve)));
+    const generation = posterFrameGeneration();
+    const job = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+
+    clearPosterFrameCache();
+    expect(posterFrameGeneration()).not.toBe(generation);
+    settle({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+    await job;
+
+    expect(posterFrameIfCached("a")).toBeUndefined();
+  });
+
+  it("leaves the job started after it holding its own entry", async () => {
+    let settleStale: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    let settleLive: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleStale = resolve)));
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleLive = resolve)));
+
+    const stale = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    clearPosterFrameCache();
+    expect(mockCancelPosterFrame).toHaveBeenCalledWith("a");
+    mockCancelPosterFrame.mockClear();
+    const live = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    settleStale({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+    await stale;
+
+    // A card arriving after the clear joins the live job instead of starting a third.
+    const joined = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+
+    // Both of the live job's waiters are still counted, so the engine hears the last cancel.
+    cancelPosterFrame("a");
+    expect(mockCancelPosterFrame).not.toHaveBeenCalled();
+    cancelPosterFrame("a");
+    expect(mockCancelPosterFrame).toHaveBeenCalledWith("a");
+
+    settleLive({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false });
+    await Promise.all([live, joined]);
+  });
+
+  it("does not ask again for a job the engine dropped after the clear, even with a new card waiting", async () => {
+    let settleStale: (value: { uri: string | null; cancelled: boolean }) => void = () => {};
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleStale = resolve)));
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+
+    const stale = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    clearPosterFrameCache();
+    // The next server's card for the same id waits; the stale job must not re-ask with its old URL.
+    void requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    settleStale({ uri: null, cancelled: true });
+
+    expect(await stale).toBeNull();
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+    expect(posterFrameIfCached("a")).toBeUndefined();
+  });
+
+  it("asks again for a failure once the retry window has passed, three times over", async () => {
+    jest.useFakeTimers();
+    try {
+      mockPosterFrame.mockResolvedValue({ uri: null, cancelled: false });
+      expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBeNull();
+      expect(posterFrameIfCached("a")).toBeNull();
+      expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBeNull();
+      expect(mockPosterFrame).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(POSTER_FRAME_RETRY_MS);
+      expect(posterFrameIfCached("a")).toBeUndefined();
+      mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false, fresh: true });
+      expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBe("file:///caches/chapter-frames/a/poster.jpg");
+      expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("stops asking once the attempts are spent", async () => {
+    jest.useFakeTimers();
+    try {
+      mockPosterFrame.mockResolvedValue({ uri: null, cancelled: false });
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+        jest.advanceTimersByTime(POSTER_FRAME_RETRY_MS);
+      }
+      expect(mockPosterFrame).toHaveBeenCalledTimes(POSTER_FRAME_ATTEMPTS);
+      expect(posterFrameIfCached("a")).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("keeps asking for a source that would not open, waiting twice as long each time up to the cap", async () => {
+    jest.useFakeTimers();
+    try {
+      mockPosterFrame.mockResolvedValue({ uri: null, cancelled: false, reason: "open" });
+      let wait = POSTER_FRAME_RETRY_MS;
+      for (let attempt = 1; attempt <= POSTER_FRAME_ATTEMPTS + 3; attempt += 1) {
+        expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBeNull();
+        expect(mockPosterFrame).toHaveBeenCalledTimes(attempt);
+        jest.advanceTimersByTime(wait - 1);
+        expect(posterFrameIfCached("a")).toBeNull();
+        jest.advanceTimersByTime(1);
+        expect(posterFrameIfCached("a")).toBeUndefined();
+        wait = Math.min(wait * 2, POSTER_FRAME_OPEN_RETRY_CAP_MS);
+      }
+      expect(wait).toBe(POSTER_FRAME_OPEN_RETRY_CAP_MS);
+
+      // The copy finished: the next ask gets the poster.
+      mockPosterFrame.mockResolvedValue({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false, fresh: true });
+      expect(await requestPosterFrame({ Id: "a", RunTimeTicks: 0 })).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("empties the engine's pool on disk as well", async () => {
+    await clearFramePool();
+    expect(mockClearFramePool).toHaveBeenCalled();
+  });
+});
+
+describe("cancelPosterFrame", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearPosterFrameCache();
+    mockLocalMediaUri.mockReturnValue(null);
+  });
+
+  it("tells the engine to drop the job only when the last waiting card leaves", async () => {
+    let settle: (value: { uri: string | null }) => void = () => {};
+    mockPosterFrame.mockImplementation(() => new Promise((resolve) => (settle = resolve)));
+    void requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    void requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+
+    cancelPosterFrame("a");
+    expect(mockCancelPosterFrame).not.toHaveBeenCalled();
+    cancelPosterFrame("a");
+    expect(mockCancelPosterFrame).toHaveBeenCalledWith("a");
+
+    settle({ uri: null });
+  });
+
+  it("does nothing for an item nobody is waiting on", () => {
+    cancelPosterFrame("nobody");
+    expect(mockCancelPosterFrame).not.toHaveBeenCalled();
+  });
+});
+
+describe("setPosterFramesPaused", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearPosterFrameCache();
+    mockLocalMediaUri.mockReturnValue(null);
+  });
+  afterEach(() => {
+    setPosterFramesPaused(false);
+  });
+
+  it("parked backlog is not busy work; the finishing grab and fresh asks are", async () => {
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+    void requestPosterFrame({ Id: "parked", RunTimeTicks: 0 });
+    expect(posterFrameWorkInFlight()).toBe(true);
+
+    setPosterFramesPaused(true);
+    expect(mockSetPosterQueuePaused).toHaveBeenLastCalledWith(true);
+    // The grab mid-run at pause time may still be finishing.
+    expect(posterFrameWorkInFlight()).toBe(true);
+
+    // A fresh ask decodes through the drain: the runner is done, only the parked job remains.
+    mockPosterFrame.mockResolvedValueOnce({ uri: "file:///caches/chapter-frames/fresh/poster.jpg", cancelled: false, fresh: true });
+    await requestPosterFrame({ Id: "fresh", RunTimeTicks: 0 });
+    expect(posterFrameWorkInFlight()).toBe(false);
+
+    // A fresh ask in flight is real work.
+    let settleLate!: (value: { uri: string | null; cancelled: boolean }) => void;
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleLate = resolve)));
+    const late = requestPosterFrame({ Id: "late", RunTimeTicks: 0 });
+    expect(posterFrameWorkInFlight()).toBe(true);
+    settleLate({ uri: null, cancelled: false });
+    await late;
+    expect(posterFrameWorkInFlight()).toBe(false);
+
+    // Unpaused, the parked job counts again.
+    setPosterFramesPaused(false);
+    expect(posterFrameWorkInFlight()).toBe(true);
+  });
+
+  it("a caller joining a parked job kicks it loose past the pause", async () => {
+    let settleParked!: (value: { uri: string | null; cancelled: boolean }) => void;
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleParked = resolve)));
+    mockPosterFrame.mockResolvedValueOnce({ uri: "file:///caches/chapter-frames/a/poster.jpg", cancelled: false, fresh: true });
+    const card = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    setPosterFramesPaused(true);
+
+    const player = requestPosterFrame({ Id: "a", RunTimeTicks: 0 });
+    expect(mockCancelPosterFrame).toHaveBeenCalledWith("a");
+    settleParked({ uri: null, cancelled: true });
+
+    expect(await player).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(await card).toBe("file:///caches/chapter-frames/a/poster.jpg");
+    expect(mockPosterFrame).toHaveBeenCalledTimes(2);
+    // Kicked loose, the job is live work again.
+    expect(posterFrameWorkInFlight()).toBe(false);
+  });
+
+  it("withdrawing a parked job does not clear the busy flag the running grab holds", async () => {
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+    let settleParked!: (value: { uri: string | null; cancelled: boolean }) => void;
+    mockPosterFrame.mockImplementationOnce(() => new Promise((resolve) => (settleParked = resolve)));
+    void requestPosterFrame({ Id: "running", RunTimeTicks: 0 });
+    const parked = requestPosterFrame({ Id: "parked", RunTimeTicks: 0 });
+    setPosterFramesPaused(true);
+
+    // The parked job's card leaves; the engine answers it cancelled without decoding anything.
+    cancelPosterFrame("parked");
+    settleParked({ uri: null, cancelled: true });
+    await parked;
+    expect(posterFrameWorkInFlight()).toBe(true);
+  });
+
+  it("a pool hit does not clear the busy flag the running grab holds", async () => {
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+    void requestPosterFrame({ Id: "running", RunTimeTicks: 0 });
+    setPosterFramesPaused(true);
+
+    // The pool answers on the caller's thread (fresh: false); nothing decoded.
+    mockPosterFrame.mockResolvedValueOnce({ uri: "file:///caches/chapter-frames/hit/poster.jpg", cancelled: false, fresh: false });
+    await requestPosterFrame({ Id: "hit", RunTimeTicks: 0 });
+    expect(posterFrameWorkInFlight()).toBe(true);
+  });
+
+  it("owner churn repeating the pause does not misfile a fresh ask as parked", async () => {
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+    void requestPosterFrame({ Id: "parked", RunTimeTicks: 0 });
+    setPosterFramesPaused(true);
+    mockPosterFrame.mockResolvedValueOnce({ uri: "file:///caches/chapter-frames/done/poster.jpg", cancelled: false, fresh: true });
+    await requestPosterFrame({ Id: "done", RunTimeTicks: 0 });
+    mockPosterFrame.mockImplementationOnce(() => new Promise(() => {}));
+    void requestPosterFrame({ Id: "fresh", RunTimeTicks: 0 });
+    expect(posterFrameWorkInFlight()).toBe(true);
+
+    // Audio joins the video hold: the change listener sends true again.
+    setPosterFramesPaused(true);
+    expect(posterFrameWorkInFlight()).toBe(true);
+  });
+
+  it("does nothing when the installed binary lacks the pause method", () => {
+    const module = require("react-native").NativeModules.LocalRemuxer as Record<string, unknown>;
+    const method = module.setPosterQueuePaused;
+    delete module.setPosterQueuePaused;
+    try {
+      setPosterFramesPaused(true);
+      expect(mockSetPosterQueuePaused).not.toHaveBeenCalled();
+      expect(posterFrameWorkInFlight()).toBe(false);
+    } finally {
+      module.setPosterQueuePaused = method;
+    }
+  });
+});

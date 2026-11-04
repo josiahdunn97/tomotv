@@ -1,0 +1,129 @@
+/**
+ * The one line on the panel that tells the viewer where playback will run. It states server
+ * involvement, so "no server work" has to be false exactly when a server feed opens the session:
+ * the engine's tier is only proved once playback starts, and the line promises nothing else.
+ */
+import React from "react";
+import TestRenderer, { act } from "react-test-renderer";
+import { Text } from "react-native";
+import { fetchItemDetails } from "@/services/jellyfinApi";
+import { predictPlaybackLane } from "@/services/localRemux";
+import type { JellyfinItem } from "@/types/jellyfin";
+import VideoInfoScreen from "@/app/video-info";
+
+const item = {
+  Id: "item-1",
+  Name: "Arrival",
+  Type: "Movie",
+  MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+  UserData: { PlaybackPositionTicks: 0, Played: false },
+} as unknown as JellyfinItem;
+
+jest.mock("expo-router", () => ({
+  useLocalSearchParams: () => ({ videoId: "item-1" }),
+  useRouter: () => ({ back: jest.fn(), push: jest.fn(), replace: jest.fn() }),
+}));
+
+jest.mock("@/utils/logger", () => ({ logger: { error: jest.fn(), info: jest.fn(), debug: jest.fn(), warn: jest.fn() } }));
+jest.mock("@/hooks/useSubtitlePanel", () => ({ useSubtitlePanel: () => ({ available: true, open: jest.fn(), offsetMs: 0 }) }));
+jest.mock("react-native-gesture-handler", () => {
+  const { View } = require("react-native");
+  const chain: any = new Proxy(() => chain, { get: () => () => chain, apply: () => chain });
+  return { Gesture: { Pan: () => chain, Native: () => chain }, GestureDetector: ({ children }: { children: React.ReactNode }) => children, GestureHandlerRootView: View };
+});
+jest.mock("@/services/localRemux", () => ({
+  predictPlaybackLane: jest.fn(async () => null),
+  posterFrameIfCached: jest.fn(() => undefined),
+  posterFrameRevision: jest.fn(() => 0),
+  requestPosterFrame: jest.fn(async () => null),
+  cancelPosterFrame: jest.fn(),
+}));
+jest.mock("@/hooks/useFolderPlay", () => ({ useFolderPlay: () => jest.fn() }));
+jest.mock("@/hooks/useShowInFolder", () => ({ useShowInFolder: () => jest.fn() }));
+jest.mock("@/hooks/useOpenShelfItem", () => ({ useOpenShelfItem: () => jest.fn() }));
+jest.mock("@/services/nextUp", () => ({ containerKey: () => null, dismissNextUpContainer: jest.fn() }));
+jest.mock("@/contexts/LoadingContext", () => ({ useLoadingActions: () => ({ showGlobalLoader: jest.fn(), hideGlobalLoader: jest.fn() }) }));
+jest.mock("@/components/ambient-background", () => ({ AmbientBackground: () => null }));
+jest.mock("@/components/close-overlay-button", () => ({ CloseOverlayButton: () => null }));
+jest.mock("@/components/info-action-row", () => ({ InfoActionRow: () => null }));
+jest.mock("@/components/info-focus-row", () => ({ InfoFocusRow: ({ children }: { children: React.ReactNode }) => children }));
+jest.mock("@/components/FocusableButton", () => ({ FocusableButton: () => null }));
+jest.mock("@/components/progress-button", () => ({ ProgressButton: () => null }));
+jest.mock("expo-image", () => ({ Image: Object.assign(() => null, { loadAsync: async () => ({ width: 16, height: 9 }) }) }));
+jest.mock("expo-blur", () => ({ BlurView: () => null }));
+jest.mock("@expo/vector-icons", () => ({ Ionicons: () => null }));
+jest.mock("react-native-safe-area-context", () => ({
+  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+  SafeAreaProvider: ({ children }: { children: React.ReactNode }) => children,
+}));
+
+jest.mock("@/services/jellyfinApi", () => ({
+  subscribeSubtitlesChanged: jest.fn(() => () => {}),
+  subscribeAuthChange: jest.fn(() => () => {}),
+  clearResumePosition: jest.fn(async () => {}),
+  deleteItem: jest.fn(async () => {}),
+  fetchIsAdministrator: jest.fn(async () => false),
+  isLiveChannel: () => false,
+  fetchItemDetails: jest.fn(),
+  fetchFolderMediaKinds: jest.fn(async () => null),
+  fetchItemFolderPath: jest.fn(async () => []),
+  getBackdropUrl: () => null,
+  getLogoUrl: () => null,
+  getPersonImageUrl: () => null,
+  getPosterUrl: () => null,
+  hasPoster: () => false,
+  isAudioItem: () => false,
+  isFolder: () => false,
+  isPhoto: () => false,
+  isBook: () => false,
+  notifyResumeChange: jest.fn(),
+  setVideoFavorite: jest.fn(async () => {}),
+  setVideoPlayed: jest.fn(async () => {}),
+}));
+
+const mockFetchItemDetails = fetchItemDetails as jest.Mock;
+const mockPredict = predictPlaybackLane as jest.Mock;
+
+/** Every line the panel renders, so the assertion names the sentence, not a node path. */
+async function laneLine(plan: unknown): Promise<string> {
+  mockFetchItemDetails.mockResolvedValue(item);
+  mockPredict.mockResolvedValue(plan);
+  let tree: TestRenderer.ReactTestRenderer;
+  await act(async () => {
+    tree = TestRenderer.create(<VideoInfoScreen />);
+  });
+  const lines = tree!.root
+    .findAllByType(Text)
+    .flatMap((node) => (Array.isArray(node.props.children) ? node.props.children : [node.props.children]))
+    .filter((child): child is string => typeof child === "string");
+  return lines.find((line) => line.startsWith("Direct Play") || line.startsWith("Re-encoded") || line.startsWith("Transcoded") || line.startsWith("Needs")) ?? "";
+}
+
+describe("the engine line on the item panel", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("promises no server work for a file the device copies over a link that carries it", async () => {
+    expect(await laneLine({ lane: "copy", smallFeedFirst: false })).toBe("Direct Play · no server work");
+  });
+
+  it("says a smaller server feed opens the session when the link cannot carry the file", async () => {
+    expect(await laneLine({ lane: "copy", smallFeedFirst: true })).toBe("Direct Play · starts on a smaller server feed on slow connections");
+  });
+
+  it("carries the same tail on the device's own re-encode", async () => {
+    expect(await laneLine({ lane: "deviceTranscode", smallFeedFirst: false })).toBe("Re-encoded on this device · no server work");
+    expect(await laneLine({ lane: "deviceTranscode", smallFeedFirst: true })).toBe("Re-encoded on this device · starts on a smaller server feed on slow connections");
+  });
+
+  it("names the server outright when the whole file goes through it", async () => {
+    expect(await laneLine({ lane: "server", smallFeedFirst: false })).toBe("Transcoded by the server");
+  });
+
+  it("says the file needs a server this device will not ask", async () => {
+    expect(await laneLine({ lane: "unplayable", smallFeedFirst: false })).toBe("Needs server transcoding, which is off");
+  });
+
+  it("says nothing at all until the lane is known", async () => {
+    expect(await laneLine(null)).toBe("");
+  });
+});

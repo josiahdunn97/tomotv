@@ -1,0 +1,750 @@
+import { COLORS } from "@/constants/colors";
+import { Image } from "expo-image";
+import * as Linking from "expo-linking";
+import { DarkTheme, Stack, ThemeProvider, useNavigationContainerRef } from "expo-router";
+import { LogBox, Platform } from "react-native";
+import React, { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import "react-native-reanimated";
+
+import { preloadAmbientBackgrounds } from "@/components/ambient-background";
+import { AudioMiniPlayer } from "@/components/audio-mini-player";
+import { downloadManager } from "@/services/downloads/manager";
+import { flushOfflinePositions } from "@/services/downloads/offlineProgress";
+import { closeLeftoverOpens } from "@/services/jellyfin/liveTv";
+import { resetPlaybackReportBackoff } from "@/services/jellyfin/playback";
+import { nudgeBitrateMemory, warmBitrateMemory } from "@/services/jellyfin/bitrateTest";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { MacKeyCommands } from "@/components/mac-key-commands";
+import { DiagnosticsInbox } from "@/components/diagnostics-inbox";
+import { SyncPlayDriver } from "@/components/sync-play-driver";
+import { PlayerHost } from "@/components/player-host";
+import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { LoadingProvider } from "@/contexts/LoadingContext";
+import { LibraryProvider } from "@/contexts/LibraryContext";
+import { LibraryFiltersProvider } from "@/contexts/LibraryFiltersContext";
+import { PlayerSessionProvider } from "@/contexts/PlayerSessionContext";
+import { useAppStateRefresh } from "@/hooks/useAppStateRefresh";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { PlayQueueProvider } from "@/contexts/PlayQueueContext";
+import { registerMultiAudioPlugin } from "@/services/multiAudioLoader";
+import { applyScreenshotSizeLockAtLaunch } from "@/services/screenshotSizeLock";
+import { videoDecodeSupport } from "@/services/localRemux";
+import { watchRecordingHolds } from "@/services/recordingHold";
+import { startShelfChannelEdits } from "@/services/topShelfChannelEdits";
+import { logger } from "@/utils/logger";
+import { tabsAvailable } from "@/utils/rootRoutes";
+import { t } from "@/services/i18n";
+import { LocaleBoundary } from "@/components/locale-boundary";
+import { useLocale } from "@/hooks/useLocale";
+
+/**
+ * LogBox off, both platforms.
+ *
+ * All of this is development-only by construction: React Native does not install LogBox in
+ * release builds, so nothing here changes shipped behaviour.
+ *
+ * `ignoreAllLogs()` alone is not enough, and was also only applied on TV before. It sets
+ * LogBoxData's `isDisabled`, which suppresses the notification toasts and nothing else:
+ * `LogBoxInspectorContainer.render()` (react-native 0.85) never reads that flag, so an
+ * uncaught error still takes over the whole screen. React Native offers no switch for that
+ * screen. On tvOS it is worse than useless: it claims focus, and the remote cannot reliably
+ * get out of it.
+ *
+ * So the uncaught-error path is intercepted before LogBox ever sees it. RN installs its own
+ * handler in Libraries/Core/setUpErrorHandling.js
+ * (`ErrorUtils.setGlobalHandler` -> `ExceptionsManager.handleException` -> LogBox); replacing
+ * that handler means the error is logged and goes no further. Deliberate trade-off: a crash in
+ * development now surfaces in the log rather than on screen.
+ *
+ * Not covered, and not coverable from here: a JavaScript SYNTAX error opens LogBox from the
+ * bundler before any app code runs. React Native makes that one non-dismissable on purpose,
+ * because the bundle cannot execute at all.
+ */
+LogBox.ignoreAllLogs(true);
+if (__DEV__) {
+  const errorUtils = (globalThis as unknown as { ErrorUtils?: { setGlobalHandler: (cb: (error: unknown, isFatal?: boolean) => void) => void } }).ErrorUtils;
+  errorUtils?.setGlobalHandler((error, isFatal) => {
+    logger.error("Uncaught JS error, LogBox suppressed", error, { component: "AppRoot", isFatal: isFatal === true });
+  });
+}
+
+/** SDWebImage's decoded-image cache has no ceiling of its own. Android's image module has no such call. */
+const IMAGE_MEMORY_CACHE_BYTES = 64 * 1024 * 1024;
+if (Platform.OS === "ios") Image.configureCache({ maxMemoryCost: IMAGE_MEMORY_CACHE_BYTES });
+
+// Without a theme, expo-router's NavigationContainer falls back to the LIGHT DefaultTheme, whose
+// colors.background (rgb(242,242,242)) paints the surfaces behind/between screens, visible as a
+// white sheet under the top screen during the iOS interactive back-swipe (expo/expo#42545,
+// react-native-screens#3758). Match it to the app canvas so nothing light can peek through.
+// `primary` is the app's tint: on iOS every native-stack header takes it for the back
+// chevron and its label (tintColor = headerTintColor ?? colors.primary,
+// native-stack/views/useHeaderConfigProps.js:114), so the theme's accent replaces the system
+// blue without a per-screen override. Same value the tab bar and every FocusableButton use.
+const appDarkTheme = (primary: string) => ({
+  ...DarkTheme,
+  colors: {
+    ...DarkTheme.colors,
+    background: COLORS.BACKGROUND,
+    primary,
+  },
+});
+
+/** Not remounted on a language pick: the tabs carry their own boundary per screen, a playback
+ *  route would restart its item, and dev-locale would run its link again. */
+const KEEP_MOUNTED = new Set(["(tabs)", "player", "audio-player", "dev-locale"]);
+
+function localeScreenLayout({ route, children }: { route: { name: string }; children: React.ReactElement }) {
+  return KEEP_MOUNTED.has(route.name) ? children : <LocaleBoundary>{children}</LocaleBoundary>;
+}
+
+const subscribeDownloads = (listener: () => void) => downloadManager.subscribe(listener);
+const downloadsHydrated = () => downloadManager.getState().hydrated;
+const readyDownloads = () => downloadManager.getState().entries.filter((entry) => entry.state === "ready").length;
+
+export default function RootLayout() {
+  return (
+    <ErrorBoundary>
+      <AuthProvider>
+        <RootLayoutInner />
+      </AuthProvider>
+    </ErrorBoundary>
+  );
+}
+
+function RootLayoutInner() {
+  // Register native plugins on app startup
+  useEffect(() => {
+    registerMultiAudioPlugin();
+    preloadAmbientBackgrounds();
+    // Reconciles the download manifest with the files on disk. Playback asks isReady()
+    // synchronously, so it has to be true before any route can start something.
+    void downloadManager.hydrate().then(() => flushOfflinePositions());
+    // Tuner streams a previous run opened and never closed: the server holds them until told.
+    void closeLeftoverOpens();
+    // Background link measurement so playback routing reads warm memory
+    // instead of ever probing on the session-start path.
+    warmBitrateMemory();
+    // Same for what this device decodes: the answer opens VideoToolbox sessions once.
+    void videoDecodeSupport();
+    // Dev Mac builds: a stored screenshot size lock survives the reload.
+    applyScreenshotSizeLockAtLaunch();
+  }, []);
+
+  // A recording on a one-connection provider keeps this device off that provider.
+  useEffect(() => watchRecordingHolds(), []);
+
+  // The Top Shelf leaves out the channels this account hid and shows its renames.
+  useEffect(() => startShelfChannelEdits(), []);
+
+  // Redraws the header titles below and the hosts outside the navigator in a picked language.
+  useLocale();
+  const { accent } = useCardPalette();
+  const navigationTheme = useMemo(() => appDarkTheme(accent), [accent]);
+
+  // Foregrounding is when the device may have changed networks. Also the moment a session
+  // spent offline gets its resume positions to the server, and reporting stops standing down.
+  const warmOnForeground = useCallback(() => {
+    warmBitrateMemory();
+    resetPlaybackReportBackoff();
+    void flushOfflinePositions();
+    // A close the last session could not deliver (the link was down, the server answered 5xx) goes out again.
+    void closeLeftoverOpens();
+  }, []);
+  useAppStateRefresh(warmOnForeground, "BitrateWarmup");
+
+  // Browsing keeps the reading inside its refresh window. Skipped on the playback
+  // routes and the panel before them: a probe there races the stream it sizes.
+  const navigationRef = useNavigationContainerRef();
+  useEffect(() => {
+    return navigationRef.addListener("state", () => {
+      // Cast: no ReactNavigation.RootParamList is declared, so the return type is `never`.
+      const route = (navigationRef.getCurrentRoute() as { name?: string } | undefined)?.name;
+      if (route === "player" || route === "audio-player" || route === "video-info") return;
+      nudgeBitrateMemory();
+    });
+  }, [navigationRef]);
+
+  // Deep links are sticky for the life of the PROCESS, not the JS context.
+  // LinkingAppDelegateSubscriber writes every incoming URL into
+  // ExpoLinkingRegistry.shared.initialURL (a Swift singleton) and nothing clears it; on iOS and
+  // tvOS expo-router's getInitialURL is exactly that value (expo-router/build/link/linking.js:61-67
+  // -> Linking.getLinkingURL()), and expo-router never calls clearInitialURL. A Metro reload
+  // replaces the JS context but not the process, so the fresh JS asks for the initial URL and gets
+  // the same deep link back, remounting /player on that videoId at every reload, hours later, an
+  // item the current server may not even have. Clearing it here costs nothing: expo-router reads
+  // the initial URL synchronously while building its store (global-state/useStore.js:56-61), long
+  // before this effect runs, so the launching link still routes. Links that arrive later are
+  // events (Linking.addEventListener), not this cache, so Top Shelf and the regression suite are
+  // untouched.
+  useEffect(() => {
+    Linking.clearInitialURL();
+  }, []);
+
+  // Signed out with nothing downloaded, the tabs leave the stack and Who's watching is the root.
+  const { isReady, isConnected } = useAuth();
+  const hydrated = useSyncExternalStore(subscribeDownloads, downloadsHydrated);
+  const readyCount = useSyncExternalStore(subscribeDownloads, readyDownloads);
+  const showTabs = tabsAvailable({ isReady, isConnected }, { hydrated, readyCount });
+
+  return (
+    <LoadingProvider>
+      <LibraryProvider>
+        <PlayQueueProvider>
+          {/* The video player is mounted OUTSIDE the navigator, below, and driven through this
+                  provider. It has to be: popping /player unmounts <Video>, and RCTVideo's teardown
+                  nils the AVPlayer, which takes any Picture in Picture window down with it. Apple
+                  says the same thing: the object that owns playback "must not be part of your view
+                  hierarchy" if it is to survive PiP (WWDC20, Master Picture in Picture on tvOS). */}
+          <PlayerSessionProvider>
+            {/* Library filter selections live here (not in the (library) stack) so the Filters
+                  route can be a ROOT screen that covers the tabs: a route inside (tabs) leaves the
+                  native tab bar on screen to steal focus on tvOS. Both share this one provider. */}
+            <LibraryFiltersProvider>
+              <ThemeProvider value={navigationTheme}>
+                <Stack screenOptions={{ contentStyle: { backgroundColor: COLORS.BACKGROUND } }} screenLayout={localeScreenLayout}>
+                  <Stack.Protected guard={showTabs}>
+                    <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                  </Stack.Protected>
+                  {/* Declared first after the tabs: the stack's first remaining route is what an
+                      emptied stack lands on when the tabs leave it. Nothing lies beneath it, so Menu
+                      and back leave the app, as at any root. */}
+                  <Stack.Screen name="who-is-watching" options={{ headerShown: false, gestureEnabled: false, animation: Platform.isTV ? "fade" : "default" }} />
+                  {/* Folder browsing is a ROOT route, not nested in (tabs): a route inside the tabs
+                      leaves the native tab bar on screen, and on tvOS the focus engine hands it focus
+                      the moment a programmatic pop tears out the focused card (RNSScreenStack rebuilds
+                      the stack animated:NO). Covering the tabs, the same reason Filters lives here,
+                      removes that focus sink. TV hides the header (the grid draws its own bar); phone
+                      keeps the native UINavigationBar the folder screen configures. */}
+                  <Stack.Screen
+                    name="[folderId]"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : { headerShown: true, headerTransparent: true, headerShadowVisible: false, headerTitleStyle: { color: COLORS.TEXT_PRIMARY }, animation: "default" }
+                    }
+                  />
+                  {/* Phone's guide is a root route like folders: pushed inside the Home tab's stack, iPad
+                      returns to Home with the tab's safe-area top short of the floating tab bar. TV's guide is the livetv tab. */}
+                  <Stack.Screen
+                    name="live-tv"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : { headerShown: true, headerTransparent: true, headerShadowVisible: false, headerTitleStyle: { color: COLORS.TEXT_PRIMARY }, animation: "default" }
+                    }
+                  />
+                  {/* Regular push, NOT a fullScreenModal: UIModalPresentationFullScreen takes the RN
+                      root view out of the window, so every native view below it sees window == nil and
+                      back again. expo-tvos-search tears its UIHostingController out of the VC hierarchy
+                      on that signal, and SwiftUI's .searchable never re-registers: the Search tab comes
+                      back with no search field and no way to focus one. A root push covers the tabs just
+                      the same (see filters/photo-viewer) and never leaves the window. */}
+                  <Stack.Screen
+                    name="player"
+                    options={{
+                      headerShown: false,
+                      animation: "fade",
+                      // The route is opaque black on both sides of the AVKit presentation, so
+                      // react-native-screens' 500ms default dissolve is 500ms of nothing.
+                      animationDuration: Platform.isTV ? undefined : 150,
+                    }}
+                  />
+                  {/* Audio queue playback: same regular-push rules as player (TV remote events,
+                      Menu pops natively). The native audio UI is PRESENTED by the Swift module over
+                      this screen, not rendered by it. The fade is entrance-only: the screen flips
+                      itself to animation "none" once pushed, so the pop is a cut and AVKit's own
+                      dismissal is the only exit animation. */}
+                  <Stack.Screen
+                    name="audio-player"
+                    options={{
+                      headerShown: false,
+                      animation: "fade",
+                      // Opaque black route, same reasoning as player above.
+                      animationDuration: Platform.isTV ? undefined : 150,
+                    }}
+                  />
+                  {/* Regular push, NOT a modal: react-native-screens modals are presented outside
+                      the RN root view, so RCTTVRemoteHandler press recognizers (root-view-attached)
+                      never fire and the screen receives no TV remote events. */}
+                  <Stack.Screen
+                    name="photo-viewer"
+                    options={{
+                      headerShown: false,
+                      animation: "fade",
+                    }}
+                  />
+                  {/* Same push as the photo viewer: a book reader needs the remote too. */}
+                  <Stack.Screen
+                    name="book-reader"
+                    options={{
+                      headerShown: false,
+                      animation: "fade",
+                    }}
+                  />
+                  {/* Video Info panel. tvOS: regular push styled as a floating card (stack rules: no
+                      modals, Menu pops natively off the CTAs). iPhone, iPad and Mac: transparent modal, the
+                      screen drawing its own blurred backdrop and a card sized to its content over the presenting view. */}
+                  <Stack.Screen
+                    name="video-info"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : { headerShown: false, presentation: "transparentModal", animation: "fade", contentStyle: { backgroundColor: "transparent" } }
+                    }
+                  />
+                  {/* The guide's Recordings, Channels and Schedule: TV crossfades like video-info, phone
+                      pushes under a transparent native bar whose back chevron returns to the guide. */}
+                  <Stack.Screen
+                    name="recordings"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.recordings"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.title"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="channels"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.channels"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.title"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="channel-settings"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.channelSettings"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.channels"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="hidden-channels"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.hiddenChannels"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.channelSettings"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="guide-sources"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.guideSources"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.channelSettings"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="guide-source"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.guideSources"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.guideSources"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="connection-limits"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.connectionLimits"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.channelSettings"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="connection-limit"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.connectionLimits"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.connectionLimits"),
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="guide-channels"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : Platform.OS === "ios" && Platform.isPad
+                          ? { headerShown: false, presentation: "transparentModal", animation: "fade", contentStyle: { backgroundColor: "transparent" } }
+                          : {
+                              headerShown: true,
+                              headerTransparent: true,
+                              headerShadowVisible: false,
+                              headerTitle: t("liveTv.matchedChannels"),
+                              headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            }
+                    }
+                  />
+                  <Stack.Screen
+                    name="channel-groups"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : Platform.OS === "ios" && Platform.isPad
+                          ? { headerShown: false, presentation: "transparentModal", animation: "fade", contentStyle: { backgroundColor: "transparent" } }
+                          : {
+                              headerShown: true,
+                              headerTransparent: true,
+                              headerShadowVisible: false,
+                              headerTitle: t("liveTv.groups"),
+                              headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                              headerBackTitle: t("liveTv.channels"),
+                            }
+                    }
+                  />
+                  <Stack.Screen
+                    name="schedule"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("liveTv.scheduled"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("liveTv.title"),
+                          }
+                    }
+                  />
+                  {/* Root route (covers the tabs) so the native tab bar can't steal focus while the
+                      Filters panel is open. Regular push (not a modal) so it receives TV remote events.
+                      Phone gets a transparent UINavigationBar whose back chevron is the close; the screen
+                      titles it with the folder and hangs Clear All off it. TV shows no bar at all: its
+                      items never take remote focus, so the panel keeps its own focusable row. */}
+                  <Stack.Screen
+                    name="filters"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : { headerShown: true, headerTransparent: true, headerShadowVisible: false, headerTitleStyle: { color: COLORS.TEXT_PRIMARY }, animation: "fade" }
+                    }
+                  />
+                  {/* The login steps, one root route each so Menu walks back through them.
+                      Root, not inside a tab, for the same reason as filters: the native tab bar
+                      stays on screen there and swallows the Menu press, which is exactly how
+                      these steps used to quit the app. Regular push, never a modal.
+
+                      They are ROOT screens rather than a nested app/connect stack because iOS
+                      draws the back item itself, and only for a screen that has a predecessor in
+                      the same UINavigationController. As the first screen of a nested stack,
+                      Quick Connect was that controller's root and could never have one. Phone
+                      gets the standard push so the back item, the transition and the
+                      interactive swipe agree; TV crossfades and shows no header at all. */}
+                  <Stack.Screen
+                    name="connect/servers"
+                    options={{
+                      headerShown: !Platform.isTV,
+                      headerTransparent: true,
+                      headerTitle: "",
+                      headerBackTitle: t("common.back"),
+                      animation: Platform.isTV ? "fade" : "default",
+                    }}
+                  />
+                  <Stack.Screen
+                    name="syncplay"
+                    options={{
+                      headerShown: !Platform.isTV,
+                      headerTransparent: true,
+                      headerTitle: "",
+                      headerBackTitle: t("settings.title"),
+                      animation: Platform.isTV ? "fade" : "default",
+                    }}
+                  />
+                  <Stack.Screen
+                    name="connect/quick-connect"
+                    options={{
+                      headerShown: !Platform.isTV,
+                      headerTransparent: true,
+                      headerTitle: "",
+                      // The step's own Cancel, moved into the bar: back here IS cancelling.
+                      headerBackTitle: t("common.cancel"),
+                      animation: Platform.isTV ? "fade" : "default",
+                    }}
+                  />
+                  <Stack.Screen
+                    name="connect/login"
+                    options={{
+                      headerShown: !Platform.isTV,
+                      headerTransparent: true,
+                      headerTitle: "",
+                      headerBackTitle: t("common.back"),
+                      animation: Platform.isTV ? "fade" : "default",
+                    }}
+                  />
+                  <Stack.Screen name="dev-session" options={{ headerShown: false, animation: "none" }} />
+                  <Stack.Screen name="dev-bench" options={{ headerShown: false, animation: "none" }} />
+                  {/* The four About destinations. Phone gets the native back bar, like
+                      filters; TV shows no header and pops on Menu. */}
+                  <Stack.Screen
+                    name="licenses"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("common.openSource"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("common.about"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="bundled-licenses"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("licenses.bundled"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("common.openSource"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="demo-credits"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.mediaLicenses"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("common.about"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="diagnostics"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("diagnostics.title"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("common.about"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="language"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.language"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="appearance"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.appearance"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="lyrics-settings"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("detail.lyrics"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="subtitle-settings"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("subtitles.settingsTitle"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="skip-settings"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.skipAutomatically"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="theme-editor"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("themeEditor.title"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.appearance"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="quality"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.streamingTitle"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                  <Stack.Screen
+                    name="transcoding"
+                    options={
+                      Platform.isTV
+                        ? { headerShown: false, animation: "fade" }
+                        : {
+                            headerShown: true,
+                            headerTransparent: true,
+                            headerShadowVisible: false,
+                            headerTitle: t("settings.streamingTitle"),
+                            headerTitleStyle: { color: COLORS.TEXT_PRIMARY },
+                            headerBackTitle: t("settings.title"),
+                            animation: "fade",
+                          }
+                    }
+                  />
+                </Stack>
+              </ThemeProvider>
+            </LibraryFiltersProvider>
+            {/* Renders nothing until a route asks for playback, and parks itself off screen
+                    whenever the route has something focusable to show. */}
+            <PlayerHost />
+            {/* Transport for music whose native player has been dismissed. Phone only: an
+                    absolute overlay above focusables occludes the tvOS focus engine, so Apple TV
+                    marks the playing item's own card, whose select brings the player back. */}
+            <AudioMiniPlayer />
+            {/* Escape as the back key. Renders null anywhere but a Mac. */}
+            <MacKeyCommands />
+            {/* Offers a session an Apple TV sent to this account. Renders null, phone only. */}
+            <DiagnosticsInbox />
+            {/* Opens the group's item when the server pushes a SyncPlay queue. Renders null. */}
+            <SyncPlayDriver />
+          </PlayerSessionProvider>
+        </PlayQueueProvider>
+      </LibraryProvider>
+    </LoadingProvider>
+  );
+}
+
+export const unstable_settings = {
+  anchor: "(tabs)",
+};

@@ -1,0 +1,153 @@
+import { useFinishLogin } from "@/hooks/useFinishLogin";
+import { activateAccount, checkQuickConnectEnabled, removeAccount, resolveServerConnection, upsertSavedServer } from "@/services/jellyfinApi";
+import { t } from "@/services/i18n";
+import { findServerById } from "@/services/networkDiscovery";
+import { SavedAccount, SavedServer } from "@/types/jellyfin";
+import { logger } from "@/utils/logger";
+import { useRouter } from "expo-router";
+import { useCallback, useRef, useState } from "react";
+import { Alert } from "react-native";
+
+interface UseSelectSavedServerReturn {
+  /** One saved account, picked off the people strip: reconnects with its token. */
+  continueAs: (server: SavedServer, account: SavedAccount) => void;
+  /** A server row press: the login step on that server, prefilled for an account when given. */
+  signIn: (server: SavedServer, account?: SavedAccount) => void;
+  /** A long press on a person: sign in again with the login step, or forget the saved sign-in. */
+  accountOptions: (server: SavedServer, account: SavedAccount, afterForget: () => void | Promise<void>) => void;
+  /** Id of the server currently connecting, to drive its card's spinner. */
+  activatingServerId: string | null;
+  /** Id of the account currently connecting on it, to drive that avatar's ring. */
+  activatingUserId: string | null;
+}
+
+/**
+ * A saved server that stopped answering at its address may have moved on this
+ * LAN (a new DHCP lease is the usual cause). Sweep for its system Id and, when
+ * found, point the card at the new address before anything connects to it.
+ */
+async function locateMovedServer(server: SavedServer): Promise<SavedServer | null> {
+  if (!server.serverId) return null;
+  const moved = await findServerById(server.serverId);
+  if (!moved) return null;
+  logger.info("Saved server found at a new address", { service: "JellyfinAPI", serverName: server.name, url: moved.url });
+  await upsertSavedServer(moved.url, moved.name, server.serverId);
+  return { ...server, url: moved.url };
+}
+
+/**
+ * Picking a saved server, shared by the logged-out list and the connected
+ * switcher. A saved account reconnects with its stored token after validating
+ * it against the server; a dead token falls through to the login step
+ * prefilled, and a server that doesn't answer deletes nothing.
+ */
+export function useSelectSavedServer(onConnected?: () => void | Promise<void>): UseSelectSavedServerReturn {
+  const router = useRouter();
+  const finishLogin = useFinishLogin();
+  const [activatingServerId, setActivatingServerId] = useState<string | null>(null);
+  const [activatingUserId, setActivatingUserId] = useState<string | null>(null);
+  // One flow at a time: a second press while one runs would let the slower finish write the active slot.
+  const inFlightRef = useRef(false);
+
+  /**
+   * Resolve the address and push the matching login step. With a known account
+   * the route follows how that account signed in last time (its Quick Connect
+   * approval or its password, prefilled by name); without one, Quick Connect
+   * leads when the server offers it, the same order as the add-server flow.
+   */
+  const fallbackToLogin = useCallback(
+    async (server: SavedServer, account?: SavedAccount) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      setActivatingServerId(server.id);
+      setActivatingUserId(account?.userId ?? null);
+      try {
+        let resolved: { url: string; name: string; serverId: string };
+        try {
+          const { url, info } = await resolveServerConnection(server.url);
+          resolved = { url, name: info.ServerName, serverId: info.Id };
+        } catch (error) {
+          const moved = await locateMovedServer(server);
+          if (!moved) throw error;
+          const { url, info } = await resolveServerConnection(moved.url);
+          resolved = { url, name: info.ServerName, serverId: info.Id };
+        }
+        const useQuickConnect = account ? account.authMethod === "quickconnect" : await checkQuickConnectEnabled(resolved.url);
+        router.push({
+          pathname: useQuickConnect ? "/connect/quick-connect" : "/connect/login",
+          params: { url: resolved.url, name: resolved.name, serverId: resolved.serverId, username: account?.userName },
+        });
+      } catch (error) {
+        Alert.alert(t("connect.connectionFailed"), error instanceof Error ? error.message : t("connect.unableToConnect"));
+      } finally {
+        inFlightRef.current = false;
+        setActivatingServerId(null);
+        setActivatingUserId(null);
+      }
+    },
+    [router],
+  );
+
+  const activate = useCallback(
+    async (server: SavedServer, account: SavedAccount) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      setActivatingServerId(server.id);
+      setActivatingUserId(account.userId);
+      try {
+        let result = await activateAccount(account);
+        if (result === "unreachable") {
+          const moved = await locateMovedServer(server);
+          if (moved) {
+            server = moved;
+            account = { ...account, serverUrl: moved.url };
+            result = await activateAccount(account);
+          }
+        }
+        if (result === "connected") {
+          await finishLogin();
+          await onConnected?.();
+          return;
+        }
+        if (result === "needs_login") {
+          // The alert names why the password step appears; the step itself is prefilled.
+          Alert.alert(t("connect.sessionExpired"), t("connect.sessionExpiredBody").replace("{server}", server.name).replace("{user}", account.userName), [
+            { text: "OK", onPress: () => void fallbackToLogin(server, account) },
+          ]);
+          return;
+        }
+        Alert.alert(t("connect.serverUnreachable"), t("connect.serverUnreachableBody").replace("{server}", server.name));
+      } catch (error) {
+        logger.error("Account switch failed", error, { service: "JellyfinAPI" });
+        Alert.alert(t("connect.connectionFailed"), error instanceof Error ? error.message : t("connect.unableToConnect"));
+      } finally {
+        inFlightRef.current = false;
+        setActivatingServerId(null);
+        setActivatingUserId(null);
+      }
+    },
+    [finishLogin, onConnected, fallbackToLogin],
+  );
+
+  const continueAs = useCallback((server: SavedServer, account: SavedAccount) => void activate(server, account), [activate]);
+  const signIn = useCallback((server: SavedServer, account?: SavedAccount) => void fallbackToLogin(server, account), [fallbackToLogin]);
+  const accountOptions = useCallback(
+    (server: SavedServer, account: SavedAccount, afterForget: () => void | Promise<void>) => {
+      Alert.alert(account.userName, server.name, [
+        { text: t("connect.signIn"), onPress: () => void fallbackToLogin(server, account) },
+        {
+          text: t("connect.forgetAccount").replace("{user}", account.userName),
+          style: "destructive",
+          onPress: async () => {
+            await removeAccount(account.serverId, account.userId);
+            await afterForget();
+          },
+        },
+        { text: t("common.cancel"), style: "cancel" },
+      ]);
+    },
+    [fallbackToLogin],
+  );
+
+  return { continueAs, signIn, accountOptions, activatingServerId, activatingUserId };
+}

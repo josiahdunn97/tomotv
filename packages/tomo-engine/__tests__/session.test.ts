@@ -1,0 +1,504 @@
+/** session - the typed calls over LocalRemuxer's session, shim and frame provider methods. */
+
+let mockRemuxer: Record<string, jest.Mock> | undefined;
+jest.mock("react-native", () => ({
+  Platform: { OS: "ios" },
+  NativeModules: {
+    get LocalRemuxer() {
+      return mockRemuxer;
+    },
+  },
+  NativeEventEmitter: jest.fn(),
+}));
+
+jest.mock("../src/events", () => ({
+  attributeSession: jest.fn(),
+  forgetSession: jest.fn(),
+  watchEngineFailure: jest.fn(),
+  watchEngineLink: jest.fn(),
+  watchEnginePlan: jest.fn(),
+  watchEngineStage: jest.fn(),
+  watchEngineTier: jest.fn(),
+}));
+
+import { configureEngine } from "../src/config";
+import * as events from "../src/events";
+import {
+  type EngineSessionConfig,
+  describedSessionConfig,
+  engineProgress,
+  inputSubtitleRenditions,
+  isConnectionBudgetFailure,
+  isRecordingHoldFailure,
+  liveSessionConfig,
+  liveSubtitleRenditions,
+  localRemuxToken,
+  originConnectionLimit,
+  originConnections,
+  originHeld,
+  reportPlayerBuffer,
+  setLiveSessionPriority,
+  setLiveWindow,
+  setOriginConnectionBudget,
+  setOriginRecording,
+  startFrameProvider,
+  startPlaylistShim,
+  startSession,
+  stopFrameProvider,
+  stopLocalRemux,
+  stopPlaylistShim,
+  subscribeOriginHolds,
+} from "../src/session";
+import { fittedIFrameSize, iframeStreamInf } from "../src/tags";
+
+const MASTER = "http://127.0.0.1:52000/tok123/master.m3u8";
+const warn = jest.fn();
+configureEngine({ log: { debug: jest.fn(), info: jest.fn(), warn } });
+
+const config = { inputUrl: "http://origin/file.mkv", itemId: "item1" } as EngineSessionConfig;
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockRemuxer = { startRemux: jest.fn().mockResolvedValue(MASTER), stopRemux: jest.fn().mockResolvedValue(undefined) };
+});
+
+describe("startSession", () => {
+  it("throws without the native module", async () => {
+    mockRemuxer = undefined;
+    await expect(startSession(config)).rejects.toThrow("not available");
+  });
+
+  it("watches plan and tier before the call and attributes the token after it", async () => {
+    await expect(startSession(config, { tierDeclared: true })).resolves.toBe(MASTER);
+    expect(mockRemuxer!.startRemux).toHaveBeenCalledWith(config);
+    expect(events.watchEnginePlan).toHaveBeenCalled();
+    expect(events.watchEngineTier).toHaveBeenCalled();
+    expect(events.attributeSession).toHaveBeenCalledWith("tok123", true);
+    expect((events.watchEnginePlan as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(mockRemuxer!.startRemux.mock.invocationCallOrder[0]);
+  });
+
+  it("leaves an unattributed session out of plan and tier but still watches link and stage", async () => {
+    await startSession(config, { attributePlan: false });
+    expect(events.watchEnginePlan).not.toHaveBeenCalled();
+    expect(events.watchEngineTier).not.toHaveBeenCalled();
+    expect(events.attributeSession).not.toHaveBeenCalled();
+    expect(events.watchEngineLink).toHaveBeenCalled();
+    expect(events.watchEngineStage).toHaveBeenCalled();
+  });
+});
+
+describe("localRemuxToken", () => {
+  it("reads the path segment before master.m3u8", () => {
+    expect(localRemuxToken(MASTER)).toBe("tok123");
+  });
+
+  it("is null without a URL", () => {
+    expect(localRemuxToken(null)).toBeNull();
+    expect(localRemuxToken(undefined)).toBeNull();
+  });
+});
+
+describe("stopLocalRemux", () => {
+  it("forgets the session and stops it", async () => {
+    await stopLocalRemux("tok123");
+    expect(events.forgetSession).toHaveBeenCalledWith("tok123");
+    expect(mockRemuxer!.stopRemux).toHaveBeenCalledWith("tok123");
+  });
+
+  it("does nothing without a token", async () => {
+    await stopLocalRemux(null);
+    expect(mockRemuxer!.stopRemux).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed stop instead of throwing", async () => {
+    mockRemuxer!.stopRemux.mockRejectedValue(new Error("gone"));
+    await expect(stopLocalRemux("tok123")).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("Failed to stop local remux session", expect.any(Error), expect.objectContaining({ token: "tok123" }));
+  });
+});
+
+describe("live session controls", () => {
+  it("skip a binary without the method", async () => {
+    await expect(setLiveWindow("tok123", 30)).resolves.toBeUndefined();
+    await expect(setLiveSessionPriority("tok123", "playback")).resolves.toBeUndefined();
+  });
+
+  it("forward the window and the priority", async () => {
+    mockRemuxer!.setLiveWindow = jest.fn().mockResolvedValue(undefined);
+    mockRemuxer!.setLivePriority = jest.fn().mockResolvedValue(undefined);
+    await setLiveWindow("tok123", 30);
+    await setLiveSessionPriority("tok123", "ring");
+    expect(mockRemuxer!.setLiveWindow).toHaveBeenCalledWith("tok123", 30);
+    expect(mockRemuxer!.setLivePriority).toHaveBeenCalledWith("tok123", "ring");
+  });
+
+  it("log a rejected call", async () => {
+    mockRemuxer!.setLiveWindow = jest.fn().mockRejectedValue(new Error("x"));
+    await setLiveWindow("tok123", 30);
+    expect(warn).toHaveBeenCalledWith("Failed to resize a live window", expect.any(Error), expect.objectContaining({ token: "tok123" }));
+  });
+});
+
+describe("isConnectionBudgetFailure", () => {
+  it("names the broker's own endings and no other", () => {
+    expect(isConnectionBudgetFailure("no connection left on the live origin")).toBe(true);
+    expect(isConnectionBudgetFailure("no connection left on the origin")).toBe(true);
+    expect(isConnectionBudgetFailure("live input yielded its connection to a higher-priority read")).toBe(true);
+    expect(isConnectionBudgetFailure("open_input: Server returned 404 Not Found")).toBe(false);
+    expect(isConnectionBudgetFailure("")).toBe(false);
+  });
+});
+
+describe("reportPlayerBuffer", () => {
+  it("resolves the floor the engine answers", async () => {
+    mockRemuxer!.setPlayerBuffer = jest.fn().mockResolvedValue(4_000_000);
+    await expect(reportPlayerBuffer("tok123", 12.5, true)).resolves.toBe(4_000_000);
+    expect(mockRemuxer!.setPlayerBuffer).toHaveBeenCalledWith("tok123", 12.5, true);
+  });
+
+  it("is 0 for a non-finite buffer, a non-number answer or a rejection", async () => {
+    mockRemuxer!.setPlayerBuffer = jest.fn().mockResolvedValue("x");
+    await expect(reportPlayerBuffer("tok123", Number.NaN, false)).resolves.toBe(0);
+    expect(mockRemuxer!.setPlayerBuffer).not.toHaveBeenCalled();
+    await expect(reportPlayerBuffer("tok123", 5, false)).resolves.toBe(0);
+    mockRemuxer!.setPlayerBuffer.mockRejectedValue(new Error("x"));
+    await expect(reportPlayerBuffer("tok123", 5, false)).resolves.toBe(0);
+  });
+});
+
+describe("engineProgress", () => {
+  it("is null without the method or the required numbers", async () => {
+    await expect(engineProgress("tok123")).resolves.toBeNull();
+    mockRemuxer!.engineProgress = jest.fn().mockResolvedValue({ alive: true, bytesRead: 10 });
+    await expect(engineProgress("tok123")).resolves.toBeNull();
+  });
+
+  it("keeps the optional fields only when well typed", async () => {
+    mockRemuxer!.engineProgress = jest.fn().mockResolvedValue({
+      alive: true,
+      bytesRead: 10,
+      readSeconds: 1,
+      elapsedSeconds: 2,
+      sourceState: "reading",
+      recovering: "no",
+      hasPlayableSupplier: false,
+      sourceRetryAfterSeconds: -1,
+    });
+    await expect(engineProgress("tok123")).resolves.toEqual({ alive: true, bytesRead: 10, readSeconds: 1, elapsedSeconds: 2, sourceState: "reading", hasPlayableSupplier: false });
+  });
+});
+
+describe("liveSubtitleRenditions", () => {
+  it("maps the tracks, keeping the first default only and filling an empty language", async () => {
+    mockRemuxer!.liveSubtitles = jest.fn().mockResolvedValue([
+      { index: 3, name: "English", language: "eng", isDefault: true, isForced: false, isImage: false },
+      { index: 4, name: "Teletext", language: "", isDefault: true, isForced: false, isImage: true },
+    ]);
+    const renditions = await liveSubtitleRenditions("tok123");
+    expect(renditions?.map((r) => [r.index, r.language, r.isDefault, r.isImage])).toEqual([
+      [3, "eng", true, false],
+      [4, "und", false, true],
+    ]);
+  });
+
+  it("is null for an unknown answer", async () => {
+    mockRemuxer!.liveSubtitles = jest.fn().mockResolvedValue(null);
+    await expect(liveSubtitleRenditions("tok123")).resolves.toBeNull();
+    await expect(liveSubtitleRenditions(null)).resolves.toBeNull();
+  });
+
+  it("keeps a file's text and SDH tracks as the engine names them", async () => {
+    mockRemuxer!.liveSubtitles = jest.fn().mockResolvedValue([
+      { index: 3, name: "English", language: "eng", isDefault: false, isForced: false, isImage: false, isEngineText: true, isHearingImpaired: true },
+      { index: 4, name: "PGS", language: "eng", isDefault: false, isForced: false, isImage: true, isEngineText: false, isHearingImpaired: false },
+    ]);
+    const renditions = await inputSubtitleRenditions("tok123");
+    expect(renditions?.map((r) => [r.index, r.isEngineText, r.isImage, r.isHearingImpaired])).toEqual([
+      [3, true, false, true],
+      [4, false, true, undefined],
+    ]);
+  });
+});
+
+describe("liveSessionConfig", () => {
+  it("names the channel's URL and nothing about its streams, with a 15s start buffer", () => {
+    const live = liveSessionConfig({ inputUrl: "https://origin/master.m3u8", itemId: "ch1" });
+    expect(live).toMatchObject({ inputUrl: "https://origin/master.m3u8", itemId: "ch1", isLive: true, describesInput: true, liveBufferSeconds: 15, liveSegmentSeconds: 2 });
+    expect(live.audioTracks).toEqual([]);
+    expect(live.tiers).toEqual([]);
+    for (const key of ["httpHeaders", "liveOriginKey", "livePriority", "liveAudioLanguage", "livePlaylist", "fallbackInputUrl", "liveWindowSeconds", "probeOrigin"]) {
+      expect(key in live).toBe(false);
+    }
+  });
+
+  it("carries how to reach the channel and which tracks to take", () => {
+    const live = liveSessionConfig({
+      inputUrl: "http://provider:8080/live/1.ts",
+      itemId: "ch1",
+      httpHeaders: { "User-Agent": "x" },
+      originKey: "provider:8080",
+      priority: "ring",
+      bufferSeconds: 20,
+      audioLanguage: "spa",
+      windowSeconds: 120,
+      fallbackInputUrl: "http://server/LiveTv/LiveStreamFiles/abc/stream.ts",
+      checkOrigin: true,
+      playlist: true,
+    });
+    expect(live).toMatchObject({
+      probeOrigin: true,
+      livePlaylist: true,
+      httpHeaders: { "User-Agent": "x" },
+      liveOriginKey: "provider:8080",
+      livePriority: "ring",
+      liveBufferSeconds: 20,
+      liveAudioLanguage: "spa",
+      liveWindowSeconds: 120,
+      fallbackInputUrl: "http://server/LiveTv/LiveStreamFiles/abc/stream.ts",
+    });
+  });
+
+  it("answers the player on its first segment when asked for no buffer", () => {
+    expect(liveSessionConfig({ inputUrl: "u", itemId: "i", bufferSeconds: 0 }).liveBufferSeconds).toBe(0);
+  });
+});
+
+describe("describedSessionConfig", () => {
+  it("names the input and nothing about its streams", () => {
+    const described = describedSessionConfig({ inputUrl: "http://origin/file.mkv", itemId: "item1" });
+    expect(described).toMatchObject({ inputUrl: "http://origin/file.mkv", itemId: "item1", describesInput: true, isLive: false, durationSeconds: 0, startOffsetSeconds: 0 });
+    expect(described.audioTracks).toEqual([]);
+    expect(described.subtitles).toEqual([]);
+    expect(described.tiers).toEqual([]);
+    expect(described.serverVideoOnly).toBe(false);
+    expect("httpHeaders" in described).toBe(false);
+  });
+
+  it("carries the origin's headers and a positive resume offset", () => {
+    const described = describedSessionConfig({ inputUrl: "http://origin/file.mkv", itemId: "item1", httpHeaders: { "User-Agent": "x" }, startOffsetSeconds: 90, readAheadSegments: 20 });
+    expect(described.httpHeaders).toEqual({ "User-Agent": "x" });
+    expect(described.startOffsetSeconds).toBe(90);
+    expect(described.readAheadSegments).toBe(20);
+    expect(describedSessionConfig({ inputUrl: "u", itemId: "i", startOffsetSeconds: Number.NaN }).startOffsetSeconds).toBe(0);
+    expect(describedSessionConfig({ inputUrl: "u", itemId: "i", startOffsetSeconds: -4, httpHeaders: {} }).startOffsetSeconds).toBe(0);
+  });
+
+  it("names the provider and the connections the input may read over", () => {
+    const described = describedSessionConfig({ inputUrl: "u", itemId: "i", originKey: "provider-a", inputConnections: 2.9 });
+    expect(described.liveOriginKey).toBe("provider-a");
+    expect(described.inputConnections).toBe(2);
+    const bare = describedSessionConfig({ inputUrl: "u", itemId: "i", inputConnections: 0 });
+    expect("liveOriginKey" in bare).toBe(false);
+    expect("inputConnections" in bare).toBe(false);
+  });
+});
+
+describe("setOriginConnectionBudget", () => {
+  it("is false on a binary without the method, and for an empty key", async () => {
+    await expect(setOriginConnectionBudget("provider-a", 2)).resolves.toBe(false);
+    mockRemuxer!.setOriginBudget = jest.fn().mockResolvedValue(undefined);
+    await expect(setOriginConnectionBudget("", 2)).resolves.toBe(false);
+    expect(mockRemuxer!.setOriginBudget).not.toHaveBeenCalled();
+  });
+
+  it("sets a whole count, and 0 for anything that is not one", async () => {
+    mockRemuxer!.setOriginBudget = jest.fn().mockResolvedValue(undefined);
+    await expect(setOriginConnectionBudget("provider-a", 2.7)).resolves.toBe(true);
+    await setOriginConnectionBudget("provider-a", -1);
+    await setOriginConnectionBudget("provider-a", Number.NaN);
+    expect(mockRemuxer!.setOriginBudget.mock.calls).toEqual([
+      ["provider-a", 2],
+      ["provider-a", 0],
+      ["provider-a", 0],
+    ]);
+  });
+
+  it("is false when the engine refuses", async () => {
+    mockRemuxer!.setOriginBudget = jest.fn().mockRejectedValue(new Error("x"));
+    await expect(setOriginConnectionBudget("provider-a", 1)).resolves.toBe(false);
+  });
+});
+
+describe("originConnectionLimit", () => {
+  it("is the limit the engine last took for the provider, and null once forgotten or never set", async () => {
+    mockRemuxer!.setOriginBudget = jest.fn().mockResolvedValue(undefined);
+    expect(originConnectionLimit("provider-b")).toBeNull();
+    await setOriginConnectionBudget("provider-b", 1);
+    expect(originConnectionLimit("provider-b")).toBe(1);
+    await setOriginConnectionBudget("provider-b", 3);
+    expect(originConnectionLimit("provider-b")).toBe(3);
+    await setOriginConnectionBudget("provider-b", 0);
+    expect(originConnectionLimit("provider-b")).toBeNull();
+    expect(originConnectionLimit("")).toBeNull();
+    expect(originConnectionLimit(undefined)).toBeNull();
+  });
+
+  it("keeps the last limit when the engine refuses a new one", async () => {
+    mockRemuxer!.setOriginBudget = jest.fn().mockResolvedValue(undefined);
+    await setOriginConnectionBudget("provider-c", 1);
+    mockRemuxer!.setOriginBudget = jest.fn().mockRejectedValue(new Error("x"));
+    await setOriginConnectionBudget("provider-c", 2);
+    expect(originConnectionLimit("provider-c")).toBe(1);
+  });
+});
+
+describe("originConnections", () => {
+  it("is null without the method, an empty key or a usable answer", async () => {
+    await expect(originConnections("provider-a")).resolves.toBeNull();
+    mockRemuxer!.originBudget = jest.fn().mockResolvedValue({ budget: 2 });
+    await expect(originConnections("")).resolves.toBeNull();
+    await expect(originConnections("provider-a")).resolves.toBeNull();
+    mockRemuxer!.originBudget.mockRejectedValue(new Error("x"));
+    await expect(originConnections("provider-a")).resolves.toBeNull();
+  });
+
+  it("reads the limit in force and the connections held, null while no limit is known", async () => {
+    mockRemuxer!.originBudget = jest.fn().mockResolvedValue({ budget: 2, active: 1 });
+    await expect(originConnections("provider-a")).resolves.toEqual({ budget: 2, active: 1, held: false });
+    mockRemuxer!.originBudget.mockResolvedValue({ budget: null, active: 0 });
+    await expect(originConnections("provider-a")).resolves.toEqual({ budget: null, active: 0, held: false });
+  });
+
+  it("reads whether a recording holds the provider and remembers it", async () => {
+    mockRemuxer!.originBudget = jest.fn().mockResolvedValue({ budget: 1, active: 0, held: true });
+    await expect(originConnections("provider-read")).resolves.toEqual({ budget: 1, active: 0, held: true });
+    expect(originHeld("provider-read")).toBe(true);
+    mockRemuxer!.originBudget.mockResolvedValue({ budget: 1, active: 0, held: false });
+    await originConnections("provider-read");
+    expect(originHeld("provider-read")).toBe(false);
+  });
+});
+
+describe("setOriginRecording", () => {
+  it("tells the engine and remembers whether the provider is held, telling listeners only on a change", async () => {
+    const listener = jest.fn();
+    const stop = subscribeOriginHolds(listener);
+    mockRemuxer!.setOriginRecording = jest.fn().mockResolvedValue(true);
+    await expect(setOriginRecording("provider-r", true)).resolves.toBe(true);
+    expect(mockRemuxer!.setOriginRecording).toHaveBeenCalledWith("provider-r", true);
+    expect(originHeld("provider-r")).toBe(true);
+    await setOriginRecording("provider-r", true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    mockRemuxer!.setOriginRecording.mockResolvedValue(false);
+    await expect(setOriginRecording("provider-r", false)).resolves.toBe(false);
+    expect(originHeld("provider-r")).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  it("is false without the method, an empty key, or when the call fails", async () => {
+    await expect(setOriginRecording("provider-x", true)).resolves.toBe(false);
+    mockRemuxer!.setOriginRecording = jest.fn().mockRejectedValue(new Error("x"));
+    await expect(setOriginRecording("", true)).resolves.toBe(false);
+    await expect(setOriginRecording("provider-x", true)).resolves.toBe(false);
+    expect(originHeld("provider-x")).toBe(false);
+  });
+
+  it("names a session a recording ended or refused", () => {
+    expect(isRecordingHoldFailure("live origin is held by a recording")).toBe(true);
+    expect(isRecordingHoldFailure("live input yielded its connection to a higher-priority read")).toBe(false);
+  });
+});
+
+describe("startPlaylistShim", () => {
+  it("is null with neither a resume offset nor an SDR retag", async () => {
+    mockRemuxer!.startPlaylistShim = jest.fn();
+    await expect(startPlaylistShim("http://server/master.m3u8", 0)).resolves.toBeNull();
+    expect(mockRemuxer!.startPlaylistShim).not.toHaveBeenCalled();
+  });
+
+  it("starts for an SDR retag alone, offset clamped to 0", async () => {
+    mockRemuxer!.startPlaylistShim = jest.fn().mockResolvedValue("http://127.0.0.1/shim/master.m3u8");
+    await expect(startPlaylistShim("http://server/master.m3u8", -5, { sdrInit: true })).resolves.toBe("http://127.0.0.1/shim/master.m3u8");
+    expect(mockRemuxer!.startPlaylistShim).toHaveBeenCalledWith({ masterUrl: "http://server/master.m3u8", startOffsetSeconds: 0, sdrInit: true });
+  });
+
+  it("is null when the shim fails", async () => {
+    mockRemuxer!.startPlaylistShim = jest.fn().mockRejectedValue(new Error("x"));
+    await expect(startPlaylistShim("http://server/master.m3u8", 30)).resolves.toBeNull();
+  });
+
+  it("starts for an I-frame line alone and hands it to the master", async () => {
+    mockRemuxer!.startPlaylistShim = jest.fn().mockResolvedValue("http://127.0.0.1/shim/master.m3u8");
+    const line = '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="http://127.0.0.1/frame-x/iframes.m3u8"';
+    await expect(startPlaylistShim("http://server/master.m3u8", 0, { iframeStreamInf: line })).resolves.toBe("http://127.0.0.1/shim/master.m3u8");
+    expect(mockRemuxer!.startPlaylistShim).toHaveBeenCalledWith({ masterUrl: "http://server/master.m3u8", startOffsetSeconds: 0, sdrInit: false, iframeStreamInf: line });
+  });
+});
+
+describe("startFrameProvider", () => {
+  it("is null without an input", async () => {
+    mockRemuxer!.startFrameProvider = jest.fn();
+    await expect(startFrameProvider("", "item1")).resolves.toBeNull();
+    expect(mockRemuxer!.startFrameProvider).not.toHaveBeenCalled();
+  });
+
+  it("passes the input and item", async () => {
+    mockRemuxer!.startFrameProvider = jest.fn().mockResolvedValue("http://127.0.0.1/frames/");
+    await expect(startFrameProvider("http://origin/file.mkv", "item1")).resolves.toBe("http://127.0.0.1/frames/");
+    expect(mockRemuxer!.startFrameProvider).toHaveBeenCalledWith({ inputUrl: "http://origin/file.mkv", itemId: "item1" });
+  });
+
+  it("is null when the provider will not start", async () => {
+    mockRemuxer!.startFrameProvider = jest.fn().mockRejectedValue(new Error("x"));
+    await expect(startFrameProvider("http://origin/file.mkv", "item1")).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith("Failed to start frame provider", expect.any(Error), expect.anything());
+  });
+
+  it("passes an I-frame rendition when asked for one", async () => {
+    mockRemuxer!.startFrameProvider = jest.fn().mockResolvedValue("http://127.0.0.1/frames/");
+    await startFrameProvider("http://origin/file.mkv", "item1", { transcode: true, durationSeconds: 600 });
+    expect(mockRemuxer!.startFrameProvider).toHaveBeenCalledWith({ inputUrl: "http://origin/file.mkv", itemId: "item1", iframes: { transcode: true, durationSeconds: 600 } });
+  });
+});
+
+describe("stopping a shim or a provider", () => {
+  it("does nothing without a token", async () => {
+    mockRemuxer!.stopPlaylistShim = jest.fn();
+    mockRemuxer!.stopFrameProvider = jest.fn();
+    await stopPlaylistShim(null);
+    await stopFrameProvider(null);
+    expect(mockRemuxer!.stopPlaylistShim).not.toHaveBeenCalled();
+    expect(mockRemuxer!.stopFrameProvider).not.toHaveBeenCalled();
+  });
+
+  it("stops by token, and logs a refusal instead of throwing", async () => {
+    mockRemuxer!.stopPlaylistShim = jest.fn().mockResolvedValue(undefined);
+    mockRemuxer!.stopFrameProvider = jest.fn().mockRejectedValue(new Error("gone"));
+    await stopPlaylistShim("shim-1");
+    await expect(stopFrameProvider("frame-1")).resolves.toBeUndefined();
+    expect(mockRemuxer!.stopPlaylistShim).toHaveBeenCalledWith("shim-1");
+    expect(warn).toHaveBeenCalledWith("Failed to stop frame provider", expect.any(Error), expect.objectContaining({ token: "frame-1" }));
+    mockRemuxer!.stopPlaylistShim = jest.fn().mockRejectedValue(new Error("gone"));
+    await expect(stopPlaylistShim("shim-1")).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("Failed to stop playlist shim", expect.any(Error), expect.objectContaining({ token: "shim-1" }));
+  });
+});
+
+describe("iframeStreamInf", () => {
+  const line = { bandwidth: 2_000_000.4, averageBandwidth: 1_000_000, codecs: "avc1.640028", width: 1920, height: 800 };
+
+  it("names the provider's playlist with its peak, mean, codec, size and SDR range", () => {
+    expect(iframeStreamInf("http://127.0.0.1:9/frame-a/", line)).toBe(
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1000000,CODECS="avc1.640028",RESOLUTION=1920x800,VIDEO-RANGE=SDR,URI="http://127.0.0.1:9/frame-a/iframes.m3u8"',
+    );
+  });
+
+  it("never declares a mean above the peak, and leaves an unknown size out", () => {
+    expect(iframeStreamInf("http://h/", { ...line, averageBandwidth: 9_000_000, width: 0 })).toBe(
+      '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=2000000,CODECS="avc1.640028",VIDEO-RANGE=SDR,URI="http://h/iframes.m3u8"',
+    );
+  });
+});
+
+describe("fittedIFrameSize", () => {
+  it("fits inside 1920x1080 on both axes, even, keeping the shape", () => {
+    expect(fittedIFrameSize(3840, 1600)).toEqual({ width: 1920, height: 800 });
+    expect(fittedIFrameSize(3840, 2160)).toEqual({ width: 1920, height: 1080 });
+    expect(fittedIFrameSize(1440, 1440)).toEqual({ width: 1080, height: 1080 });
+  });
+
+  it("never enlarges a smaller picture", () => {
+    expect(fittedIFrameSize(960, 720)).toEqual({ width: 960, height: 720 });
+  });
+});

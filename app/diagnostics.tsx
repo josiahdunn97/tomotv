@@ -1,0 +1,270 @@
+import { AmbientBackground } from "@/components/ambient-background";
+import { FocusableButton } from "@/components/FocusableButton";
+import { GlassButton } from "@/components/glass-button";
+import { SectionFooter } from "@/components/settings/SectionFooter";
+import { settingsStyles, sideInsets } from "@/components/settings/styles";
+import { COLORS } from "@/constants/colors";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { getSends, refreshSends } from "@/services/diagnosticsInbox";
+import { documentLines, logText } from "@/services/diagnosticsLog";
+import { sendSession, type SentSession } from "@/services/diagnosticsOutbox";
+import { shareLog } from "@/services/diagnosticsShare";
+import { getStoredUserName, isAuthenticated } from "@/services/jellyfinApi";
+import { readLastSession, type PlaybackSession } from "@/services/playbackProbe";
+import { describePlayback } from "@/services/playbackStory";
+import { THIS_DEVICE } from "@/utils/hostEnvironment";
+import { logger } from "@/utils/logger";
+import { Ionicons } from "@expo/vector-icons";
+import { Stack, useLocalSearchParams, type NativeStackNavigationOptions } from "expo-router";
+import { useHeaderHeight } from "expo-router/react-navigation";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View, type LayoutChangeEvent } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { t } from "@/services/i18n";
+
+const IS_TV = Platform.isTV;
+const DEVICE = THIS_DEVICE;
+
+/** Menlo advances 0.6em per glyph, so the JSON's own indent converts to a left inset. Moving
+ *  it out of the string is what makes a wrapped line hang under its property instead of
+ *  restarting at the card margin. */
+const CHAR_WIDTH = (IS_TV ? 18 : 12) * 0.6;
+const LINE_INSET = IS_TV ? 20 : 14;
+const indentOf = (line: string) => LINE_INSET + (line.length - line.trimStart().length) * CHAR_WIDTH;
+
+const LINE_HEIGHT = IS_TV ? 26 : 18;
+const LINE_PAD_V = IS_TV ? 3 : 1;
+/** One row's full height in the scroll: the text line plus the row's own padding. */
+const LINE_SLOT = LINE_HEIGHT + LINE_PAD_V * 2;
+const CONTENT_PAD = IS_TV ? 21 : 15;
+
+type SendState = "idle" | "sending" | "sent" | "failed";
+
+const sendTitle = (state: SendState): string => (state === "sending" ? t("diagnostics.sending") : state === "sent" ? t("diagnostics.sent") : t("diagnostics.sendToPhoneBtn"));
+const sendNote = (state: SendState, userName: string | null): string | null => {
+  if (state === "sent") return t("diagnostics.sentFor").replace("{user}", userName ?? t("common.thisUser"));
+  return state === "failed" ? t("diagnostics.couldNotReach") : null;
+};
+
+const bySender = (sender: string | undefined) => (sender ? (getSends().find((sent) => sent.sender === sender) ?? null) : null);
+
+/**
+ * The most recent playback, as the engine recorded it, or one an Apple TV sent when the route
+ * names the sender. The page itself never scrolls: the log card takes whatever height is left
+ * under the title and scrolls inside that, so the biggest possible slab of log is on screen.
+ */
+export default function DiagnosticsScreen() {
+  const insets = useSafeAreaInsets();
+  const headerHeight = useHeaderHeight();
+  const { accent } = useCardPalette();
+  const { sender } = useLocalSearchParams<{ sender?: string }>();
+  const [own] = useState<PlaybackSession | null>(readLastSession);
+  const [sent, setSent] = useState<SentSession | null>(() => bySender(sender));
+  const [looked, setLooked] = useState(!sender || sent !== null);
+  const [copied, setCopied] = useState(false);
+  const [sendState, setSendState] = useState<SendState>("idle");
+  const [userName, setUserName] = useState<string | null>(null);
+  const connected = isAuthenticated();
+  // TV hides the scroll indicator, so a line sliced at the card's bottom edge reads as a defect,
+  // not as "more below": the viewport is trimmed to whole lines and the trim goes unused.
+  const [scrollHeight, setScrollHeight] = useState<number | null>(null);
+  const quantizeScroll = useCallback((event: LayoutChangeEvent) => {
+    const height = event.nativeEvent.layout.height;
+    if (height <= LINE_SLOT + CONTENT_PAD) return;
+    setScrollHeight(Math.floor((height - CONTENT_PAD) / LINE_SLOT) * LINE_SLOT + CONTENT_PAD);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    getStoredUserName().then((name) => {
+      if (active) setUserName(name);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // A sender the inbox has not read yet, the route arriving before the first poll: read now.
+  useEffect(() => {
+    if (!sender || looked) return;
+    let active = true;
+    refreshSends().then(() => {
+      if (!active) return;
+      setSent(bySender(sender));
+      setLooked(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, [sender, looked]);
+
+  const session = sender ? (sent?.session ?? null) : own;
+  const device = session?.device.family ?? DEVICE;
+
+  const lines = useMemo(() => (session ? documentLines(session) : []), [session]);
+  const story = useMemo(() => (session ? describePlayback(session, !sender) : null), [session, sender]);
+  const text = useMemo(() => (session ? logText(session, story) : ""), [session, story]);
+
+  // Required inside the handler, never at module scope: expo-clipboard's podspec is iOS and
+  // macOS only, so evaluating it on tvOS throws before this route can render anything.
+  const copy = useCallback(async () => {
+    try {
+      const Clipboard = await import("expo-clipboard");
+      await Clipboard.setStringAsync(text);
+      setCopied(true);
+    } catch (error) {
+      logger.warn("Clipboard unavailable", error, { service: "Diagnostics" });
+    }
+  }, [text]);
+
+  const share = useCallback(async () => {
+    try {
+      await shareLog(text, `Tomo TV diagnostics, ${device}.txt`);
+    } catch (error) {
+      logger.warn("Share unavailable", error, { service: "Diagnostics" });
+    }
+  }, [text, device]);
+
+  const send = useCallback(async () => {
+    if (!own || sendState === "sending") return;
+    setSendState("sending");
+    try {
+      await sendSession(own);
+      setSendState("sent");
+    } catch (error) {
+      logger.warn("Diagnostics send failed", error, { service: "Diagnostics" });
+      setSendState("failed");
+    }
+  }, [own, sendState]);
+
+  // Phone only, as custom items: a UIBarButtonItem shows its image or its title, never both.
+  // tvOS has no pasteboard or share sheet a viewer can reach and no header, so it gets nothing.
+  const screenOptions = useMemo<NativeStackNavigationOptions>(
+    () => ({
+      unstable_headerRightItems: () =>
+        session
+          ? [
+              {
+                type: "custom",
+                element: (
+                  <FocusableButton
+                    title={copied ? t("common.copied") : t("common.copy")}
+                    variant="link"
+                    icon={<Ionicons name={copied ? "checkmark" : "copy-outline"} size={16} color={accent} />}
+                    onPress={copy}
+                    accessibilityLabel={t("diagnostics.copy")}
+                  />
+                ),
+              },
+              {
+                type: "custom",
+                element: <FocusableButton variant="link" icon={<Ionicons name="share-outline" size={20} color={accent} />} onPress={share} accessibilityLabel={t("diagnostics.shareFile")} />,
+              },
+            ]
+          : [],
+    }),
+    [session, copied, copy, share, accent],
+  );
+
+  return (
+    <View style={settingsStyles.screenContainer}>
+      {!IS_TV && <Stack.Screen options={screenOptions} />}
+      <AmbientBackground />
+      <View style={[styles.page, { paddingTop: IS_TV ? 40 + insets.top : headerHeight + 12, paddingBottom: (IS_TV ? 60 : 24) + insets.bottom }, sideInsets(insets)]}>
+        <View style={[settingsStyles.contentContainer, styles.column]}>
+          {/* Phone puts this in the native bar; TV has no header, so it keeps the page title and
+              carries Send beside it, where the remote lands before the log. */}
+          {IS_TV && (
+            <View style={styles.titleRow}>
+              <Text style={styles.title}>{t("settings.diagnostics")}</Text>
+              {own && connected && (
+                <View style={styles.sendCluster}>
+                  {sendNote(sendState, userName) && <Text style={styles.sendNote}>{sendNote(sendState, userName)}</Text>}
+                  <GlassButton title={sendTitle(sendState)} isLoading={sendState === "sending"} disabled={sendState === "sent"} onPress={send} accessibilityLabel={t("diagnostics.sendToPhone")} />
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Focusable on TV even with nothing to read: a pushed screen with no focusable view
+              never takes focus, and Menu then reaches the tab bar and exits instead of popping. */}
+          {!session && looked && (
+            <Pressable isTVSelectable={IS_TV} hasTVPreferredFocus={IS_TV} accessibilityRole="text" style={({ focused }) => [settingsStyles.section, styles.empty, focused && styles.emptyFocused]}>
+              <Ionicons name="film-outline" size={IS_TV ? 44 : 32} color={COLORS.TEXT_QUATERNARY} />
+              <Text style={styles.emptyTitle}>{sender ? t("diagnostics.nothingHere") : t("diagnostics.nothingPlayed")}</Text>
+              <Text style={styles.emptyBody}>{sender ? t("diagnostics.sessionGone") : t("diagnostics.emptyBody")}</Text>
+            </Pressable>
+          )}
+
+          {session && (
+            <View style={[settingsStyles.sectionHeader, settingsStyles.sectionHeaderFirst]}>
+              <Text style={settingsStyles.sectionHeaderText}>{t("diagnostics.lastPlayed")}</Text>
+            </View>
+          )}
+          {session && (
+            <View style={[settingsStyles.section, styles.log]}>
+              <ScrollView
+                style={[styles.logScroll, IS_TV && scrollHeight !== null && { flex: 0, height: scrollHeight }]}
+                onLayout={IS_TV && scrollHeight === null ? quantizeScroll : undefined}
+                contentContainerStyle={styles.logContent}
+                showsVerticalScrollIndicator={!IS_TV}
+                nestedScrollEnabled>
+                {/* The document, one line per row. No horizontal scroll: a long value wraps and
+                    hangs under its property, so a row can never grow wider than the card. */}
+                {lines.map((line, index) =>
+                  // TV wraps each line in a focusable so the remote can walk the log and drag
+                  // the scroll with it. Phone leaves the text bare, because a Pressable over it
+                  // swallows the long press that starts a selection.
+                  IS_TV ? (
+                    <Pressable
+                      key={index}
+                      isTVSelectable
+                      hasTVPreferredFocus={index === 0}
+                      accessibilityRole="text"
+                      style={({ focused }) => [styles.lineRow, { paddingLeft: indentOf(line) }, focused && styles.lineRowFocused]}>
+                      {({ focused }) => <Text style={[styles.line, focused && styles.lineFocused]}>{line.trimStart() || " "}</Text>}
+                    </Pressable>
+                  ) : (
+                    <Text key={index} selectable style={[styles.line, styles.lineRow, { paddingLeft: indentOf(line) }]}>
+                      {line.trimStart() || " "}
+                    </Text>
+                  ),
+                )}
+              </ScrollView>
+              {/* The plain-words reading at the card's foot: the document above is the evidence,
+                  this is the answer. */}
+              {story && (
+                <SectionFooter>
+                  <Text style={[settingsStyles.sectionNote, styles.story, { color: accent }]}>{story}</Text>
+                </SectionFooter>
+              )}
+            </View>
+          )}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  page: { flex: 1, alignItems: "center" },
+  column: { flex: 1 },
+  titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 24, marginHorizontal: 16 },
+  title: { fontSize: 44, fontWeight: "800", color: COLORS.TEXT_PRIMARY, letterSpacing: -1 },
+  sendCluster: { flexDirection: "row", alignItems: "center", gap: 20 },
+  sendNote: { fontSize: 20, color: COLORS.TEXT_SECONDARY },
+  // The note in the accent and a step larger: it is the answer, not a footnote.
+  story: { fontSize: IS_TV ? 22 : 14, lineHeight: IS_TV ? 30 : 20 },
+  // flex: 1 is the whole point: the card eats the height the heading did not.
+  log: { flex: 1 },
+  logScroll: { flex: 1 },
+  logContent: { paddingVertical: CONTENT_PAD },
+  lineRow: { paddingRight: IS_TV ? 20 : 14, paddingVertical: LINE_PAD_V },
+  lineRowFocused: { backgroundColor: COLORS.SURFACE_RAISED },
+  line: { fontFamily: Platform.select({ ios: "Menlo", default: "monospace" }), fontSize: IS_TV ? 18 : 12, lineHeight: LINE_HEIGHT, color: IS_TV ? COLORS.TERMINAL_INK_DIM : COLORS.TERMINAL_INK },
+  lineFocused: { color: COLORS.TERMINAL_INK },
+  empty: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, paddingHorizontal: 24 },
+  emptyFocused: { backgroundColor: COLORS.SURFACE_RAISED },
+  emptyTitle: { fontSize: IS_TV ? 26 : 18, fontWeight: "700", color: COLORS.TEXT_BRIGHT },
+  emptyBody: { fontSize: IS_TV ? 20 : 13, color: COLORS.TEXT_SECONDARY, textAlign: "center", lineHeight: IS_TV ? 28 : 19 },
+});

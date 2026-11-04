@@ -1,0 +1,70 @@
+/**
+ * The XMLTV guide sources live in @keiver/tomo-live; this maps their listings onto the server's
+ * program shape, with ids the program panel never fetches.
+ */
+import type { JellyfinProgram } from "@/types/jellyfin";
+import { EXTERNAL_GUIDE_PREFIX } from "@/utils/guide";
+import type { GuideChannelRequest } from "@/utils/guideMatch";
+import { fetchExternalAiring, fetchExternalListingWindow, searchExternalListings, type GuideListing } from "@keiver/tomo-live";
+
+export {
+  activeGuideUrls,
+  clearDownloadedGuides,
+  fetchExternalListingWindow,
+  forgetGuide,
+  type GuideListing,
+  type GuideMatch,
+  type GuideSourceState,
+  type GuideSourceStatus,
+  guideSourcesBusy,
+  guideSourceStatuses,
+  preloadGuide,
+  refreshExternalGuide,
+  resetExternalGuide,
+  searchExternalListings,
+  subscribeGuideRefreshed,
+  subscribeGuideSources,
+} from "@keiver/tomo-live";
+
+function listingProgram({ channelId, programme }: GuideListing): JellyfinProgram {
+  return {
+    Id: `${EXTERNAL_GUIDE_PREFIX}${channelId}:${programme.start}`,
+    Name: programme.title,
+    ChannelId: channelId,
+    StartDate: new Date(programme.start).toISOString(),
+    EndDate: programme.stop !== null ? new Date(programme.stop).toISOString() : undefined,
+    Overview: programme.desc ?? undefined,
+    EpisodeTitle: programme.subTitle ?? undefined,
+    Genres: programme.categories,
+    OfficialRating: programme.rating ?? undefined,
+  };
+}
+
+export async function fetchExternalPrograms(urls: readonly string[], channels: readonly GuideChannelRequest[], windowMs: { from: number; to: number }): Promise<JellyfinProgram[]> {
+  return (await fetchExternalProgramWindow(urls, channels, windowMs)).programs;
+}
+
+export async function fetchExternalProgramWindow(
+  urls: readonly string[],
+  channels: readonly GuideChannelRequest[],
+  windowMs: { from: number; to: number },
+): Promise<{ programs: JellyfinProgram[]; failedChannelIds: string[] }> {
+  const { listings, failedChannelIds } = await fetchExternalListingWindow(urls, channels, windowMs);
+  return { programs: listings.map(listingProgram), failedChannelIds };
+}
+
+/** The programme airing at `atMs` per channel from the guide sources, in the server's program shape. */
+export async function fetchExternalAiringPrograms(urls: readonly string[], channels: readonly GuideChannelRequest[], atMs: number): Promise<JellyfinProgram[]> {
+  return (await fetchExternalAiring(urls, channels, atMs)).listings.map(listingProgram);
+}
+
+/** The guide sources' programmes in the window matching every word of `query`, in the server's program shape. */
+export async function searchExternalPrograms(
+  urls: readonly string[],
+  channels: readonly GuideChannelRequest[],
+  windowMs: { from: number; to: number },
+  query: string,
+  limit: number,
+): Promise<JellyfinProgram[]> {
+  return (await searchExternalListings(urls, channels, windowMs, query, limit)).map(listingProgram);
+}

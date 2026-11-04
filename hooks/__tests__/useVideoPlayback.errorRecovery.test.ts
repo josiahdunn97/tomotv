@@ -1,0 +1,325 @@
+/**
+ * useVideoPlayback - Error Recovery Ladder Tests
+ *
+ * Exercises planErrorRecovery, the pure decision function behind onError:
+ * direct → engine → server, with one engine restart for a mid-playback
+ * starvation (STALLED / CoreMedia -12889) before the server rung. Every
+ * decision the ladder can take is asserted here, including the exact
+ * preservation of the pre-existing paths (credential refresh, transcode
+ * seek recovery, up-front transcode latch).
+ */
+
+import { PlaybackErrorType, planErrorRecovery, type ErrorRecoveryInput } from "../useVideoPlayback";
+import { AUTOMATIC_RETRY_BUDGET_MS, automaticRetryDelay, isPermanentLiveError, reopensUntilAdmitted, shouldAutomaticallyRetry } from "../videoPlayback/errorRecovery";
+import { classifyPlaybackError as classifyError } from "@/utils/errorClassification";
+
+describe("automatic network recovery", () => {
+  it("caps the delay without exhausting retries", () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 20, 1000].map(automaticRetryDelay)).toEqual([500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  });
+
+  const vod = { live: false, heldOnDisk: false, ladderSpent: false, retryingForMs: 0 };
+
+  it.each([PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT, PlaybackErrorType.STALLED, PlaybackErrorType.UNKNOWN])("keeps retrying %s after every lane has failed", (errorType) => {
+    expect(shouldAutomaticallyRetry({ ...vod, errorType, ladderSpent: true })).toBe(true);
+  });
+
+  it.each([PlaybackErrorType.CORRUPT, PlaybackErrorType.DECODE])("retries %s only while a lane is left to try it", (errorType) => {
+    expect(shouldAutomaticallyRetry({ ...vod, errorType })).toBe(true);
+    expect(shouldAutomaticallyRetry({ ...vod, errorType, ladderSpent: true })).toBe(false);
+  });
+
+  it("stops once the retry budget is spent", () => {
+    expect(shouldAutomaticallyRetry({ ...vod, errorType: PlaybackErrorType.NETWORK, retryingForMs: AUTOMATIC_RETRY_BUDGET_MS - 1 })).toBe(true);
+    expect(shouldAutomaticallyRetry({ ...vod, errorType: PlaybackErrorType.NETWORK, retryingForMs: AUTOMATIC_RETRY_BUDGET_MS })).toBe(false);
+  });
+
+  it.each([PlaybackErrorType.NOT_FOUND, PlaybackErrorType.UNAUTHORIZED, PlaybackErrorType.PROTECTED])("never automatically retries %s", (errorType) => {
+    expect(shouldAutomaticallyRetry({ ...vod, errorType })).toBe(false);
+  });
+
+  it("leaves live and offline recovery to their existing policies", () => {
+    expect(shouldAutomaticallyRetry({ ...vod, live: true, errorType: PlaybackErrorType.NETWORK })).toBe(false);
+    expect(shouldAutomaticallyRetry({ ...vod, heldOnDisk: true, errorType: PlaybackErrorType.NETWORK })).toBe(false);
+  });
+});
+
+// A mid-playback baseline; individual tests override what they probe.
+const base: ErrorRecoveryInput = {
+  mode: "localRemux",
+  errorType: PlaybackErrorType.UNKNOWN,
+  currentTimeSec: 120,
+  hasTriedRemuxRestart: false,
+  hasTriedTranscoding: false,
+  hasTriedSeekRecovery: false,
+  hasTriedCredentialRefresh: false,
+  heldOnDisk: false,
+  hasDroppedSubtitles: false,
+};
+
+describe("network gateway item recovery", () => {
+  it.each([PlaybackErrorType.STALLED, PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT, PlaybackErrorType.DECODE, PlaybackErrorType.CORRUPT, PlaybackErrorType.UNKNOWN])(
+    "retries the local gateway instead of forbidden server video after %s",
+    (errorType) => {
+      expect(planErrorRecovery({ ...base, networkGateway: true, serverTranscodingAllowed: false, errorType, hasTriedRemuxRestart: true })).toMatchObject({
+        retryGateway: true,
+        latchTranscodeUpFront: false,
+        stallFallback: false,
+        carryPositionSec: 120,
+        action: { kind: "reportError" },
+      });
+    },
+  );
+
+  it.each([PlaybackErrorType.DECODE, PlaybackErrorType.CORRUPT, PlaybackErrorType.UNKNOWN])("ends at the error when the engine fails %s again after its one fresh session", (errorType) => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, serverTranscodingAllowed: false, hasRetriedGateway: true, errorType, hasTriedRemuxRestart: true })).toMatchObject({
+      retryGateway: false,
+      engineSpent: true,
+      latchTranscodeUpFront: false,
+      willRetryWithTranscode: false,
+      action: { kind: "reportError" },
+    });
+  });
+
+  it.each([PlaybackErrorType.STALLED, PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT])("keeps retrying the engine after %s, which the link can outlast", (errorType) => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, serverTranscodingAllowed: false, hasRetriedGateway: true, errorType, hasTriedRemuxRestart: true })).toMatchObject({
+      retryGateway: true,
+      engineSpent: false,
+    });
+  });
+
+  it("never spends the engine while the server is still a rung", () => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, hasRetriedGateway: true }).engineSpent).toBe(false);
+  });
+
+  it("preserves credential refresh when server video is forbidden", () => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, serverTranscodingAllowed: false, errorType: PlaybackErrorType.UNAUTHORIZED }).action).toEqual({ kind: "refreshCredentials" });
+  });
+
+  it.each([PlaybackErrorType.STALLED, PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT])("preserves the original supplier after repeated %s failures", (errorType) => {
+    const decision = planErrorRecovery({ ...base, networkGateway: true, errorType, hasTriedRemuxRestart: true });
+    expect(decision).toMatchObject({ retryGateway: true, latchTranscodeUpFront: false, stallFallback: false, stopRemuxSession: true, carryPositionSec: 120, action: { kind: "reportError" } });
+  });
+
+  it.each([PlaybackErrorType.STALLED, PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT])("does not revive a confirmed unavailable producer after %s", (errorType) => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, hasTriedTranscoding: true, errorType }).retryGateway).toBe(false);
+  });
+
+  it.each([PlaybackErrorType.DECODE, PlaybackErrorType.CORRUPT, PlaybackErrorType.UNKNOWN])("retains server-only fallback for structural %s failures", (errorType) => {
+    expect(planErrorRecovery({ ...base, networkGateway: true, errorType })).toMatchObject({ retryGateway: false, latchTranscodeUpFront: true });
+  });
+});
+
+describe("planErrorRecovery: engine restart rung", () => {
+  it("restarts the engine once for a mid-playback starvation", () => {
+    const d = planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED });
+    expect(d.action.kind).toBe("restartRemux");
+    expect(d.latchTranscodeUpFront).toBe(false); // the ladder stays intact
+    expect(d.carryPositionSec).toBe(120); // resumes at the playhead
+    expect(d.stopRemuxSession).toBe(true); // dead session cleaned up
+    expect(d.stallFallback).toBe(false); // not yet on the server
+    expect(d.willRetryWithTranscode).toBe(true); // probe/suite semantics
+  });
+
+  it("goes to the server on the second starvation, at the floor preset", () => {
+    const d = planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED, hasTriedRemuxRestart: true });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(true);
+    expect(d.stallFallback).toBe(true);
+    expect(d.carryPositionSec).toBe(120); // mid-film resume on the fallback too
+    expect(d.stopRemuxSession).toBe(true);
+  });
+
+  it("does not restart the engine for a startup starvation", () => {
+    const d = planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED, currentTimeSec: 0 });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(true); // straight to the server, as before
+    expect(d.stallFallback).toBe(true); // but the server entry is still the floor
+    expect(d.carryPositionSec).toBeNull();
+  });
+
+  it("does not restart the engine for non-starvation errors", () => {
+    for (const errorType of [PlaybackErrorType.DECODE, PlaybackErrorType.CORRUPT, PlaybackErrorType.NETWORK, PlaybackErrorType.TIMEOUT, PlaybackErrorType.UNKNOWN, PlaybackErrorType.NOT_FOUND]) {
+      const d = planErrorRecovery({ ...base, errorType });
+      expect(d.action.kind).toBe("reportError");
+      expect(d.stallFallback).toBe(false);
+    }
+  });
+
+  it("restart threshold is strictly above one second of playback", () => {
+    expect(planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED, currentTimeSec: 1 }).action.kind).toBe("reportError");
+    expect(planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED, currentTimeSec: 1.01 }).action.kind).toBe("restartRemux");
+  });
+});
+
+describe("planErrorRecovery: preserved pre-existing paths", () => {
+  it("mid-playback localRemux failure latches transcode up front and carries the playhead", () => {
+    const d = planErrorRecovery(base);
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(true);
+    expect(d.willRetryWithTranscode).toBe(true);
+    expect(d.carryPositionSec).toBe(120);
+    expect(d.stopRemuxSession).toBe(true); // the retry path no longer leaks the session
+  });
+
+  it("startup localRemux failure keeps today's behavior (latch, no position carry)", () => {
+    const d = planErrorRecovery({ ...base, currentTimeSec: 0 });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(true);
+    expect(d.carryPositionSec).toBeNull();
+  });
+
+  it("direct-play failure never latches; mid-playback carries the playhead to the engine rung", () => {
+    const d = planErrorRecovery({ ...base, mode: "direct" });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(false);
+    expect(d.willRetryWithTranscode).toBe(true);
+    expect(d.carryPositionSec).toBe(120);
+    expect(d.stopRemuxSession).toBe(false);
+  });
+
+  it("credential refresh wins over every other rung and keeps historical resume semantics", () => {
+    for (const mode of ["direct", "localRemux", "transcode"] as const) {
+      const d = planErrorRecovery({ ...base, mode, errorType: PlaybackErrorType.UNAUTHORIZED });
+      expect(d.action.kind).toBe("refreshCredentials");
+      expect(d.carryPositionSec).toBeNull();
+    }
+    // A 401 mid-remux still spends the engine rung up front: today's behavior, preserved.
+    expect(planErrorRecovery({ ...base, errorType: PlaybackErrorType.UNAUTHORIZED }).latchTranscodeUpFront).toBe(true);
+  });
+
+  it("spent credential refresh falls through to the normal ladder", () => {
+    const d = planErrorRecovery({ ...base, errorType: PlaybackErrorType.UNAUTHORIZED, hasTriedCredentialRefresh: true });
+    expect(d.action.kind).toBe("reportError");
+  });
+
+  it("transcode mid-playback crash takes seek recovery once", () => {
+    const d = planErrorRecovery({ ...base, mode: "transcode" });
+    expect(d.action.kind).toBe("transcodeSeekRecovery");
+    expect(d.carryPositionSec).toBe(120);
+    expect(d.latchTranscodeUpFront).toBe(false);
+    expect(d.willRetryWithTranscode).toBe(false);
+  });
+
+  it("transcode failure is terminal once seek recovery is spent", () => {
+    const d = planErrorRecovery({ ...base, mode: "transcode", hasTriedSeekRecovery: true });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.willRetryWithTranscode).toBe(false);
+    expect(d.carryPositionSec).toBeNull();
+  });
+
+  it("transcode startup failure is terminal (no seek recovery below the threshold)", () => {
+    const d = planErrorRecovery({ ...base, mode: "transcode", currentTimeSec: 0.5 });
+    expect(d.action.kind).toBe("reportError");
+  });
+
+  it("a localRemux failure with transcode already spent neither latches nor retries", () => {
+    const d = planErrorRecovery({ ...base, hasTriedTranscoding: true });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.latchTranscodeUpFront).toBe(false);
+    expect(d.willRetryWithTranscode).toBe(false);
+    expect(d.stopRemuxSession).toBe(false);
+    expect(d.carryPositionSec).toBeNull();
+  });
+
+  it("a starved restart with transcode already spent goes terminal, not into a restart loop", () => {
+    const d = planErrorRecovery({ ...base, errorType: PlaybackErrorType.STALLED, hasTriedRemuxRestart: true, hasTriedTranscoding: true });
+    expect(d.action.kind).toBe("reportError");
+    expect(d.willRetryWithTranscode).toBe(false);
+  });
+});
+
+describe("classifyPlaybackError: starvation", () => {
+  const { classifyPlaybackError } = jest.requireActual<typeof import("../useVideoPlayback")>("../useVideoPlayback");
+
+  it("classifies the native -12889 code+domain shape", () => {
+    expect(classifyPlaybackError({ code: -12889, domain: "CoreMediaErrorDomain" })).toBe(PlaybackErrorType.STALLED);
+  });
+
+  it("classifies the message-only shape RNV sometimes surfaces", () => {
+    expect(classifyPlaybackError({ localizedDescription: "The operation couldn’t be completed. (CoreMediaErrorDomain error -12889.)" })).toBe(PlaybackErrorType.STALLED);
+    expect(classifyPlaybackError(new Error("CoreMediaErrorDomain error -12889"))).toBe(PlaybackErrorType.STALLED);
+  });
+
+  it("does not confuse other CoreMedia codes with starvation", () => {
+    expect(classifyPlaybackError({ code: -12971, domain: "CoreMediaErrorDomain" })).toBe(PlaybackErrorType.DECODE);
+    expect(classifyPlaybackError({ code: -12889, domain: "SomeOtherDomain" })).not.toBe(PlaybackErrorType.STALLED);
+  });
+});
+
+describe("planErrorRecovery: a held file degrades instead of reaching a server", () => {
+  it("spends the subtitles rather than the transcode rung, and stops the dead session", () => {
+    const d = planErrorRecovery({ ...base, heldOnDisk: true });
+    expect(d.dropSubtitles).toBe(true);
+    // Retries, but never latched: the pick has to be free to land on direct play.
+    expect(d.willRetryWithTranscode).toBe(true);
+    expect(d.carryPositionSec).toBe(120);
+    expect(d.latchTranscodeUpFront).toBe(false);
+    expect(d.stopRemuxSession).toBe(true);
+  });
+
+  // The duplicate error. RNV observes AVPlayerItemFailedToPlayToEndTime with object: nil, so a
+  // second failure can land before the retry runs; latching the rung there is what put a
+  // download on a server the replay from disk exists to avoid.
+  it("spends no rung on a second failure arriving before the replay", () => {
+    const d = planErrorRecovery({ ...base, heldOnDisk: true, hasDroppedSubtitles: true });
+    expect(d.dropSubtitles).toBe(false);
+    expect(d.latchTranscodeUpFront).toBe(false);
+  });
+
+  it("still latches the rung for a streamed file on the same input", () => {
+    expect(planErrorRecovery({ ...base, heldOnDisk: false, hasDroppedSubtitles: true }).latchTranscodeUpFront).toBe(true);
+  });
+
+  // The playhead rides the retry. Deriving it from a narrowed retry flag silently resumed a
+  // held file from wherever the launching screen was rather than where the viewer was.
+  it("carries the playhead into the replay", () => {
+    expect(planErrorRecovery({ ...base, heldOnDisk: true }).carryPositionSec).toBe(120);
+  });
+
+  it("still latches the server rung for the same failure on a streamed file", () => {
+    const d = planErrorRecovery({ ...base, heldOnDisk: false });
+    expect(d.willRetryWithTranscode).toBe(true);
+    expect(d.latchTranscodeUpFront).toBe(true);
+    expect(d.dropSubtitles).toBe(false);
+  });
+
+  it("leaves the engine restart rung ahead of the subtitle drop for a held stall", () => {
+    const d = planErrorRecovery({ ...base, heldOnDisk: true, errorType: PlaybackErrorType.STALLED });
+    expect(d.action).toEqual({ kind: "restartRemux" });
+    expect(d.dropSubtitles).toBe(false);
+  });
+});
+
+describe("isPermanentLiveError", () => {
+  it("takes a stall or a lost input for something another open fixes", () => {
+    expect(isPermanentLiveError(PlaybackErrorType.STALLED, "live playback stalled for 60s")).toBe(false);
+    expect(isPermanentLiveError(PlaybackErrorType.NETWORK, "live input lost: no data for 12s")).toBe(false);
+  });
+
+  it("takes the account, a gone channel and DRM for failures every open repeats", () => {
+    for (const errorType of [PlaybackErrorType.UNAUTHORIZED, PlaybackErrorType.NOT_FOUND, PlaybackErrorType.PROTECTED]) {
+      expect(isPermanentLiveError(errorType, "")).toBe(true);
+    }
+  });
+
+  it("takes an input the engine gave up, a channel the server could only re-encode, or one the engine cannot take, for permanent", () => {
+    expect(isPermanentLiveError(PlaybackErrorType.STALLED, "live input gone: Server returned 404 Not Found")).toBe(true);
+    expect(isPermanentLiveError(PlaybackErrorType.STALLED, "The server can carry News 24 only by re-encoding it")).toBe(true);
+    expect(isPermanentLiveError(PlaybackErrorType.STALLED, "the open gave the engine nothing to read")).toBe(true);
+  });
+
+  it("takes a recording holding the provider for permanent, and never retries it on its own", () => {
+    const errorType = classifyError(new Error("live origin is held by a recording"));
+    expect(errorType).toBe(PlaybackErrorType.RECORDING_HOLD);
+    expect(isPermanentLiveError(errorType, "live origin is held by a recording")).toBe(true);
+    expect(shouldAutomaticallyRetry({ live: false, heldOnDisk: false, errorType, ladderSpent: true, retryingForMs: 0 })).toBe(false);
+  });
+
+  it("opens a channel again on the provider's refusal only after its recording was stopped", () => {
+    expect(reopensUntilAdmitted({ reopening: false, errorType: PlaybackErrorType.PROVIDER_LIMIT, admitting: true })).toBe(true);
+    expect(reopensUntilAdmitted({ reopening: false, errorType: PlaybackErrorType.PROVIDER_LIMIT, admitting: false })).toBe(false);
+    expect(reopensUntilAdmitted({ reopening: false, errorType: PlaybackErrorType.NOT_FOUND, admitting: true })).toBe(false);
+    expect(reopensUntilAdmitted({ reopening: true, errorType: PlaybackErrorType.PROVIDER_LIMIT, admitting: true })).toBe(false);
+  });
+});

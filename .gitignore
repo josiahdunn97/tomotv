@@ -1,0 +1,88 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files. Every .env.<name> is local-only; bare .env is committed on purpose
+# and says so in its own header.
+.env.*
+
+# typescript
+*.tsbuildinfo
+
+app-example
+
+# generated native folders
+/ios
+/tvos
+/macos
+/.prebuild-mac-backup
+/.native-build.lock
+/android
+/TomoTV.xcworkspace
+
+# RN prebuilt tarball cache, persisted across prebuild --clean wipes
+/.rn-artifact-cache
+
+# release artifacts from scripts/archive-both.sh
+/build
+
+# FFmpeg xcframeworks downloaded by packages/tomo-engine/scripts/fetch-ffmpeg.js
+packages/tomo-engine/ios/Frameworks/
+
+coverage
+*.lcov
+
+nogit/
+
+.claude/*
+!.claude/rules/
+CLAUDE.local.md
+
+# FFmpeg build tree: pinned sources, per-slice prefixes, packaged artifacts.
+# Written by scripts/ffmpeg/build.sh, never by npm install.
+.ffmpeg-build/
+applestore/generated/
+
+# SwiftPM build products for the host test packages
+native/ios/.build/
+packages/tomo-engine/.build/
+
+# Live TV rig sources cut from the fixtures (test/playback/README.md); MPEG-TS, not TypeScript
+test/playback/live/*.ts
+test/playback/live/hls/
+test/playback/live/guide.xml
+test/playback/live/real-guide.xml
+
+# python
+__pycache__/
+
+# probe output redirects
+*.out

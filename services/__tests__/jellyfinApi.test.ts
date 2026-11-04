@@ -1,0 +1,3426 @@
+import {
+  isCodecSupported,
+  needsTranscoding,
+  audioNeedsRewrap,
+  isAudioOnly,
+  hasPoster,
+  searchVideos,
+  fetchFolderContents,
+  fetchLibraryVideos,
+  fetchLibraryYears,
+  fetchPlaylistContents,
+  fetchPlaylistDownloadables,
+  fetchRecursiveVideos,
+  fetchUserViews,
+  fetchViewItemCount,
+  fetchLibraryRootCount,
+  setVideoFavorite,
+  isFolder,
+  isPhoto,
+  connectToDemoServer,
+  isDemoMode,
+  disconnectFromDemo,
+  getVideoStreamUrl,
+  getTranscodingStreamUrl,
+  getPosterUrl,
+  getChapterImageUrl,
+  getFolderThumbnailUrl,
+  getSubtitleUrl,
+  getTextSubtitleStreams,
+  isImageBasedSubtitleCodec,
+  getBurnInSubtitleStream,
+  fetchVideoDetails,
+  fetchItemDetails,
+  fetchLatestItems,
+  fetchFavoriteItems,
+  refreshConfig,
+  getConfig,
+  buildServerUrlCandidates,
+  checkServerInfo,
+  evaluateSavedConnection,
+  getAuthHeader,
+  resolveServerConnection,
+  subscribeAuthChange,
+} from "../jellyfinApi";
+import { EMPTY_FILTERS, JellyfinVideoItem } from "@/types/jellyfin";
+import { getConvertedDownloadUrl, serverVideoCodecs, sourceIsHdr } from "@/services/jellyfin/streamUrls";
+import { chainTerms, joinTermResults, nextOffset } from "@/services/jellyfin/search";
+
+// Mock expo-secure-store
+jest.mock("expo-secure-store", () => ({
+  getItemAsync: jest.fn().mockResolvedValue(null),
+  setItemAsync: jest.fn().mockResolvedValue(undefined),
+  deleteItemAsync: jest.fn().mockResolvedValue(undefined),
+}));
+
+// Mock managers to prevent cache clearing errors in tests
+jest.mock("@/services/libraryManager", () => ({
+  libraryManager: {
+    clearCache: jest.fn(),
+  },
+}));
+
+// Login paths arm warmBitrateMemory's delayed probe; unmocked, that timer fires
+// mid-suite and leaks a fetch into whatever test is running by then.
+jest.mock("@/services/jellyfin/bitrateTest", () => ({
+  warmBitrateMemory: jest.fn(),
+  rememberedBitrate: jest.fn().mockResolvedValue(null),
+  rememberedBitrateStatus: jest.fn().mockResolvedValue(null),
+}));
+
+// Mock expo-file-system for the Local Network primed marker. `exists: true` by
+// default so every test outside the grace-window suite behaves as a primed
+// install (single attempt, immediate error), matching pre-marker behavior.
+jest.mock("expo-file-system", () => {
+  const markerState = { exists: true, created: 0 };
+  class File {
+    get exists() {
+      return markerState.exists;
+    }
+    create() {
+      markerState.created += 1;
+      markerState.exists = true;
+    }
+  }
+  return { Paths: { document: "file:///docs/" }, File, __markerState: markerState };
+});
+const { __markerState: markerState } = jest.requireMock("expo-file-system") as { __markerState: { exists: boolean; created: number } };
+
+describe("jellyfinApi", () => {
+  describe("isCodecSupported", () => {
+    it("should support H.264/AVC codec", () => {
+      expect(isCodecSupported("h264")).toBe(true);
+      expect(isCodecSupported("avc")).toBe(true);
+      expect(isCodecSupported("H264")).toBe(true);
+    });
+
+    it("should support HEVC/H.265 codec", () => {
+      expect(isCodecSupported("hevc")).toBe(true);
+      expect(isCodecSupported("h265")).toBe(true);
+      expect(isCodecSupported("HEVC")).toBe(true);
+    });
+
+    it("should support HEVC codec-tag names (single registry with REMUXABLE_CODECS)", () => {
+      expect(isCodecSupported("hvc1")).toBe(true);
+      expect(isCodecSupported("hev1")).toBe(true);
+    });
+
+    it("should not support MPEG-4", () => {
+      expect(isCodecSupported("mpeg4")).toBe(false);
+      expect(isCodecSupported("mpeg-4")).toBe(false);
+    });
+
+    it("should not support VP8/VP9", () => {
+      expect(isCodecSupported("vp8")).toBe(false);
+      expect(isCodecSupported("vp9")).toBe(false);
+    });
+
+    it("should not support AV1", () => {
+      expect(isCodecSupported("av1")).toBe(false);
+    });
+
+    it("should not support VC1/WMV", () => {
+      expect(isCodecSupported("vc1")).toBe(false);
+      expect(isCodecSupported("wmv")).toBe(false);
+    });
+
+    it("should not support MPEG-2", () => {
+      expect(isCodecSupported("mpeg2")).toBe(false);
+    });
+
+    it("should not support DivX/Xvid", () => {
+      expect(isCodecSupported("divx")).toBe(false);
+      expect(isCodecSupported("xvid")).toBe(false);
+    });
+
+    it("should default to not supported for unknown codecs", () => {
+      expect(isCodecSupported("unknown_codec")).toBe(false);
+    });
+  });
+
+  describe("audioNeedsRewrap", () => {
+    const audio = (codec: string, container: string): JellyfinVideoItem =>
+      ({
+        Id: "a1",
+        Name: "Track",
+        MediaStreams: [{ Type: "Audio", Codec: codec, Index: 0 }],
+        MediaSources: [{ Id: "s1", Container: container }],
+      }) as any;
+
+    it.each([
+      ["mp3", "mp3"],
+      ["aac", "mov,mp4,m4a,3gp,3g2,mj2"],
+      ["alac", "mov,mp4,m4a,3gp,3g2,mj2"],
+      ["flac", "flac"],
+      ["pcm_s16le", "wav"],
+    ])("leaves %s in %s to direct play", (codec, container) => {
+      expect(audioNeedsRewrap(audio(codec, container))).toBe(false);
+    });
+
+    it("sends Vorbis to the engine, which AVPlayer cannot decode", () => {
+      expect(audioNeedsRewrap(audio("vorbis", "ogg"))).toBe(true);
+    });
+
+    it("sends APE and TTA to the engine", () => {
+      expect(audioNeedsRewrap(audio("ape", "ape"))).toBe(true);
+      expect(audioNeedsRewrap(audio("tta", "tta"))).toBe(true);
+    });
+
+    it("sends a playable codec in an unplayable container to the engine", () => {
+      // FLAC in Matroska: AVPlayer decodes the codec and refuses the wrapper.
+      expect(audioNeedsRewrap(audio("flac", "matroska,webm"))).toBe(true);
+    });
+
+    it("returns false when there is no audio stream to judge", () => {
+      expect(audioNeedsRewrap(null)).toBe(false);
+    });
+  });
+
+  describe("needsTranscoding", () => {
+    it("should return false for supported codec", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(false);
+    });
+
+    it("should return true for unsupported codec", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "mpeg4", Index: 0 }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(true);
+    });
+
+    it("should return false when no video stream exists", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Audio", Codec: "aac", Index: 0 }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(false);
+    });
+
+    it("should return false when video item is null", () => {
+      expect(needsTranscoding(null)).toBe(false);
+    });
+
+    // The registry says the family decodes HEVC; the device says whether this one does.
+    it("leaves direct play for HEVC the device cannot decode", () => {
+      const hevc = (BitDepth: number): JellyfinVideoItem =>
+        ({ Id: "123", Name: "Test Video", MediaSources: [{ Id: "123", Container: "mp4" }], MediaStreams: [{ Type: "Video", Codec: "hevc", Index: 0, BitDepth }] }) as any;
+      expect(needsTranscoding(hevc(10), { hevc: false, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null })).toBe(true);
+      expect(needsTranscoding(hevc(10), { hevc: true, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null })).toBe(true);
+      expect(needsTranscoding(hevc(8), { hevc: true, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null })).toBe(false);
+      expect(needsTranscoding(hevc(10), { hevc: true, hevcMain10: true, av1: false, h264MaxHeight: null, hevcMaxHeight: null })).toBe(false);
+      expect(needsTranscoding(hevc(10))).toBe(false);
+    });
+
+    it("leaves direct play for a frame taller than the hardware decoder opens", () => {
+      const h264 = (Height: number): JellyfinVideoItem =>
+        ({ Id: "123", Name: "Test Video", MediaSources: [{ Id: "123", Container: "mp4" }], MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0, Height }] }) as any;
+      const hd = { hevc: true, hevcMain10: true, av1: false, h264MaxHeight: 1080, hevcMaxHeight: 1080 };
+      expect(needsTranscoding(h264(2160), hd)).toBe(true);
+      expect(needsTranscoding(h264(1080), hd)).toBe(false);
+      expect(needsTranscoding(h264(2160), { ...hd, h264MaxHeight: null })).toBe(false);
+    });
+
+    it("should return true for supported codec in MKV container", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+        MediaSources: [{ Id: "123", Container: "mkv" }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(true);
+    });
+
+    it("should return false for supported codec in MP4 container", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+        MediaSources: [{ Id: "123", Container: "mp4" }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(false);
+    });
+
+    it("should return true for unsupported containers like avi and webm", () => {
+      for (const container of ["avi", "wmv", "flv", "webm"]) {
+        const videoItem: JellyfinVideoItem = {
+          Id: "123",
+          Name: "Test Video",
+          MediaStreams: [{ Type: "Video", Codec: "hevc", Index: 0 }],
+          MediaSources: [{ Id: "123", Container: container }],
+        } as any;
+
+        expect(needsTranscoding(videoItem)).toBe(true);
+      }
+    });
+
+    it("should return false for comma-separated container with a supported token", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+        MediaSources: [{ Id: "123", Container: "mov,mp4,m4a,3gp,3g2,mj2" }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(false);
+    });
+
+    it("should return true for comma-separated container with no supported token", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "hevc", Index: 0 }],
+        MediaSources: [{ Id: "123", Container: "mkv,webm" }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(true);
+    });
+
+    it("should return false for supported codec with no container info", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test Video",
+        MediaStreams: [{ Type: "Video", Codec: "h264", Index: 0 }],
+      } as any;
+
+      expect(needsTranscoding(videoItem)).toBe(false);
+    });
+  });
+
+  describe("isAudioOnly", () => {
+    it("should return true for audio-only files", () => {
+      const audioItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Audio File",
+        MediaStreams: [{ Type: "Audio", Codec: "aac", Index: 0 }],
+      } as any;
+
+      expect(isAudioOnly(audioItem)).toBe(true);
+    });
+
+    it("should return false for video files", () => {
+      const videoItem: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Video File",
+        MediaStreams: [
+          { Type: "Video", Codec: "h264", Index: 0 },
+          { Type: "Audio", Codec: "aac", Index: 1 },
+        ],
+      } as any;
+
+      expect(isAudioOnly(videoItem)).toBe(false);
+    });
+
+    it("should return false for null item", () => {
+      expect(isAudioOnly(null)).toBe(false);
+    });
+  });
+
+  describe("hasPoster", () => {
+    it("should return true when poster exists", () => {
+      const item: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test",
+        ImageTags: { Primary: "abc123" },
+      } as any;
+
+      expect(hasPoster(item)).toBe(true);
+    });
+
+    it("should return false when no poster exists", () => {
+      const item: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test",
+        ImageTags: {},
+      } as any;
+
+      expect(hasPoster(item)).toBe(false);
+    });
+
+    it("should return false when ImageTags is undefined", () => {
+      const item: JellyfinVideoItem = {
+        Id: "123",
+        Name: "Test",
+      } as any;
+
+      expect(hasPoster(item)).toBe(false);
+    });
+  });
+
+  describe("searchVideos pagination", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      // Mock fetch globally
+      global.fetch = jest.fn();
+
+      // Mock SecureStore to return valid config (new format with SERVER_URL)
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("should return empty array for empty search term", async () => {
+      const result = await searchVideos("");
+      expect(result).toEqual({ items: [], next: null });
+    });
+
+    it("should return empty array for whitespace-only search term", async () => {
+      const result = await searchVideos("   ");
+      expect(result).toEqual({ items: [], next: null });
+    });
+
+    it("should call API with correct pagination parameters", async () => {
+      const mockResponse = {
+        Items: [
+          { Id: "1", Name: "Video 1", Type: "Movie" },
+          { Id: "2", Name: "Video 2", Type: "Movie" },
+        ],
+        TotalRecordCount: 100,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("test", { limit: 20 });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("SearchTerm=test"), expect.any(Object));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("Limit=20"), expect.any(Object));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("StartIndex=0"), expect.any(Object));
+      expect(result.items).toHaveLength(2);
+      expect(result.next).toEqual({ title: 2 });
+    });
+
+    it("should handle pagination with custom startIndex", async () => {
+      const mockResponse = {
+        Items: [
+          { Id: "21", Name: "Video 21", Type: "Movie" },
+          { Id: "22", Name: "Video 22", Type: "Movie" },
+        ],
+        TotalRecordCount: 100,
+        StartIndex: 20,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("test", { limit: 20, cursor: { title: 20 } });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("StartIndex=20"), expect.any(Object));
+      expect(result.items).toHaveLength(2);
+      expect(result.next).toEqual({ title: 22 });
+    });
+
+    it("should use default pagination values when not specified", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      await searchVideos("test");
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("Limit=60"), expect.any(Object));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("StartIndex=0"), expect.any(Object));
+    });
+
+    it("should return correct structure with items and total", async () => {
+      const mockResponse = {
+        Items: [
+          { Id: "1", Name: "Video 1", Type: "Movie" },
+          { Id: "2", Name: "Video 2", Type: "Movie" },
+          { Id: "3", Name: "Video 3", Type: "Movie" },
+        ],
+        TotalRecordCount: 150,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("action", { limit: 3 });
+
+      expect(result).toEqual({
+        items: mockResponse.Items,
+        next: { title: 3 },
+      });
+    });
+
+    it("should handle response without TotalRecordCount", async () => {
+      const mockResponse = {
+        Items: [{ Id: "1", Name: "Video 1", Type: "Movie" }],
+        // TotalRecordCount is optional in the API
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("test");
+
+      expect(result.items).toHaveLength(1);
+      // Without a count, a short page is the last one
+      expect(result.next).toBeNull();
+    });
+
+    it("should trim search term before sending to API", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      await searchVideos("  test query  ");
+
+      // URLSearchParams encodes spaces as '+' which is valid
+      const callUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(callUrl).toMatch(/SearchTerm=test(\+|%20)query/);
+    });
+
+    it("should handle empty results correctly", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("nonexistent");
+
+      expect(result.items).toEqual([]);
+      expect(result.next).toBeNull();
+    });
+
+    it("should handle last page of results correctly", async () => {
+      const mockResponse = {
+        Items: [
+          { Id: "96", Name: "Video 96", Type: "Movie" },
+          { Id: "97", Name: "Video 97", Type: "Movie" },
+        ],
+        TotalRecordCount: 97,
+        StartIndex: 95,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await searchVideos("test", { limit: 60, cursor: { title: 95 } });
+
+      expect(result.items).toHaveLength(2);
+      expect(result.next).toBeNull();
+    });
+  });
+
+  describe("searchVideos genre and artist facets", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    type ItemsResponse = { Items: any[]; TotalRecordCount?: number };
+
+    beforeEach(async () => {
+      global.fetch = jest.fn();
+
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    // Routes fetches by endpoint so the facet lists and each /Items search can be shaped
+    // independently. Returns the decoded /Items URLs bucketed by which query they came from.
+    const mockSearchFetch = ({
+      genres = [],
+      artists = [],
+      titleResponse = { Items: [] },
+      genreResponse = { Items: [] },
+      artistResponse = { Items: [] },
+    }: {
+      genres?: string[];
+      artists?: { Id: string; Name: string }[];
+      titleResponse?: ItemsResponse;
+      genreResponse?: ItemsResponse;
+      artistResponse?: ItemsResponse;
+    }) => {
+      const calls = { title: [] as string[], genre: [] as string[], artist: [] as string[] };
+      (global.fetch as jest.Mock).mockImplementation((rawUrl: string) => {
+        const url = decodeURIComponent(rawUrl);
+        const respond = (body: unknown) => Promise.resolve({ ok: true, json: async () => body });
+        if (url.includes("/MusicGenres?")) return respond({ Items: [] });
+        if (url.includes("/Genres?")) return respond({ Items: genres.map((name) => ({ Id: `genre-${name}`, Name: name })) });
+        if (url.includes("/Artists?")) return respond({ Items: artists });
+        if (url.includes("ArtistIds=")) {
+          calls.artist.push(url);
+          return respond(artistResponse);
+        }
+        if (url.includes("&Genres=")) {
+          calls.genre.push(url);
+          return respond(genreResponse);
+        }
+        calls.title.push(url);
+        return respond(titleResponse);
+      });
+      return calls;
+    };
+
+    it("should add a Genres request alongside the unchanged title search when a genre matches", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Comedy", "Drama"],
+        titleResponse: { Items: [{ Id: "t1", Name: "Comedy Central Special", Type: "Movie" }], TotalRecordCount: 1 },
+        genreResponse: {
+          Items: [
+            { Id: "t1", Name: "Comedy Central Special", Type: "Movie" },
+            { Id: "g1", Name: "Some Comedy Movie", Type: "Movie" },
+          ],
+          TotalRecordCount: 2,
+        },
+      });
+
+      const result = await searchVideos("comedy");
+
+      // Title query unchanged: full term, no facet filter
+      expect(calls.title).toHaveLength(1);
+      expect(calls.title[0]).toContain("SearchTerm=comedy");
+      expect(calls.title[0]).not.toContain("&Genres=");
+      // Genre query: term fully consumed into the filter
+      expect(calls.genre).toHaveLength(1);
+      expect(calls.genre[0]).toContain("Genres=Comedy");
+      expect(calls.genre[0]).not.toContain("SearchTerm=");
+      expect(calls.artist).toHaveLength(0);
+      // Union merged and deduplicated (t1 appears in both)
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["t1", "g1"]);
+    });
+
+    it("should pipe-delimit multiple matched genres", async () => {
+      const calls = mockSearchFetch({ genres: ["Action", "Comedy"] });
+
+      await searchVideos("action comedy");
+
+      expect(calls.genre).toHaveLength(1);
+      expect(calls.genre[0]).toContain("Genres=Action|Comedy");
+    });
+
+    it("should send ArtistIds with music item types when an artist matches", async () => {
+      const calls = mockSearchFetch({
+        artists: [{ Id: "a1", Name: "Queen" }],
+        artistResponse: { Items: [{ Id: "s1", Name: "Bohemian Rhapsody", Type: "Audio" }], TotalRecordCount: 1 },
+      });
+
+      const result = await searchVideos("queen");
+
+      expect(calls.artist).toHaveLength(1);
+      expect(calls.artist[0]).toContain("ArtistIds=a1");
+      expect(calls.artist[0]).toContain("IncludeItemTypes=Audio,MusicVideo");
+      expect(calls.genre).toHaveLength(0);
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toContain("s1");
+    });
+
+    it("should combine artist, genre, and years in one query", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Rock"],
+        artists: [{ Id: "a1", Name: "Queen" }],
+      });
+
+      await searchVideos("queen rock 80s");
+
+      // Title query keeps the full post-year term
+      expect(calls.title).toHaveLength(1);
+      expect(calls.title[0]).toContain("SearchTerm=queen+rock");
+      expect(calls.title[0]).toContain("Years=1980,");
+      // Genre query: leftover term is empty after both facets claim their words
+      expect(calls.genre).toHaveLength(1);
+      expect(calls.genre[0]).toContain("Genres=Rock");
+      expect(calls.genre[0]).not.toContain("SearchTerm=");
+      expect(calls.genre[0]).toContain("Years=1980,");
+      // Artist query carries the matched genre too (Queen's rock items)
+      expect(calls.artist).toHaveLength(1);
+      expect(calls.artist[0]).toContain("ArtistIds=a1");
+      expect(calls.artist[0]).toContain("Genres=Rock");
+      expect(calls.artist[0]).toContain("Years=1980,");
+    });
+
+    it("should prefix-match a partially typed genre name", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Entertainment"],
+        genreResponse: { Items: [{ Id: "g1", Name: "Some Show", Type: "Movie" }], TotalRecordCount: 1 },
+      });
+
+      const result = await searchVideos("entert");
+
+      expect(calls.genre).toHaveLength(1);
+      expect(calls.genre[0]).toContain("Genres=Entertainment");
+      expect(calls.genre[0]).not.toContain("SearchTerm=");
+      // Title query still carries the typed text unchanged
+      expect(calls.title[0]).toContain("SearchTerm=entert");
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toContain("g1");
+    });
+
+    it("should claim every genre sharing the typed prefix", async () => {
+      const calls = mockSearchFetch({ genres: ["Drama", "Dramedy"] });
+
+      await searchVideos("dram");
+
+      expect(calls.genre).toHaveLength(1);
+      expect(calls.genre[0]).toContain("Genres=Dramedy|Drama");
+    });
+
+    it("should not prefix-match below three typed characters", async () => {
+      const calls = mockSearchFetch({ genres: ["Entertainment"] });
+
+      await searchVideos("en");
+
+      expect(calls.genre).toHaveLength(0);
+      expect(calls.title).toHaveLength(1);
+    });
+
+    it("should prefix-match a partially typed artist name", async () => {
+      const calls = mockSearchFetch({ artists: [{ Id: "a1", Name: "Beyonce" }] });
+
+      await searchVideos("beyo");
+
+      expect(calls.artist).toHaveLength(1);
+      expect(calls.artist[0]).toContain("ArtistIds=a1");
+    });
+
+    it("should prefix-match a multi-word name across words", async () => {
+      const calls = mockSearchFetch({ genres: ["Science Fiction"] });
+
+      await searchVideos("science fic");
+
+      expect(calls.genre).toHaveLength(1);
+      // URLSearchParams encodes the space as "+"
+      expect(calls.genre[0]).toContain("Genres=Science+Fiction");
+      expect(calls.genre[0]).not.toContain("SearchTerm=");
+    });
+
+    it("should fire exactly one /Items request when nothing matches a facet", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Comedy"],
+        artists: [{ Id: "a1", Name: "Queen" }],
+        titleResponse: { Items: [{ Id: "t1", Name: "Kimmy", Type: "Movie" }], TotalRecordCount: 42 },
+      });
+
+      const result = await searchVideos("kimmy");
+
+      expect(calls.title).toHaveLength(1);
+      expect(calls.genre).toHaveLength(0);
+      expect(calls.artist).toHaveLength(0);
+      // The title source alone carries the next page
+      expect(result.next).toEqual({ title: 1 });
+    });
+
+    it("should degrade to title-only search when facet endpoints fail", async () => {
+      let itemsCalls = 0;
+      (global.fetch as jest.Mock).mockImplementation((url: string) => {
+        if (/\/(Genres|MusicGenres|Artists)\?/.test(url)) {
+          return Promise.resolve({ ok: false, status: 500, statusText: "Internal Server Error" });
+        }
+        itemsCalls++;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ Items: [{ Id: "t1", Name: "Kimmy", Type: "Movie" }], TotalRecordCount: 1 }),
+        });
+      });
+
+      const result = await searchVideos("kimmy");
+
+      expect(result.items).toHaveLength(1);
+      expect(result.next).toBeNull();
+      expect(itemsCalls).toBe(1);
+    });
+
+    it("starts each source's next page at the offset that source itself reached", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Comedy"],
+        titleResponse: {
+          Items: [
+            { Id: "t1", Name: "Comedy One", Type: "Movie" },
+            { Id: "t2", Name: "Comedy Two", Type: "Movie" },
+          ],
+          TotalRecordCount: 5,
+        },
+        genreResponse: {
+          Items: [
+            { Id: "t1", Name: "Comedy One", Type: "Movie" },
+            { Id: "g1", Name: "Funny", Type: "Movie" },
+            { Id: "g2", Name: "Funnier", Type: "Movie" },
+          ],
+          TotalRecordCount: 10,
+        },
+      });
+
+      const first = await searchVideos("comedy", { limit: 3 });
+      // Four unique cards from five raw items: the offsets come from the raw pages.
+      expect(first.items).toHaveLength(4);
+      expect(first.next).toEqual({ title: 2, genre: 3 });
+
+      await searchVideos("comedy", { limit: 3, cursor: first.next ?? undefined });
+      expect(calls.title[1]).toContain("StartIndex=2");
+      expect(calls.genre[1]).toContain("StartIndex=3");
+    });
+
+    it("stops asking a source once it is exhausted, and reports no next page when all are", async () => {
+      const calls = mockSearchFetch({
+        genres: ["Comedy"],
+        titleResponse: { Items: [{ Id: "t1", Name: "Comedy One", Type: "Movie" }], TotalRecordCount: 1 },
+        genreResponse: { Items: [{ Id: "g1", Name: "Funny", Type: "Movie" }], TotalRecordCount: 4 },
+      });
+
+      const first = await searchVideos("comedy", { limit: 1 });
+      expect(first.next).toEqual({ genre: 1 });
+
+      const second = await searchVideos("comedy", { limit: 1, cursor: first.next ?? undefined });
+      expect(calls.title).toHaveLength(1);
+      expect(calls.genre).toHaveLength(2);
+      expect(second.next).toEqual({ genre: 2 });
+    });
+
+    it("asks a failed facet again from the same place while another source has pages, and drops it once none does", async () => {
+      const failingGenre = (titleTotal: number) =>
+        (global.fetch as jest.Mock).mockImplementation((rawUrl: string) => {
+          const url = decodeURIComponent(rawUrl);
+          const respond = (body: unknown) => Promise.resolve({ ok: true, json: async () => body });
+          if (url.includes("/MusicGenres?") || url.includes("/Artists?")) return respond({ Items: [] });
+          if (url.includes("/Genres?")) return respond({ Items: [{ Id: "genre-Comedy", Name: "Comedy" }] });
+          if (url.includes("&Genres=")) return Promise.reject(new Error("Network request failed"));
+          return respond({ Items: [{ Id: `t${titleTotal}`, Name: "Comedy One", Type: "Movie" }], TotalRecordCount: titleTotal });
+        });
+
+      failingGenre(5);
+      expect((await searchVideos("comedy", { limit: 1 })).next).toEqual({ title: 1, genre: 0 });
+
+      failingGenre(1);
+      expect((await searchVideos("comedy", { limit: 1, cursor: { genre: 0 } })).next).toBeNull();
+    });
+  });
+
+  describe("chainTerms", () => {
+    it("splits on a plus standing alone, and leaves a plus inside a name", () => {
+      expect(chainTerms("veguitas + animation")).toEqual(["veguitas", "animation"]);
+      expect(chainTerms("  star wars  +  90s + comedy ")).toEqual(["star wars", "90s", "comedy"]);
+      expect(chainTerms("Canal+")).toEqual(["Canal+"]);
+      expect(chainTerms("veguitas+animation")).toEqual(["veguitas+animation"]);
+      expect(chainTerms("c++ + java")).toEqual(["c++", "java"]);
+    });
+
+    it("drops an unfinished chain's plus, empty terms and a repeated term", () => {
+      expect(chainTerms("veguitas +")).toEqual(["veguitas"]);
+      expect(chainTerms("+ veguitas")).toEqual(["veguitas"]);
+      expect(chainTerms("veguitas + + animation")).toEqual(["veguitas", "animation"]);
+      expect(chainTerms("Veguitas + veguitas")).toEqual(["Veguitas"]);
+      expect(chainTerms("+")).toEqual([]);
+    });
+  });
+
+  describe("joinTermResults", () => {
+    const card = (Id: string) => ({ Id, Name: Id, Type: "Movie", Path: "" }) as JellyfinVideoItem;
+    const ids = (lists: string[][]) => joinTermResults(lists.map((list) => list.map(card))).map((item) => item.Id);
+
+    it("takes a card from each term in turn, so a long answer never crowds out a short one", () => {
+      expect(ids([["a1", "a2", "a3", "a4"], ["b1"]])).toEqual(["a1", "b1", "a2", "a3", "a4"]);
+      expect(ids([["a1"], ["b1", "b2"], ["c1"]])).toEqual(["a1", "b1", "c1", "b2"]);
+    });
+
+    it("shows a card several terms found once, where it first comes up", () => {
+      expect(
+        ids([
+          ["a1", "both"],
+          ["both", "b1"],
+        ]),
+      ).toEqual(["a1", "both", "b1"]);
+    });
+
+    it("keeps every card of a term whose partner found nothing", () => {
+      expect(ids([["a1", "a2"], []])).toEqual(["a1", "a2"]);
+      expect(ids([[], []])).toEqual([]);
+    });
+  });
+
+  describe("searchVideos chained terms", () => {
+    const mockSecureStore = require("expo-secure-store");
+    type Page = { Items: any[]; TotalRecordCount?: number };
+
+    beforeEach(async () => {
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    // Answers each /Items search by what it asks: `genre:<Name>` for a Genres request, else its SearchTerm.
+    const serveSearches = (genres: string[], answer: (asked: string, startIndex: number) => Page) => {
+      const asked: string[] = [];
+      (global.fetch as jest.Mock).mockImplementation((rawUrl: string) => {
+        const url = decodeURIComponent(rawUrl);
+        const respond = (body: unknown) => Promise.resolve({ ok: true, json: async () => body });
+        if (url.includes("/MusicGenres?") || url.includes("/Artists?")) return respond({ Items: [] });
+        if (url.includes("/Genres?")) return respond({ Items: genres.map((name) => ({ Id: `genre-${name}`, Name: name })) });
+        const params = new URL(rawUrl).searchParams;
+        const key = params.get("Genres") ? `genre:${params.get("Genres")}` : (params.get("SearchTerm") ?? "");
+        asked.push(`${key}@${params.get("StartIndex")}`);
+        return respond(answer(key, Number(params.get("StartIndex"))));
+      });
+      return asked;
+    };
+    const movie = (id: string, name: string, extra: Partial<JellyfinVideoItem> = {}) => ({ Id: id, Name: name, Type: "Movie", Path: "", ...extra });
+
+    it("yields every card either term finds, each once", async () => {
+      const inSeries = { Id: "e1", Name: "El gallo", Type: "Episode", Path: "", SeriesName: "Veguitas", Genres: ["Animation"] };
+      const asked = serveSearches(["Animation"], (key) => {
+        const named = movie("v1", "Veguitas en la finca", { Genres: ["Animation"] });
+        if (key === "veguitas") return { Items: [named, movie("v2", "Veguitas: el documental", { Genres: ["Documentary"] })], TotalRecordCount: 2 };
+        if (key === "animation") return { Items: [movie("a1", "Animation Reel")], TotalRecordCount: 1 };
+        if (key === "genre:Animation") return { Items: [named, inSeries, movie("x1", "Otro corto", { Genres: ["Animation"] })], TotalRecordCount: 3 };
+        return { Items: [] };
+      });
+
+      const result = await searchVideos("veguitas + animation");
+
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["v1", "a1", "v2", "e1", "x1"]);
+      expect(result.next).toBeNull();
+      // Each term is asked on its own: the server never sees the chain.
+      expect(asked.sort()).toEqual(["animation@0", "genre:Animation@0", "veguitas@0"]);
+    });
+
+    it("keeps a term's cards the other term never names", async () => {
+      serveSearches([], (key) => ({
+        Items: key === "luna" ? [movie("m1", "Luna de miel"), movie("m2", "Luna nueva del mar")] : key === "mar" ? [movie("m2", "Luna nueva del mar"), movie("m3", "Mar adentro")] : [],
+      }));
+
+      const forward = await searchVideos("luna + mar");
+      const backward = await searchVideos("mar + luna");
+
+      expect(forward.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["m1", "m2", "m3"]);
+      expect(backward.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["m2", "m1", "m3"]);
+    });
+
+    it("answers with one term's cards when the other finds nothing", async () => {
+      serveSearches([], (key) => ({ Items: key === "zeta" ? [movie("z1", "Zeta uno"), movie("z2", "Zeta dos")] : [] }));
+
+      const result = await searchVideos("zeta + omega");
+
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["z1", "z2"]);
+    });
+
+    it("asks each term once for a page, with no read-ahead", async () => {
+      const card = (key: string, at: number) => movie(`${key}-${at}`, `${key} ${at}`);
+      const asked = serveSearches([], (key, startIndex) => ({ Items: [card(key, startIndex), card(key, startIndex + 1)], TotalRecordCount: 1000 }));
+
+      const result = await searchVideos("kappa + sigma", { limit: 2 });
+
+      expect(result.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["kappa-0", "sigma-0", "kappa-1", "sigma-1"]);
+      expect(asked.sort()).toEqual(["kappa@0", "sigma@0"]);
+    });
+
+    it("continues each term from its own place, and no further once it is exhausted", async () => {
+      const asked = serveSearches([], (key, startIndex) => {
+        if (key === "rio") return { Items: [movie(`r${startIndex}`, `Rio bravo ${startIndex}`)], TotalRecordCount: 3 };
+        return { Items: [movie("b0", "Bravo solo")], TotalRecordCount: 1 };
+      });
+
+      const first = await searchVideos("rio + bravo", { limit: 1 });
+      expect(first.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["r0", "b0"]);
+      expect(first.next).toEqual({ chain: [{ title: 1 }, null] });
+
+      asked.length = 0;
+      const second = await searchVideos("rio + bravo", { limit: 1, cursor: first.next ?? undefined });
+      expect(asked).toEqual(["rio@1"]);
+      expect(second.items.map((item: JellyfinVideoItem) => item.Id)).toEqual(["r1"]);
+      expect(second.next).toEqual({ chain: [{ title: 2 }, null] });
+    });
+
+    it("searches an unfinished chain as its one term", async () => {
+      const asked = serveSearches([], () => ({ Items: [movie("d1", "Delta")], TotalRecordCount: 1 }));
+
+      const result = await searchVideos("delta +");
+
+      expect(asked).toEqual(["delta@0"]);
+      expect(result.items).toHaveLength(1);
+    });
+  });
+
+  describe("nextOffset", () => {
+    it("advances by the raw page while the server reports more", () => {
+      expect(nextOffset(0, { items: [1, 2], total: 5 }, 2)).toBe(2);
+      expect(nextOffset(4, { items: [1], total: 5 }, 2)).toBeUndefined();
+    });
+
+    it("falls back to a full page meaning more when the server omits its count", () => {
+      expect(nextOffset(0, { items: [1, 2] }, 2)).toBe(2);
+      expect(nextOffset(2, { items: [1] }, 2)).toBeUndefined();
+    });
+
+    it("treats a source never asked, or an empty page, as exhausted", () => {
+      expect(nextOffset(undefined, { items: [1] }, 1)).toBeUndefined();
+      expect(nextOffset(0, undefined, 1)).toBeUndefined();
+      expect(nextOffset(0, { items: [], total: 9 }, 1)).toBeUndefined();
+    });
+  });
+
+  describe("fetchPlaylistContents", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      // Mock fetch globally
+      global.fetch = jest.fn();
+
+      // Mock SecureStore to return valid config
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("should fetch playlist contents successfully", async () => {
+      const mockResponse = {
+        Items: [
+          { Id: "1", Name: "Video 1", Type: "Movie" },
+          { Id: "2", Name: "Video 2", Type: "Episode" },
+        ],
+        TotalRecordCount: 2,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await fetchPlaylistContents("playlist-123");
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining("/Playlists/playlist-123/Items"),
+        expect.objectContaining({
+          method: "GET",
+          headers: expect.objectContaining({
+            Accept: "application/json",
+            Authorization: 'MediaBrowser Client="TomoTV", Device="iOS", DeviceId="test-device-id", Version="9.9.9", Token="test-api-key"',
+          }),
+        }),
+      );
+      expect(result.items).toHaveLength(2);
+      expect(result.total).toBe(2);
+    });
+
+    it("should call API with correct pagination parameters", async () => {
+      const mockResponse = {
+        Items: [{ Id: "1", Name: "Video 1", Type: "Movie" }],
+        TotalRecordCount: 100,
+        StartIndex: 20,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await fetchPlaylistContents("playlist-456", { limit: 30, startIndex: 20 });
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("Limit=30"), expect.any(Object));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("StartIndex=20"), expect.any(Object));
+      expect(result.items).toHaveLength(1);
+      expect(result.total).toBe(100);
+    });
+
+    it("should use default pagination values when not specified", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      await fetchPlaylistContents("playlist-789");
+
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("Limit=60"), expect.any(Object));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining("StartIndex=0"), expect.any(Object));
+    });
+
+    it("should handle response without TotalRecordCount", async () => {
+      const mockResponse = {
+        Items: [{ Id: "1", Name: "Video 1", Type: "Movie" }],
+        StartIndex: 0,
+        // TotalRecordCount is optional in the API
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await fetchPlaylistContents("playlist-abc");
+
+      expect(result.items).toHaveLength(1);
+      expect(result.total).toBeUndefined();
+    });
+
+    it("should handle empty playlist", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      const result = await fetchPlaylistContents("empty-playlist");
+
+      expect(result.items).toEqual([]);
+      expect(result.total).toBe(0);
+    });
+
+    it("should throw error when server is not configured", async () => {
+      mockSecureStore.getItemAsync.mockResolvedValue(null);
+      await refreshConfig();
+
+      await expect(fetchPlaylistContents("playlist-123")).rejects.toThrow("Jellyfin server not configured.");
+    });
+
+    it("should throw error on HTTP error response", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+      });
+
+      await expect(fetchPlaylistContents("nonexistent-playlist")).rejects.toThrow("Failed to fetch playlist contents: 404");
+    });
+
+    it("should throw error on network failure", async () => {
+      (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("Network error"));
+
+      await expect(fetchPlaylistContents("playlist-123")).rejects.toThrow();
+    });
+
+    it("should retry on network failure", async () => {
+      // First attempt fails with network error (retryable), second succeeds
+      (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("Network request failed")).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          Items: [{ Id: "1", Name: "Video 1", Type: "Movie" }],
+          TotalRecordCount: 1,
+          StartIndex: 0,
+        }),
+      });
+
+      const result = await fetchPlaylistContents("playlist-retry");
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(result.items).toHaveLength(1);
+    });
+
+    it("should fail after max retry attempts", async () => {
+      // All attempts fail with network error (retryable)
+      (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("Network error")).mockRejectedValueOnce(new Error("Network error")).mockRejectedValueOnce(new Error("Network error"));
+
+      await expect(fetchPlaylistContents("playlist-fail")).rejects.toThrow("Network error");
+      expect(global.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("asks for MediaSources when a playlist is listed for download", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) });
+
+      await fetchPlaylistDownloadables("playlist-download");
+
+      const url = new URL((global.fetch as jest.Mock).mock.calls[0][0]);
+      expect(url.pathname).toBe("/Playlists/playlist-download/Items");
+      expect(url.searchParams.get("Fields")?.split(",")).toContain("MediaSources");
+    });
+
+    it("should include correct query parameters", async () => {
+      const mockResponse = {
+        Items: [],
+        TotalRecordCount: 0,
+        StartIndex: 0,
+      };
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockResponse,
+      });
+
+      await fetchPlaylistContents("playlist-xyz", { limit: 10, startIndex: 5 });
+
+      const callUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(callUrl).toContain("userId=test-user-id");
+      expect(callUrl).toContain("StartIndex=5");
+      expect(callUrl).toContain("Limit=10");
+      // Fields parameter is URL-encoded
+      expect(decodeURIComponent(callUrl)).toContain("Fields=Path,MediaStreams,Genres,ChildCount,RecursiveItemCount,ParentId,ImageTags,PrimaryImageAspectRatio");
+    });
+
+    it("should not retry on HTTP error responses", async () => {
+      // HTTP errors are not retryable, so fetch should only be called once
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+      });
+
+      await expect(fetchPlaylistContents("playlist-404")).rejects.toThrow("Failed to fetch playlist contents: 404");
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("signs out and reports an expired session when the server returns 401", async () => {
+      const mockSecureStore = require("expo-secure-store");
+      const authChanged = jest.fn();
+      const unsubscribe = subscribeAuthChange(authChanged);
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+      });
+
+      await expect(fetchPlaylistContents("playlist-expired")).rejects.toThrow("Session expired. Please sign in again.");
+
+      // The sign-out runs fire-and-forget; flush it before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_api_key");
+      expect(authChanged).toHaveBeenCalled();
+      unsubscribe();
+    });
+  });
+
+  describe("request caching", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("serves a repeated identical read from cache without a second request", async () => {
+      // Only one fetch is queued: a second network call would resolve to undefined and throw,
+      // so the read succeeding twice proves the second came from cache.
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [{ Id: "1", Name: "V", Type: "Movie" }], TotalRecordCount: 1 }),
+      });
+
+      const first = await fetchPlaylistContents("pl-cache");
+      const second = await fetchPlaylistContents("pl-cache");
+
+      expect(first.items).toHaveLength(1);
+      expect(second.items).toHaveLength(1);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("refetches a folder listing after a favorite toggle invalidates the cache", async () => {
+      const folderPage = () => ({
+        ok: true,
+        json: async () => ({ Items: [{ Id: "a", Name: "A", Type: "Movie" }], TotalRecordCount: 1 }),
+      });
+      (global.fetch as jest.Mock)
+        .mockResolvedValueOnce(folderPage()) // initial folder fetch
+        .mockResolvedValueOnce({ ok: true, json: async () => ({}) }) // favorite POST
+        .mockResolvedValueOnce(folderPage()); // folder refetch after invalidation
+
+      await fetchFolderContents("folder-1");
+      await fetchFolderContents("folder-1"); // served from cache — no new request
+      await setVideoFavorite("a", true); // invalidates cached folder reads
+      await fetchFolderContents("folder-1"); // cache dropped — refetches
+
+      const folderCalls = (global.fetch as jest.Mock).mock.calls.filter((call) => String(call[0]).includes("ParentId=folder-1"));
+      expect(folderCalls).toHaveLength(2);
+    });
+  });
+
+  describe("Demo Server Functions", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      global.fetch = jest.fn();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    describe("connectToDemoServer", () => {
+      it("should connect successfully with valid credentials", async () => {
+        // Mock successful authentication
+        (global.fetch as jest.Mock)
+          .mockResolvedValueOnce({
+            ok: true,
+            headers: new Headers({ "content-type": "application/json" }),
+            json: async () => ({
+              AccessToken: "demo-api-key-123",
+              User: { Id: "demo-user-id-456" },
+            }),
+          })
+          // Mock successful validation call
+          .mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({ Items: [] }),
+          });
+
+        // Mock SecureStore operations
+        mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "jellyfin_server_url") return Promise.resolve("https://tomotv.cubita.studio");
+          if (key === "jellyfin_api_key") return Promise.resolve("demo-api-key-123");
+          if (key === "jellyfin_user_id") return Promise.resolve("demo-user-id-456");
+          return Promise.resolve(null);
+        });
+
+        await connectToDemoServer();
+
+        // Verify authentication call
+        expect(global.fetch).toHaveBeenCalledWith(
+          "https://tomotv.cubita.studio/Users/AuthenticateByName",
+          expect.objectContaining({
+            method: "POST",
+            headers: expect.objectContaining({
+              "Content-Type": "application/json",
+            }),
+            body: expect.stringContaining('"Username":"demo"'),
+          }),
+        );
+
+        // Verify credentials were saved (3 credentials + demo flag)
+        expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_server_url", "https://tomotv.cubita.studio");
+        expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_api_key", "demo-api-key-123");
+        expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_user_id", "demo-user-id-456");
+        expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_is_demo_mode", "true");
+
+        // A demo connect measures the link like every other sign-in
+        expect(jest.requireMock("@/services/jellyfin/bitrateTest").warmBitrateMemory).toHaveBeenCalled();
+
+        // Note: Cache clearing is wrapped in try-catch and uses dynamic imports,
+        // so we don't assert on it in unit tests
+      });
+
+      it("should handle network timeout during authentication", async () => {
+        // Mock timeout error
+        (global.fetch as jest.Mock).mockImplementation(() => {
+          return new Promise((_, reject) => {
+            const error = new Error("Aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo server connection timed out");
+      });
+
+      it("should handle demo server unavailable (503)", async () => {
+        // Mock 503 for stable server (2 retry attempts)
+        (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: false, status: 503 }).mockResolvedValueOnce({ ok: false, status: 503 });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo server is temporarily unavailable");
+      });
+
+      it("should handle demo server error (502)", async () => {
+        // Mock 502 for stable server (2 retry attempts)
+        (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: false, status: 502 }).mockResolvedValueOnce({ ok: false, status: 502 });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo server is temporarily unavailable");
+      });
+
+      it("should handle invalid credentials (401)", async () => {
+        // Mock 401 for stable server (no retry on 401)
+        (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: false, status: 401 });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo credentials are invalid");
+      });
+
+      it("should handle invalid response format (non-JSON)", async () => {
+        // Mock invalid response for stable server (no retry on invalid response)
+        (global.fetch as jest.Mock).mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ "content-type": "text/html" }),
+          json: async () => {
+            throw new Error("Invalid JSON");
+          },
+        });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo server returned invalid response format");
+      });
+
+      it("should handle missing credentials in response", async () => {
+        // Mock missing credentials for stable server (no retry)
+        (global.fetch as jest.Mock).mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ "content-type": "application/json" }),
+          json: async () => ({
+            // Missing AccessToken and User.Id
+          }),
+        });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Invalid demo server response: missing credentials");
+      });
+
+      it("should rollback credentials on save failure", async () => {
+        (global.fetch as jest.Mock).mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ "content-type": "application/json" }),
+          json: async () => ({
+            AccessToken: "demo-api-key-123",
+            User: { Id: "demo-user-id-456" },
+          }),
+        });
+
+        // Mock save success but verification failure
+        mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+        mockSecureStore.getItemAsync.mockResolvedValue(null); // Verification fails
+
+        await expect(connectToDemoServer()).rejects.toThrow("Failed to save demo credentials");
+
+        // Verify rollback was attempted
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_url");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_api_key");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_user_id");
+      });
+
+      it("should rollback credentials on validation failure", async () => {
+        (global.fetch as jest.Mock)
+          .mockResolvedValueOnce({
+            ok: true,
+            headers: new Headers({ "content-type": "application/json" }),
+            json: async () => ({
+              AccessToken: "demo-api-key-123",
+              User: { Id: "demo-user-id-456" },
+            }),
+          })
+          // Mock validation failure
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 401,
+          });
+
+        mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "jellyfin_server_url") return Promise.resolve("https://tomotv.cubita.studio");
+          if (key === "jellyfin_api_key") return Promise.resolve("demo-api-key-123");
+          if (key === "jellyfin_user_id") return Promise.resolve("demo-user-id-456");
+          return Promise.resolve(null);
+        });
+
+        await expect(connectToDemoServer()).rejects.toThrow("Demo credentials are invalid");
+
+        // Verify rollback
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_url");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_api_key");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_user_id");
+      });
+
+      it("should retry on network failure", async () => {
+        // First attempt fails, second succeeds
+        (global.fetch as jest.Mock)
+          .mockRejectedValueOnce(new Error("Network error"))
+          .mockResolvedValueOnce({
+            ok: true,
+            headers: new Headers({ "content-type": "application/json" }),
+            json: async () => ({
+              AccessToken: "demo-api-key-123",
+              User: { Id: "demo-user-id-456" },
+            }),
+          })
+          .mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({ Items: [] }),
+          });
+
+        mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "jellyfin_server_url") return Promise.resolve("https://tomotv.cubita.studio");
+          if (key === "jellyfin_api_key") return Promise.resolve("demo-api-key-123");
+          if (key === "jellyfin_user_id") return Promise.resolve("demo-user-id-456");
+          return Promise.resolve(null);
+        });
+
+        await connectToDemoServer();
+
+        // Verify retry occurred (2 auth calls + 1 validation = 3; the server
+        // name is a fixed constant now, no /System/Info/Public fetch)
+        expect(global.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it("should fail after max retry attempts", async () => {
+        // All attempts fail for stable server (2 retry attempts)
+        (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("Network error")).mockRejectedValueOnce(new Error("Network error"));
+
+        await expect(connectToDemoServer()).rejects.toThrow();
+
+        // Verify max retries (2 attempts for stable server)
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it("should not mark demo mode active before validation succeeds", async () => {
+        (global.fetch as jest.Mock)
+          .mockResolvedValueOnce({
+            ok: true,
+            headers: new Headers({ "content-type": "application/json" }),
+            json: async () => ({
+              AccessToken: "demo-api-key-123",
+              User: { Id: "demo-user-id-456" },
+            }),
+          })
+          .mockResolvedValueOnce({
+            ok: false,
+            status: 401,
+          });
+
+        mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "jellyfin_server_url") return Promise.resolve("https://tomotv.cubita.studio");
+          if (key === "jellyfin_api_key") return Promise.resolve("demo-api-key-123");
+          if (key === "jellyfin_user_id") return Promise.resolve("demo-user-id-456");
+          return Promise.resolve(null);
+        });
+
+        await expect(connectToDemoServer()).rejects.toThrow();
+
+        // Verify demo mode flag was never set
+        const demoModeCalls = (mockSecureStore.setItemAsync as jest.Mock).mock.calls.filter((call) => call[0] === "jellyfin_is_demo_mode");
+        expect(demoModeCalls).toHaveLength(0);
+      });
+    });
+
+    describe("isDemoMode", () => {
+      it("should return true when demo mode is active", async () => {
+        mockSecureStore.getItemAsync.mockResolvedValue("true");
+
+        const result = await isDemoMode();
+
+        expect(result).toBe(true);
+        expect(mockSecureStore.getItemAsync).toHaveBeenCalledWith("jellyfin_is_demo_mode");
+      });
+
+      it("should return false when demo mode is inactive", async () => {
+        mockSecureStore.getItemAsync.mockResolvedValue(null);
+
+        const result = await isDemoMode();
+
+        expect(result).toBe(false);
+      });
+
+      it("should return false when demo mode flag is not 'true'", async () => {
+        mockSecureStore.getItemAsync.mockResolvedValue("false");
+
+        const result = await isDemoMode();
+
+        expect(result).toBe(false);
+      });
+
+      it("should return false on error", async () => {
+        mockSecureStore.getItemAsync.mockRejectedValue(new Error("Storage error"));
+
+        const result = await isDemoMode();
+
+        expect(result).toBe(false);
+      });
+    });
+
+    describe("disconnectFromDemo", () => {
+      beforeEach(() => {
+        // Mock getItemAsync for refreshConfig/getConfig calls
+        mockSecureStore.getItemAsync.mockImplementation(async () => {
+          // Return null for all keys to simulate cleared state
+          return null;
+        });
+      });
+
+      it("should clear all credentials and demo flag", async () => {
+        mockSecureStore.deleteItemAsync.mockResolvedValue(undefined);
+
+        await disconnectFromDemo();
+
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_url");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_api_key");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_user_id");
+        expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_is_demo_mode");
+      });
+
+      it("should complete successfully", async () => {
+        mockSecureStore.deleteItemAsync.mockResolvedValue(undefined);
+
+        // Should complete without throwing
+        await expect(disconnectFromDemo()).resolves.toBeUndefined();
+      });
+
+      it("should throw error on SecureStore failure", async () => {
+        mockSecureStore.deleteItemAsync.mockRejectedValue(new Error("Delete failed"));
+
+        await expect(disconnectFromDemo()).rejects.toThrow("Failed to disconnect from demo server");
+      });
+    });
+  });
+
+  describe("URL generation", () => {
+    const mockSecureStore = require("expo-secure-store");
+    const mockConfig = {
+      jellyfin_server_url: "http://192.168.1.100:8096",
+      jellyfin_api_key: "test-api-key",
+      jellyfin_user_id: "test-user-id",
+    };
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null));
+      // Need to call refreshConfig to populate cachedConfig
+      await refreshConfig();
+    });
+
+    describe("getVideoStreamUrl", () => {
+      it("should generate direct play URL with Static=true and MediaSourceId", () => {
+        const url = getVideoStreamUrl("video123");
+
+        expect(url).toBe("http://192.168.1.100:8096/Videos/video123/stream?Static=true&MediaSourceId=video123&ApiKey=test-api-key");
+        expect(url).toContain("/Videos/video123/stream");
+        expect(url).toContain("Static=true");
+        expect(url).toContain("ApiKey=test-api-key");
+      });
+
+      it("should use MediaSourceId from videoItem when provided", () => {
+        const videoItem = {
+          Id: "video123",
+          Name: "Test",
+          MediaSources: [{ Id: "media-source-456" }],
+        } as any;
+        const url = getVideoStreamUrl("video123", videoItem);
+
+        expect(url).toContain("MediaSourceId=media-source-456");
+      });
+
+      it("should handle HTTPS server URLs", async () => {
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "jellyfin_server_url") return Promise.resolve("https://jellyfin.example.com");
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = getVideoStreamUrl("video123");
+
+        expect(url).toContain("https://jellyfin.example.com");
+        expect(url).toContain("/Videos/video123/stream");
+      });
+    });
+
+    describe("getConvertedDownloadUrl", () => {
+      const rung = { label: "480p", bitrate: 1500000, width: 854, height: 480 };
+      const item = { Id: "video123", MediaSources: [{ Id: "ms-1" }] } as never;
+
+      // Jellyfin names the output from media path, device and play session only.
+      it("carries its own play session, so it is never handed another conversion's file", () => {
+        const url = getConvertedDownloadUrl("video123", item, rung, 2, { playSessionId: "ps-1" });
+        expect(url).toContain("&PlaySessionId=ps-1");
+        expect(url).toContain("&AudioStreamIndex=2&VideoBitrate=1500000");
+        expect(url).not.toContain("SubtitleMethod");
+      });
+
+      it("asks the server to burn a DVB track into the picture", () => {
+        const url = getConvertedDownloadUrl("video123", item, rung, undefined, { playSessionId: "ps-2", burnSubtitleIndex: 3 });
+        expect(url).toContain("&SubtitleMethod=Encode&SubtitleStreamIndex=3");
+      });
+    });
+
+    describe("getTranscodingStreamUrl", () => {
+      it("should generate HLS master.m3u8 URL with quality settings", async () => {
+        // Mock quality settings - use index 3 for 1080p
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "app_video_quality") return Promise.resolve("3"); // 1080p index
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).toContain("/Videos/video123/master.m3u8");
+        expect(url).toContain("VideoCodec=h264,hevc");
+        expect(url).toContain("AudioCodec=aac");
+        expect(url).toContain("MaxWidth=1920");
+        expect(url).toContain("MaxHeight=1080");
+        expect(url).toContain("VideoBitrate=8000000");
+        expect(url).toContain("VideoLevel=41");
+        expect(url).toContain("SegmentContainer=mp4");
+        expect(url).toContain("EnableAutoStreamCopy=true");
+        expect(url).toContain("AllowVideoStreamCopy=true");
+        expect(url).not.toContain("RequireAvc");
+        expect(url).toContain("ApiKey=test-api-key");
+      });
+
+      it("should omit caps and allow surround stream copy on Original preset", async () => {
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "app_video_quality") return Promise.resolve("5"); // Original index
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).toContain("VideoBitrate=120000000");
+        expect(url).not.toContain("MaxWidth");
+        expect(url).not.toContain("MaxHeight");
+        expect(url).not.toContain("VideoLevel");
+        expect(url).toContain("AudioCodec=aac,ac3,eac3");
+        expect(url).toContain("TranscodingMaxAudioChannels=6");
+        expect(url).toContain("EnableAutoStreamCopy=true");
+        expect(url).toContain("AllowVideoStreamCopy=true");
+      });
+
+      describe("HEVC is offered only where the device decodes it", () => {
+        const hevc10 = { Id: "video123", Name: "Robin Hood", MediaStreams: [{ Type: "Video", Codec: "hevc", BitDepth: 10 }] } as any;
+        const hevc8 = { Id: "video123", Name: "Ep", MediaStreams: [{ Type: "Video", Codec: "hevc", BitDepth: 8 }] } as any;
+        const call = (item: any, device: any) => getTranscodingStreamUrl("video123", item, undefined, undefined, undefined, undefined, undefined, device);
+
+        it("an Apple TV HD, which decodes no HEVC, asks for h264 only", async () => {
+          const url = await call(hevc10, { hevc: false, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null });
+          expect(url).toContain("VideoCodec=h264&");
+          expect(url).not.toContain("hevc");
+        });
+
+        it("a device that decodes Main but not Main 10 asks for h264 only on a 10-bit source", async () => {
+          const url = await call(hevc10, { hevc: true, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null });
+          expect(url).toContain("VideoCodec=h264&");
+        });
+
+        it("the same device keeps hevc for an 8-bit source", async () => {
+          const url = await call(hevc8, { hevc: true, hevcMain10: false, av1: false, h264MaxHeight: null, hevcMaxHeight: null });
+          expect(url).toContain("VideoCodec=h264,hevc");
+        });
+
+        it("no device answer keeps the registry's yes", async () => {
+          const url = await call(hevc10, null);
+          expect(url).toContain("VideoCodec=h264,hevc");
+        });
+
+        describe("an HDR source keeps its range on the server", () => {
+          const hdr10 = { Id: "video123", Name: "Dune", MediaStreams: [{ Type: "Video", Codec: "hevc", BitDepth: 10, VideoRangeType: "HDR10" }] } as any;
+          const dovi = { Id: "video123", Name: "Dune", MediaStreams: [{ Type: "Video", Codec: "hevc", BitDepth: 10, VideoRangeType: "DOVIWithEL" }] } as any;
+          const subtitled = { ...hdr10, MediaStreams: [...hdr10.MediaStreams, { Type: "Subtitle", Index: 2, Codec: "subrip" }] } as any;
+          const main10 = { hevc: true, hevcMain10: true, av1: false, h264MaxHeight: 2160, hevcMaxHeight: 2160 };
+          const noHevc = { hevc: false, hevcMain10: false, av1: false, h264MaxHeight: 1080, hevcMaxHeight: null };
+
+          it("is asked for as hevc alone on a Main 10 decoder, so the server cannot answer H.264 with the PQ tags kept", async () => {
+            expect(await call(hdr10, main10)).toContain("VideoCodec=hevc&");
+            expect(await call(dovi, main10)).toContain("VideoCodec=hevc&");
+            expect(serverVideoCodecs(hdr10, main10)).toBe("hevc");
+          });
+
+          it("is asked for as h264 where the device decodes no HEVC, and the shim retags the answer", async () => {
+            expect(await call(hdr10, noHevc)).toContain("VideoCodec=h264&");
+            expect(sourceIsHdr(hdr10)).toBe(true);
+          });
+
+          it("keeps hevc on a subtitled source: subtitles inside the file never ride the server", async () => {
+            expect(await call(subtitled, main10)).toContain("VideoCodec=hevc&");
+            expect(serverVideoCodecs(subtitled, main10)).toBe("hevc");
+            expect(sourceIsHdr(subtitled)).toBe(true);
+          });
+
+          it("an SDR source is offered both as before", async () => {
+            expect(await call(hevc10, main10)).toContain("VideoCodec=h264,hevc");
+            expect(sourceIsHdr(hevc10)).toBe(false);
+            expect(sourceIsHdr(null)).toBe(false);
+          });
+        });
+
+        describe("a frame taller than the hardware decoder opens is scaled by the server", () => {
+          const uhd = (Codec: string) => ({ Id: "video123", Name: "UHD", MediaStreams: [{ Type: "Video", Codec, BitDepth: 8, Width: 3840, Height: 2160 }] }) as any;
+          const decoder = (max: number | null) => ({ hevc: true, hevcMain10: true, av1: false, h264MaxHeight: max, hevcMaxHeight: max });
+
+          beforeEach(async () => {
+            mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+              if (key === "app_video_quality") return Promise.resolve("5"); // Original index
+              return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+            });
+            await refreshConfig();
+          });
+
+          it("a 4K H.264 source on a 1080p decoder is capped on the Original preset", async () => {
+            const url = await call(uhd("h264"), decoder(1080));
+            expect(url).toContain("MaxWidth=1920&MaxHeight=1080");
+            expect(url).not.toContain("VideoLevel");
+          });
+
+          it("the same source on a 4K decoder stays uncapped", async () => {
+            const url = await call(uhd("h264"), decoder(2160));
+            expect(url).not.toContain("MaxWidth");
+          });
+
+          it("a 4K HEVC source on a 1080p decoder is asked for as h264 at 1080p", async () => {
+            const url = await call(uhd("hevc"), decoder(1080));
+            expect(url).toContain("VideoCodec=h264&");
+            expect(url).toContain("MaxHeight=1080");
+          });
+
+          it("no answer leaves Original alone", async () => {
+            const url = await call(uhd("h264"), decoder(null));
+            expect(url).not.toContain("MaxWidth");
+          });
+        });
+      });
+
+      it("should generate 4K transcoding URL with level 5.1", async () => {
+        // Mock quality settings - use index 4 for 4K
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "app_video_quality") return Promise.resolve("4"); // 4K index
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).toContain("MaxWidth=3840");
+        expect(url).toContain("MaxHeight=2160");
+        expect(url).toContain("VideoBitrate=20000000");
+        expect(url).toContain("VideoLevel=51");
+      });
+
+      it("should fallback to Original defaults for out-of-bounds quality index", async () => {
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "app_video_quality") return Promise.resolve("99"); // Out of bounds
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).toContain("VideoBitrate=120000000");
+        expect(url).not.toContain("MaxWidth");
+        expect(url).not.toContain("MaxHeight");
+        expect(url).not.toContain("VideoLevel");
+      });
+
+      it("should fallback to Original defaults for corrupted quality value", async () => {
+        mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+          if (key === "app_video_quality") return Promise.resolve("abc"); // NaN after parseInt
+          return Promise.resolve(mockConfig[key as keyof typeof mockConfig] || null);
+        });
+
+        await refreshConfig();
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).toContain("VideoBitrate=120000000");
+        expect(url).not.toContain("MaxWidth");
+        expect(url).not.toContain("MaxHeight");
+        expect(url).not.toContain("VideoLevel");
+      });
+
+      it("should use MediaSourceId from videoItem when available", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaSources: [{ Id: "source-456" }],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem);
+
+        expect(url).toContain("MediaSourceId=source-456");
+      });
+
+      // Jellyfin answers any embedded-subtitle request by extracting every track from the whole
+      // file, uncancellable (its issue #17499), so the server lane carries no subtitle renditions.
+      it("asks the server for no subtitle renditions, whatever the file carries", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", IsExternal: true, Index: 2, Language: "eng" },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "spa" },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem);
+
+        expect(url).not.toContain("SubtitleMethod");
+        expect(url).not.toContain("SubtitleStreamIndex=");
+        expect(url).toContain("SegmentContainer=mp4");
+        expect(url).toContain("VideoCodec=h264,hevc");
+      });
+
+      it("should not add subtitle params when no external subtitles", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Audio", Codec: "aac", Index: 1 },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem);
+
+        expect(url).not.toContain("SubtitleStreamIndex");
+        expect(url).not.toContain("SubtitleMethod");
+        // No WebVTT renditions, so fMP4 and the HEVC-capable target stay
+        expect(url).toContain("SegmentContainer=mp4");
+        expect(url).toContain("VideoCodec=h264,hevc");
+      });
+
+      it("should append StartTimeTicks when provided", async () => {
+        const url = await getTranscodingStreamUrl("video123", null, undefined, 3000000000);
+
+        expect(url).toContain("StartTimeTicks=3000000000");
+      });
+
+      it("should omit StartTimeTicks when not provided", async () => {
+        const url = await getTranscodingStreamUrl("video123");
+
+        expect(url).not.toContain("StartTimeTicks");
+      });
+
+      it("should omit StartTimeTicks when 0", async () => {
+        const url = await getTranscodingStreamUrl("video123", null, undefined, 0);
+
+        expect(url).not.toContain("StartTimeTicks");
+      });
+
+      it("should use SubtitleMethod=Encode with SubtitleStreamIndex when burn-in index provided", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", IsExternal: false, Index: 2, Language: "eng" },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem, undefined, undefined, 2);
+
+        expect(url).toContain("SubtitleStreamIndex=2");
+        expect(url).toContain("SubtitleMethod=Encode");
+        expect(url).not.toContain("SubtitleMethod=Hls");
+        // Burn-in renders subtitles into the frames, so the video must re-encode
+        expect(url).toContain("AllowVideoStreamCopy=false");
+        // Burned-in subs have no VTT timeline to align, so fMP4 stays
+        expect(url).toContain("SegmentContainer=mp4");
+        expect(url).toContain("VideoCodec=h264,hevc");
+      });
+
+      it("should keep fMP4 for image-only subtitles even without a burn-in index", async () => {
+        // Image subs never materialize as WebVTT renditions, so there is no
+        // timestamp map to align; the container choice must key on TEXT subs,
+        // not on the caller having selected a burn-in stream.
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", IsExternal: false, Index: 2, Language: "eng" },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem);
+
+        expect(url).toContain("SegmentContainer=mp4");
+        expect(url).toContain("VideoCodec=h264,hevc");
+      });
+
+      it("sets no subtitle method when no burn-in index is provided", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "subrip", IsExternal: true, Index: 2, Language: "eng" },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem);
+
+        expect(url).not.toContain("SubtitleMethod");
+        expect(url).not.toContain("SubtitleStreamIndex=");
+        expect(url).toContain("SegmentContainer=mp4");
+      });
+
+      it("should combine burn-in with AudioStreamIndex and StartTimeTicks", async () => {
+        const videoItem: any = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", IsExternal: false, Index: 3, Language: "eng" },
+          ],
+        };
+
+        const url = await getTranscodingStreamUrl("video123", videoItem, 1, 3000000000, 3);
+
+        expect(url).toContain("SubtitleStreamIndex=3");
+        expect(url).toContain("SubtitleMethod=Encode");
+        expect(url).toContain("AudioStreamIndex=1");
+        expect(url).toContain("StartTimeTicks=3000000000");
+      });
+    });
+
+    describe("getTextSubtitleStreams", () => {
+      it("should return empty array when no MediaStreams", () => {
+        const videoItem = { MediaStreams: undefined } as any;
+        expect(getTextSubtitleStreams(videoItem)).toEqual([]);
+      });
+
+      it("should return empty array when videoItem is null", () => {
+        expect(getTextSubtitleStreams(null)).toEqual([]);
+      });
+
+      it("should return external AND embedded text subtitle streams", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264" },
+            { Type: "Subtitle", Codec: "subrip", IsExternal: true, Index: 0, Language: "eng", DisplayTitle: "English" },
+            { Type: "Subtitle", Codec: "subrip", IsExternal: true, Index: 1, Language: "spa", DisplayTitle: "Spanish" },
+            { Type: "Subtitle", Codec: "mov_text", IsExternal: false, Index: 2, Language: "fra" },
+          ],
+        } as any;
+
+        // Embedded text tracks count too: keying on IsExternal alone left an MP4
+        // carrying one on direct play with nothing on screen.
+        expect(getTextSubtitleStreams(videoItem).map((s) => s.Index)).toEqual([0, 1, 2]);
+      });
+
+      it("should drop image-based streams, which can only burn in", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264" },
+            { Type: "Subtitle", Codec: "subrip", IsExternal: true, Index: 0, Language: "eng" },
+            { Type: "Subtitle", Codec: "pgssub", IsExternal: false, Index: 1, Language: "eng" },
+            { Type: "Subtitle", Codec: "dvdsub", IsExternal: false, Index: 2, Language: "eng" },
+          ],
+        } as any;
+
+        expect(getTextSubtitleStreams(videoItem).map((s) => s.Index)).toEqual([0]);
+      });
+    });
+
+    describe("isImageBasedSubtitleCodec", () => {
+      it("should detect image-based subtitle codecs", () => {
+        expect(isImageBasedSubtitleCodec("pgssub")).toBe(true);
+        expect(isImageBasedSubtitleCodec("PGSSUB")).toBe(true);
+        expect(isImageBasedSubtitleCodec("hdmv_pgs_subtitle")).toBe(true);
+        expect(isImageBasedSubtitleCodec("dvdsub")).toBe(true);
+        expect(isImageBasedSubtitleCodec("dvd_subtitle")).toBe(true);
+        expect(isImageBasedSubtitleCodec("vobsub")).toBe(true);
+        expect(isImageBasedSubtitleCodec("dvbsub")).toBe(true);
+        expect(isImageBasedSubtitleCodec("dvb_subtitle")).toBe(true);
+        expect(isImageBasedSubtitleCodec("dvb_teletext")).toBe(true);
+        expect(isImageBasedSubtitleCodec("xsub")).toBe(true);
+        expect(isImageBasedSubtitleCodec("sup")).toBe(true);
+        expect(isImageBasedSubtitleCodec("sub")).toBe(true);
+      });
+
+      it("should not flag text-based subtitle codecs", () => {
+        expect(isImageBasedSubtitleCodec("srt")).toBe(false);
+        expect(isImageBasedSubtitleCodec("subrip")).toBe(false);
+        expect(isImageBasedSubtitleCodec("ass")).toBe(false);
+        expect(isImageBasedSubtitleCodec("ssa")).toBe(false);
+        expect(isImageBasedSubtitleCodec("webvtt")).toBe(false);
+        expect(isImageBasedSubtitleCodec("vtt")).toBe(false);
+        expect(isImageBasedSubtitleCodec("mov_text")).toBe(false);
+        expect(isImageBasedSubtitleCodec("microdvd")).toBe(false);
+      });
+
+      it("should return false for missing codec", () => {
+        expect(isImageBasedSubtitleCodec(undefined)).toBe(false);
+        expect(isImageBasedSubtitleCodec("")).toBe(false);
+      });
+    });
+
+    describe("getBurnInSubtitleStream", () => {
+      it("should return null when videoItem is null or has no MediaStreams", () => {
+        expect(getBurnInSubtitleStream(null)).toBeNull();
+        expect(getBurnInSubtitleStream({ MediaStreams: undefined } as any)).toBeNull();
+      });
+
+      it("should return null when there are no subtitle streams", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Audio", Codec: "aac", Index: 1 },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("should return null when any subtitle stream is text-based", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", Index: 2, Language: "eng" },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "eng" },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("should return the only image-based subtitle stream", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", Index: 2, Language: "eng" },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toMatchObject({ Index: 2, Codec: "pgssub" });
+      });
+
+      it("should prefer the default track over forced and first", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", Index: 2, IsForced: true },
+            { Type: "Subtitle", Codec: "pgssub", Index: 3, IsDefault: true },
+            { Type: "Subtitle", Codec: "pgssub", Index: 4 },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toMatchObject({ Index: 3 });
+      });
+
+      it("should prefer a forced track when no default exists", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "dvdsub", Index: 2 },
+            { Type: "Subtitle", Codec: "dvdsub", Index: 3, IsForced: true },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toMatchObject({ Index: 3 });
+      });
+
+      it("should fall back to the first stream when no flags are set", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub", Index: 2 },
+            { Type: "Subtitle", Codec: "pgssub", Index: 3 },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toMatchObject({ Index: 2 });
+      });
+
+      it("should ignore subtitle streams without an Index", () => {
+        const videoItem = {
+          Id: "video123",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "pgssub" },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      // Jellyfin files XSUB and teletext as text, and a text burn-in makes it extract every
+      // subtitle track from the whole file first.
+      it("never picks an XSUB or teletext track for the server to burn in", () => {
+        const xsubAlone = {
+          Id: "v",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "xsub", Index: 2 },
+          ],
+        } as any;
+        expect(getBurnInSubtitleStream(xsubAlone)).toBeNull();
+
+        const xsubDefaultBesidePgs = {
+          Id: "v",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "xsub", Index: 2, IsDefault: true },
+            { Type: "Subtitle", Codec: "pgssub", Index: 3 },
+          ],
+        } as any;
+        expect(getBurnInSubtitleStream(xsubDefaultBesidePgs)).toMatchObject({ Index: 3 });
+
+        const forcedTeletext = {
+          Id: "v",
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "subrip", Index: 2 },
+            { Type: "Subtitle", Codec: "dvb_teletext", Index: 3, IsForced: true },
+          ],
+        } as any;
+        expect(getBurnInSubtitleStream(forcedTeletext)).toBeNull();
+      });
+    });
+
+    describe("getBurnInSubtitleStream — text subtitles stay selectable, never burn in", () => {
+      it("does NOT burn in a forced text subtitle — AVPlayer selects HLS text renditions fine", () => {
+        const videoItem = {
+          MediaStreams: [
+            { Type: "Video", Codec: "h264", Index: 0 },
+            { Type: "Subtitle", Codec: "subrip", Index: 2, Language: "eng", IsForced: true },
+          ],
+        } as any;
+
+        // Burning it in would force AllowVideoStreamCopy=false and cost this
+        // file both direct play and stream copy for no benefit.
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("does NOT burn in a default (non-forced) text subtitle — that would force subs on, e.g. multi-audio files", () => {
+        const videoItem = {
+          MediaStreams: [
+            { Type: "Subtitle", Codec: "ass", Index: 2, Language: "eng" },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "spa", IsDefault: true },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("burns in nothing for a text-only file, forced or not", () => {
+        const videoItem = {
+          MediaStreams: [
+            { Type: "Subtitle", Codec: "subrip", Index: 2, Language: "eng", IsDefault: true },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "eng", IsForced: true },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("returns null for a text-only file with no forced track (left unsupported)", () => {
+        const videoItem = {
+          MediaStreams: [
+            { Type: "Subtitle", Codec: "subrip", Index: 2, Language: "eng" },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "spa", IsDefault: true },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toBeNull();
+      });
+
+      it("burns in a forced image sub even when a text track is also present (mixed file)", () => {
+        const videoItem = {
+          MediaStreams: [
+            { Type: "Subtitle", Codec: "pgssub", Index: 2, Language: "eng", IsForced: true },
+            { Type: "Subtitle", Codec: "subrip", Index: 3, Language: "eng" },
+          ],
+        } as any;
+
+        expect(getBurnInSubtitleStream(videoItem)).toMatchObject({ Index: 2, Codec: "pgssub" });
+      });
+    });
+
+    describe("getPosterUrl", () => {
+      it("should generate poster URL with default maxHeight", async () => {
+        const url = getPosterUrl("item123");
+
+        expect(url).toBe("http://192.168.1.100:8096/Items/item123/Images/Primary?ApiKey=test-api-key&maxHeight=450&quality=90");
+      });
+
+      it("should generate poster URL with custom maxHeight", async () => {
+        const url = getPosterUrl("item123", 600);
+
+        expect(url).toContain("maxHeight=600");
+      });
+    });
+
+    describe("getChapterImageUrl", () => {
+      it("addresses the chapter by list position and pins the server's tag", () => {
+        const url = getChapterImageUrl("item123", 3, "abc");
+
+        expect(url).toBe("http://192.168.1.100:8096/Items/item123/Images/Chapter/3?ApiKey=test-api-key&maxWidth=480&quality=90&tag=abc");
+      });
+    });
+
+    describe("getFolderThumbnailUrl", () => {
+      it("should generate folder thumbnail URL with default maxHeight", async () => {
+        const url = getFolderThumbnailUrl("folder123");
+
+        expect(url).toBe("http://192.168.1.100:8096/Items/folder123/Images/Primary?ApiKey=test-api-key&maxHeight=300&quality=90");
+      });
+
+      it("should generate folder thumbnail URL with custom maxHeight", async () => {
+        const url = getFolderThumbnailUrl("folder123", 400);
+
+        expect(url).toContain("maxHeight=400");
+      });
+    });
+
+    describe("getSubtitleUrl", () => {
+      it("should generate subtitle URL with default VTT format", async () => {
+        const url = getSubtitleUrl("video123", 2);
+
+        expect(url).toBe("http://192.168.1.100:8096/Videos/video123/video123/Subtitles/2/Stream.vtt?ApiKey=test-api-key");
+      });
+
+      it("should generate subtitle URL with custom format", async () => {
+        const url = getSubtitleUrl("video123", 3, "srt");
+
+        expect(url).toContain("/Subtitles/3/Stream.srt");
+        expect(url).toContain("ApiKey=test-api-key");
+      });
+    });
+  });
+
+  describe("config migration", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("should migrate old IP/port format to URL format", async () => {
+      // Setup old format keys
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const oldConfig: Record<string, string> = {
+          jellyfin_server_url: "", // New format doesn't exist yet
+          jellyfin_server_ip: "192.168.1.100",
+          jellyfin_server_port: "8096",
+          jellyfin_server_protocol: "http",
+          jellyfin_api_key: "old-api-key",
+          jellyfin_user_id: "old-user-id",
+        };
+        return Promise.resolve(oldConfig[key] || null);
+      });
+
+      await getConfig(true);
+
+      // Should have migrated to new URL format
+      expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_server_url", "http://192.168.1.100:8096");
+
+      // Should have deleted old keys
+      expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_ip");
+      expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_port");
+      expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith("jellyfin_server_protocol");
+    });
+
+    it("should skip migration if new format already exists", async () => {
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        if (key === "jellyfin_server_url") return Promise.resolve("http://192.168.1.100:8096");
+        return Promise.resolve(null);
+      });
+
+      await getConfig(true);
+
+      // Should not have called setItemAsync for migration
+      expect(mockSecureStore.setItemAsync).not.toHaveBeenCalledWith("jellyfin_server_url", expect.any(String));
+    });
+
+    it("should skip migration if old format doesn't exist", async () => {
+      mockSecureStore.getItemAsync.mockResolvedValue(null);
+
+      await getConfig(true);
+
+      // Should not have called setItemAsync for migration
+      expect(mockSecureStore.setItemAsync).not.toHaveBeenCalledWith("jellyfin_server_url", expect.any(String));
+    });
+
+    it("should handle HTTPS protocol in migration", async () => {
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const oldConfig: Record<string, string> = {
+          jellyfin_server_url: "",
+          jellyfin_server_ip: "jellyfin.example.com",
+          jellyfin_server_port: "443",
+          jellyfin_server_protocol: "https",
+        };
+        return Promise.resolve(oldConfig[key] || null);
+      });
+
+      await getConfig(true);
+
+      expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_server_url", "https://jellyfin.example.com:443");
+    });
+
+    it("should use default values when old protocol/port missing", async () => {
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const oldConfig: Record<string, string> = {
+          jellyfin_server_url: "",
+          jellyfin_server_ip: "192.168.1.50",
+          // No port or protocol specified
+        };
+        return Promise.resolve(oldConfig[key] || null);
+      });
+
+      await getConfig(true);
+
+      // Should default to http://ip:8096
+      expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith("jellyfin_server_url", "http://192.168.1.50:8096");
+    });
+  });
+
+  describe("buildServerUrlCandidates", () => {
+    it("uses a full http/https URL exactly as entered", () => {
+      expect(buildServerUrlCandidates("http://192.168.1.100:8096")).toEqual(["http://192.168.1.100:8096"]);
+      expect(buildServerUrlCandidates("https://jellyfin.example.com")).toEqual(["https://jellyfin.example.com"]);
+    });
+
+    it("strips trailing slashes from a full URL", () => {
+      expect(buildServerUrlCandidates("https://jellyfin.example.com/")).toEqual(["https://jellyfin.example.com"]);
+    });
+
+    it("treats the scheme case-insensitively", () => {
+      expect(buildServerUrlCandidates("HTTPS://host")).toEqual(["HTTPS://host"]);
+    });
+
+    it("probes both protocols when a bare host includes a port", () => {
+      expect(buildServerUrlCandidates("192.168.1.100:8096")).toEqual(["https://192.168.1.100:8096", "http://192.168.1.100:8096"]);
+    });
+
+    it("probes default and standard ports (https first) for a bare IP", () => {
+      expect(buildServerUrlCandidates("192.168.1.100")).toEqual(["https://192.168.1.100:8920", "https://192.168.1.100", "http://192.168.1.100:8096", "http://192.168.1.100"]);
+    });
+
+    it("probes default and standard ports for a bare hostname", () => {
+      expect(buildServerUrlCandidates("jellyfin.example.com")).toEqual([
+        "https://jellyfin.example.com:8920",
+        "https://jellyfin.example.com",
+        "http://jellyfin.example.com:8096",
+        "http://jellyfin.example.com",
+      ]);
+    });
+
+    it("returns no candidates for empty input", () => {
+      expect(buildServerUrlCandidates("")).toEqual([]);
+      expect(buildServerUrlCandidates("   ")).toEqual([]);
+    });
+
+    describe("checkServerInfo abort signal", () => {
+      it("gives up when the caller's signal fires, without waiting out the timeout", async () => {
+        // The network scan passes its own signal so pressing Stop drops the
+        // requests already in flight instead of leaving sockets to time out.
+        global.fetch = jest.fn(
+          (_url: string, init: { signal: AbortSignal }) =>
+            new Promise((_resolve, reject) => {
+              init.signal.addEventListener("abort", () => {
+                const error = new Error("Aborted");
+                error.name = "AbortError";
+                reject(error);
+              });
+            }),
+        ) as unknown as typeof fetch;
+
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 20);
+
+        // A 60s timeout that never gets to matter: the external signal is what ends it.
+        await expect(checkServerInfo("http://10.0.0.5:8096", 60000, controller.signal)).rejects.toThrow(/timed out/i);
+      });
+
+      it("does not leave a listener on a signal it was given", async () => {
+        global.fetch = jest.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ ServerName: "Home", Version: "10.9.0", Id: "server-a" }),
+        }) as unknown as typeof fetch;
+
+        const controller = new AbortController();
+        const add = jest.spyOn(controller.signal, "addEventListener");
+        const remove = jest.spyOn(controller.signal, "removeEventListener");
+
+        await checkServerInfo("http://10.0.0.5:8096", 5000, controller.signal);
+
+        // A subnet sweep makes thousands of these against one signal.
+        expect(add).toHaveBeenCalledTimes(1);
+        expect(remove).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it("keeps a subpath after the host instead of appending the port to the path", () => {
+      // Regression: this used to build "https://10.0.0.5/jellyfin:8920", which is
+      // malformed, so every candidate failed for reverse-proxy addresses.
+      expect(buildServerUrlCandidates("10.0.0.5/jellyfin")).toEqual(["https://10.0.0.5/jellyfin", "http://10.0.0.5/jellyfin", "https://10.0.0.5:8920/jellyfin", "http://10.0.0.5:8096/jellyfin"]);
+    });
+
+    it("keeps a subpath alongside an explicit port", () => {
+      expect(buildServerUrlCandidates("10.0.0.5:8096/jellyfin")).toEqual(["https://10.0.0.5:8096/jellyfin", "http://10.0.0.5:8096/jellyfin"]);
+    });
+
+    it("prefers the proxy ports when a subpath is present", () => {
+      // A subpath implies a reverse proxy, which listens on 443/80 far more often
+      // than on Jellyfin's own ports.
+      const [first, second] = buildServerUrlCandidates("jellyfin.example.com/media");
+      expect(first).toBe("https://jellyfin.example.com/media");
+      expect(second).toBe("http://jellyfin.example.com/media");
+    });
+
+    it("strips a trailing slash from a subpath", () => {
+      expect(buildServerUrlCandidates("10.0.0.5/jellyfin/")[0]).toBe("https://10.0.0.5/jellyfin");
+    });
+  });
+
+  describe("resolveServerConnection", () => {
+    const originalFetch = global.fetch;
+    const mockFetch = jest.fn();
+
+    beforeEach(() => {
+      mockFetch.mockReset();
+      global.fetch = mockFetch as unknown as typeof fetch;
+    });
+
+    afterAll(() => {
+      global.fetch = originalFetch;
+    });
+
+    /** Answer as Jellyfin for the given base URLs, and refuse everything else. */
+    const serveJellyfinAt = (...bases: string[]) => {
+      mockFetch.mockImplementation(async (url: string) => {
+        if (bases.some((base) => url === `${base}/System/Info/Public`)) {
+          return { ok: true, json: async () => ({ ServerName: "Home", Version: "10.9.0", Id: "abc" }) };
+        }
+        throw new Error("connection refused");
+      });
+    };
+
+    it("resolves a bare IP to the candidate that answers", async () => {
+      serveJellyfinAt("http://192.168.1.100:8096");
+
+      const { url, info } = await resolveServerConnection("192.168.1.100");
+
+      expect(url).toBe("http://192.168.1.100:8096");
+      expect(info.ServerName).toBe("Home");
+    });
+
+    it("resolves a reverse-proxy subpath, which used to build malformed URLs", async () => {
+      serveJellyfinAt("http://192.168.1.100/jellyfin");
+
+      const { url } = await resolveServerConnection("192.168.1.100/jellyfin");
+
+      expect(url).toBe("http://192.168.1.100/jellyfin");
+    });
+
+    it("lists every candidate and its failure when nothing answers", async () => {
+      serveJellyfinAt();
+
+      const error = await resolveServerConnection("192.168.1.100").catch((e: Error) => e);
+      const message = (error as Error).message;
+
+      expect(message).toContain("Couldn't reach a Jellyfin server at 192.168.1.100.");
+      for (const candidate of buildServerUrlCandidates("192.168.1.100")) {
+        expect(message).toContain(candidate);
+      }
+      expect(message).toContain("unreachable");
+      expect(message).toContain("Local Network access");
+    });
+
+    it("names the failure reason per candidate", async () => {
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url.startsWith("http://192.168.1.100:8096")) return { ok: false, status: 502 };
+        if (url.startsWith("http://192.168.1.100/")) return { ok: true, json: async () => ({ hello: "router" }) };
+        throw Object.assign(new Error("AbortError"), { name: "AbortError" });
+      });
+
+      const error = await resolveServerConnection("192.168.1.100").catch((e: Error) => e);
+      const message = (error as Error).message;
+
+      expect(message).toContain("http://192.168.1.100:8096  HTTP 502");
+      expect(message).toContain("http://192.168.1.100  not a Jellyfin server");
+      expect(message).toContain("https://192.168.1.100:8920  no response");
+    });
+
+    it("surfaces the specific error for a full URL, which has a single candidate", async () => {
+      serveJellyfinAt();
+
+      await expect(resolveServerConnection("http://192.168.1.100:8096")).rejects.toThrow("Unable to reach Jellyfin server");
+    });
+
+    it("rejects an empty address", async () => {
+      await expect(resolveServerConnection("   ")).rejects.toThrow("Please enter a server address.");
+    });
+  });
+
+  describe("resolveServerConnection Local Network grace window", () => {
+    const originalFetch = global.fetch;
+    const mockFetch = jest.fn();
+
+    beforeEach(() => {
+      mockFetch.mockReset();
+      global.fetch = mockFetch as unknown as typeof fetch;
+      markerState.exists = true;
+      markerState.created = 0;
+    });
+
+    afterAll(() => {
+      global.fetch = originalFetch;
+    });
+
+    const jellyfinResponse = { ok: true, json: async () => ({ ServerName: "Home", Version: "10.9.0", Id: "abc" }) };
+
+    it("retries a failed first-ever attempt until the permission prompt is answered", async () => {
+      markerState.exists = false;
+      // First attempt dies like a socket blocked by the pending prompt; the
+      // poll one second later succeeds like a granted permission.
+      mockFetch.mockRejectedValueOnce(new Error("connection refused")).mockResolvedValue(jellyfinResponse);
+
+      const { url, info } = await resolveServerConnection("http://192.168.1.100:8096");
+
+      expect(url).toBe("http://192.168.1.100:8096");
+      expect(info.ServerName).toBe("Home");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    }, 10000);
+
+    it("retries once when primed and the failure is socket-level (post-unlock flake)", async () => {
+      markerState.exists = true;
+      mockFetch.mockRejectedValueOnce(new Error("no route to host")).mockResolvedValue(jellyfinResponse);
+
+      const { url } = await resolveServerConnection("http://192.168.1.100:8096");
+
+      expect(url).toBe("http://192.168.1.100:8096");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    }, 10000);
+
+    it("gives up after the single flake retry when primed", async () => {
+      markerState.exists = true;
+      mockFetch.mockRejectedValue(new Error("connection refused"));
+
+      await expect(resolveServerConnection("http://192.168.1.100:8096")).rejects.toThrow("Unable to reach Jellyfin server");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    }, 10000);
+
+    it("does not retry when primed and the server actively answered", async () => {
+      markerState.exists = true;
+      mockFetch.mockResolvedValue({ ok: false, status: 502 });
+
+      await expect(resolveServerConnection("http://192.168.1.100:8096")).rejects.toThrow("Unable to reach Jellyfin server");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries the whole candidate race when every candidate died at the socket", async () => {
+      markerState.exists = true;
+      mockFetch.mockRejectedValue(new Error("no route to host"));
+
+      await expect(resolveServerConnection("192.168.1.100")).rejects.toThrow("Couldn't reach a Jellyfin server");
+      // 4 candidates probed twice: the initial race plus the flake retry.
+      expect(mockFetch).toHaveBeenCalledTimes(8);
+    }, 10000);
+
+    it("writes the primed marker on the first successful probe", async () => {
+      markerState.exists = false;
+      mockFetch.mockResolvedValue(jellyfinResponse);
+
+      await resolveServerConnection("http://192.168.1.100:8096");
+
+      expect(markerState.created).toBe(1);
+      expect(markerState.exists).toBe(true);
+    });
+
+    it("does not count a public-host success as proof of Local Network permission", async () => {
+      markerState.exists = false;
+      mockFetch.mockResolvedValue(jellyfinResponse);
+
+      await resolveServerConnection("https://demo.jellyfin.org/stable");
+
+      expect(markerState.created).toBe(0);
+      expect(markerState.exists).toBe(false);
+    });
+  });
+
+  describe("evaluateSavedConnection", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(() => {
+      global.fetch = jest.fn();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    const withCreds = () =>
+      mockSecureStore.getItemAsync.mockImplementation((key: string) =>
+        Promise.resolve(
+          (
+            {
+              jellyfin_server_url: "http://192.168.1.100:8096",
+              jellyfin_api_key: "tok",
+              jellyfin_user_id: "uid",
+            } as Record<string, string>
+          )[key] || null,
+        ),
+      );
+
+    it("returns 'none' when there is no saved connection", async () => {
+      mockSecureStore.getItemAsync.mockResolvedValue(null);
+      expect(await evaluateSavedConnection(true)).toBe("none");
+    });
+
+    it("returns 'connected' when the saved server is reachable", async () => {
+      withCreds();
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ServerName: "Living Room", Version: "10.9.0" }),
+      });
+      expect(await evaluateSavedConnection(true)).toBe("connected");
+    });
+
+    it("returns 'needs_restore' when the saved server is unreachable", async () => {
+      withCreds();
+      (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("network down"));
+      expect(await evaluateSavedConnection(true)).toBe("needs_restore");
+    });
+
+    it("caches the result until forced to re-evaluate", async () => {
+      withCreds();
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ServerName: "Living Room", Version: "10.9.0" }),
+      });
+      expect(await evaluateSavedConnection(true)).toBe("connected");
+
+      // Without force it must not probe again (fetch not called a second time).
+      (global.fetch as jest.Mock).mockClear();
+      expect(await evaluateSavedConnection()).toBe("connected");
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("MusicVideo library support", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("includes MusicVideo when fetching folder contents", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [], TotalRecordCount: 0 }),
+      });
+
+      await fetchFolderContents("music-videos-library");
+
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(requestUrl.searchParams.get("IncludeItemTypes")).toContain("MusicVideo");
+    });
+
+    it("includes MusicVideo when searching library items", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [], TotalRecordCount: 0 }),
+      });
+
+      await searchVideos("test");
+
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(requestUrl.searchParams.get("IncludeItemTypes")).toContain("MusicVideo");
+    });
+
+    it("reaches music videos through MediaTypes, since IncludeItemTypes zeroes out at a view root", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [{ Id: "mv-1", Name: "Song", Type: "MusicVideo" }], TotalRecordCount: 1 }),
+      });
+
+      await fetchRecursiveVideos("music-videos-library");
+
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      // MusicVideo is MediaType Video, so the queue still gets it — and a library root now
+      // answers at all (verified 10.11.1: IncludeItemTypes returned 0 there, emptying the queue).
+      expect(requestUrl.searchParams.get("MediaTypes")).toBe("Video,Audio");
+      expect(requestUrl.searchParams.get("IncludeItemTypes")).toBeNull();
+    });
+
+    // A `homevideos` library root lists videos it does not own: measured on 10.11.11,
+    // "Home Videos and Photos" answers 21 videos non-recursively and zero recursively,
+    // which left every video opened from that root with an empty queue and no Up Next.
+    it("falls back to direct children when the recursive sweep finds nothing", async () => {
+      (global.fetch as jest.Mock)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [{ Id: "v-1", Name: "Clip", Type: "Movie" }], TotalRecordCount: 1 }) });
+
+      const items = await fetchRecursiveVideos("homevideos-root");
+
+      expect(items.map((item) => item.Id)).toEqual(["v-1"]);
+      const calls = (global.fetch as jest.Mock).mock.calls.map((call) => new URL(call[0] as string));
+      expect(calls).toHaveLength(2);
+      expect(calls[0].searchParams.get("Recursive")).toBe("true");
+      // The retry differs in exactly one parameter; the filters must still apply.
+      expect(calls[1].searchParams.get("Recursive")).toBe("false");
+      expect(calls[1].searchParams.get("MediaTypes")).toBe("Video,Audio");
+      expect(calls[1].searchParams.get("LocationTypes")).toBe("FileSystem,Remote");
+    });
+
+    it("does not ask twice when the recursive sweep already answered", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [{ Id: "v-1", Name: "Clip", Type: "Movie" }], TotalRecordCount: 1 }),
+      });
+
+      await fetchRecursiveVideos("ordinary-folder");
+
+      expect((global.fetch as jest.Mock).mock.calls).toHaveLength(1);
+    });
+
+    it("stays empty for a folder that genuinely holds no playable items", async () => {
+      (global.fetch as jest.Mock)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) });
+
+      await expect(fetchRecursiveVideos("photos-only-folder")).resolves.toEqual([]);
+    });
+  });
+
+  describe("media type allowlists", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    // Answers every request, not just the first: these tests assert the query the reader
+    // BUILDS, and an empty answer makes fetchRecursiveVideos retry without Recursive.
+    const mockEmptyResponse = () => {
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => ({ Items: [], TotalRecordCount: 0 }),
+      });
+    };
+
+    // Split the param so "Photo" never substring-matches "PhotoAlbum"
+    const requestedTypes = () => {
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      return requestUrl.searchParams.get("IncludeItemTypes")?.split(",") ?? [];
+    };
+
+    it("includes Photo, Trailer and AudioBook when fetching folder contents", async () => {
+      mockEmptyResponse();
+
+      await fetchFolderContents("photos-library");
+
+      expect(requestedTypes()).toEqual(expect.arrayContaining(["Photo", "Trailer", "AudioBook"]));
+    });
+
+    it("keeps Photo out of the recursive play queue via MediaTypes", async () => {
+      mockEmptyResponse();
+
+      await fetchRecursiveVideos("mixed-folder");
+
+      // Video,Audio covers every PLAYABLE_ITEM_TYPE (Trailer/MusicVideo are Video, AudioBook is
+      // Audio) and excludes both Photo (MediaType Photo) and folders (no MediaType at all).
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(requestUrl.searchParams.get("MediaTypes")).toBe("Video,Audio");
+      expect(requestedTypes()).toEqual([]);
+    });
+
+    it("keeps the flat library list to standalone videos", async () => {
+      mockEmptyResponse();
+
+      await fetchLibraryVideos();
+
+      const types = requestedTypes();
+      expect(types).toEqual(expect.arrayContaining(["Movie", "Video", "MusicVideo", "Trailer"]));
+      expect(types).not.toContain("Photo");
+      expect(types).not.toContain("Episode");
+    });
+
+    it("classifies Photo as viewable, not a folder", () => {
+      const photo = { Id: "p1", Name: "Pic", Type: "Photo" } as any;
+
+      expect(isPhoto(photo)).toBe(true);
+      expect(isFolder(photo)).toBe(false);
+    });
+
+    it("still classifies every container kind as a folder and playable kinds as not", () => {
+      const containers = ["Folder", "CollectionFolder", "UserView", "Series", "Season", "BoxSet", "MusicAlbum", "MusicArtist", "PhotoAlbum", "Playlist"];
+      for (const type of containers) {
+        expect(isFolder({ Id: "id", Name: "n", Type: type } as any)).toBe(true);
+      }
+      for (const type of ["Movie", "MusicVideo", "Trailer", "AudioBook", "Photo"]) {
+        expect(isFolder({ Id: "id", Name: "n", Type: type } as any)).toBe(false);
+      }
+    });
+  });
+
+  describe("library filters", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    const mockEmpty = () => {
+      (global.fetch as jest.Mock).mockImplementation(async () => ({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) }));
+    };
+    // A user-data filter checks /Users/{id}/Views first (a library root can't answer those
+    // server-side, see fetchViewRootFiltered), so assert on the Items query, not on call 0.
+    // An empty Views list means "not a library root", keeping these cases on the server-side path.
+    const requestUrl = () => {
+      const urls = (global.fetch as jest.Mock).mock.calls.map((call) => new URL(call[0] as string));
+      return urls.filter((url) => !url.pathname.endsWith("UserViews")).pop()!;
+    };
+
+    it("sends Years comma-delimited in the flattened filter query", async () => {
+      mockEmpty();
+
+      await fetchFolderContents("lib", { filters: { ...EMPTY_FILTERS, years: [1994, 1995] } });
+
+      const url = requestUrl();
+      expect(url.searchParams.get("Recursive")).toBe("true");
+      expect(url.searchParams.get("Years")).toBe("1994,1995");
+    });
+
+    it("shuffle alone does NOT flatten — keeps the non-recursive browse with SortBy=Random", async () => {
+      mockEmpty();
+
+      await fetchFolderContents("lib", { filters: { ...EMPTY_FILTERS, shuffle: true } });
+
+      const url = requestUrl();
+      expect(url.searchParams.get("Recursive")).toBe("false");
+      expect(url.searchParams.get("IncludeItemTypes")).toContain("MusicVideo"); // BROWSE_ITEM_TYPES
+      expect(url.searchParams.get("IncludeItemTypes")).toContain("Book"); // the reader's kind browses too
+      expect(url.searchParams.get("SortBy")).toBe("Random");
+    });
+
+    it("a content filter flattens recursively, and shuffle still drives SortBy", async () => {
+      mockEmpty();
+
+      await fetchFolderContents("lib", { filters: { ...EMPTY_FILTERS, favorite: true, shuffle: true } });
+
+      const url = requestUrl();
+      expect(url.searchParams.get("Recursive")).toBe("true");
+      expect(url.searchParams.get("Filters")).toBe("IsFavorite");
+      expect(url.searchParams.get("SortBy")).toBe("Random");
+    });
+
+    it("fetchLibraryYears maps /Years names to numbers, drops non-numeric, sorts descending", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          Items: [
+            { Id: "y1", Name: "1994" },
+            { Id: "y2", Name: "2011" },
+            { Id: "bad", Name: "Unknown" },
+            { Id: "y3", Name: "2003" },
+          ],
+        }),
+      });
+
+      const years = await fetchLibraryYears("lib");
+
+      expect(requestUrl().pathname).toBe("/Years");
+      expect(years).toEqual([2011, 2003, 1994]);
+    });
+  });
+
+  describe("item count accuracy", () => {
+    const mockSecureStore = require("expo-secure-store");
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const mockConfig: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(mockConfig[key] || null);
+      });
+
+      // getConfig serves its in-memory cache; force it to re-read this suite's credentials
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it("strips the server's random ChildCount from views without fetching counts inline", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          Items: [
+            { Id: "lib-1", Name: "Music2", Type: "CollectionFolder", ChildCount: 5 },
+            { Id: "lib-2", Name: "Movies", Type: "CollectionFolder", ChildCount: 3 },
+          ],
+        }),
+      });
+
+      const { items } = await fetchUserViews();
+
+      expect(items[0].ChildCount).toBeUndefined();
+      expect(items[1].ChildCount).toBeUndefined();
+      expect(items[0].RecursiveItemCount).toBeUndefined();
+      // Counts stream in lazily via fetchViewItemCount — the view list is one request.
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts a view with one recursive MediaTypes query", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 1234 }) });
+
+      await expect(fetchViewItemCount("lib-1")).resolves.toBe(1234);
+
+      // The count query mirrors the server's GetRecursiveChildCount semantics
+      const countUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(countUrl.searchParams.get("ParentId")).toBe("lib-1");
+      expect(countUrl.searchParams.get("Recursive")).toBe("true");
+      expect(countUrl.searchParams.get("Limit")).toBe("1");
+      // MediaTypes is the only filter Jellyfin 10.11 applies correctly on recursive
+      // view-root queries: IsFolder=false is ignored (folders get counted) and
+      // IncludeItemTypes/Filters=IsNotFolder return 0 for most typed libraries.
+      expect(countUrl.searchParams.get("MediaTypes")).toBe("Video,Audio,Photo,Book");
+      expect(countUrl.searchParams.has("IncludeItemTypes")).toBe(false);
+      expect(countUrl.searchParams.has("IsFolder")).toBe(false);
+    });
+
+    it("rebuilds a homevideos-style count from children when the view-root recursion returns 0", async () => {
+      (global.fetch as jest.Mock)
+        // recursive count at the view root: the server ignores Recursive here
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) })
+        // direct leaves (non-recursive)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 21 }) })
+        // direct folder children
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [{ Id: "folder-a" }, { Id: "folder-b" }] }) })
+        // recursive counts under each folder (recursion works below the view)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 3 }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 52 }) });
+
+      await expect(fetchViewItemCount("lib-hv")).resolves.toBe(76);
+
+      const calls = (global.fetch as jest.Mock).mock.calls.map((call) => new URL(call[0] as string));
+      // Fallback leaf query states Recursive=false (Jellyfin 12 defaults an omitted one to true), keeps the MediaTypes shape
+      expect(calls[1].searchParams.get("Recursive")).toBe("false");
+      expect(calls[1].searchParams.get("MediaTypes")).toBe("Video,Audio,Photo,Book");
+      // Folder discovery is typed (IsFolder is ignored by the server)
+      expect(calls[2].searchParams.get("IncludeItemTypes")).toBe("Folder,PhotoAlbum");
+      // Per-folder counts recurse under the folder ids
+      expect(calls[3].searchParams.get("ParentId")).toBe("folder-a");
+      expect(calls[3].searchParams.get("Recursive")).toBe("true");
+    });
+
+    it("gives up (rejects, nothing cached) when a view has more folders than the fan-out cap", async () => {
+      const manyFolders = Array.from({ length: 25 }, (_, i) => ({ Id: `folder-${i}` }));
+      (global.fetch as jest.Mock)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 0 }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 4 }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ Items: manyFolders }) });
+
+      await expect(fetchViewItemCount("lib-huge")).rejects.toThrow("View item count unavailable");
+      // No per-folder queries fired: 3 calls total, the storm never starts.
+      expect(global.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("rejects when the count query fails so no badge renders and nothing caches", async () => {
+      (global.fetch as jest.Mock).mockRejectedValueOnce(new Error("network down"));
+
+      await expect(fetchViewItemCount("lib-1")).rejects.toThrow();
+    });
+
+    it("counts the Live TV root by channel total without downloading the channels", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ Items: [], TotalRecordCount: 10985 }) });
+
+      await expect(fetchLibraryRootCount("livetv-view", "livetv")).resolves.toBe(10985);
+
+      const url = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(url.pathname).toBe("/LiveTv/Channels");
+      expect(url.searchParams.get("limit")).toBe("0");
+    });
+
+    it("requests RecursiveItemCount in Fields when fetching folder contents", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [], TotalRecordCount: 0 }),
+      });
+
+      await fetchFolderContents("some-folder");
+
+      const requestUrl = new URL((global.fetch as jest.Mock).mock.calls[0][0] as string);
+      expect(requestUrl.searchParams.get("Fields")).toContain("RecursiveItemCount");
+    });
+  });
+
+  describe("getAuthHeader", () => {
+    it("builds the client header without a Token for unauthenticated requests", () => {
+      expect(getAuthHeader("device-123")).toBe('MediaBrowser Client="TomoTV", Device="iOS", DeviceId="device-123", Version="9.9.9"');
+    });
+
+    it("appends the Token for authenticated requests", () => {
+      expect(getAuthHeader("device-123", "secret-token")).toBe('MediaBrowser Client="TomoTV", Device="iOS", DeviceId="device-123", Version="9.9.9", Token="secret-token"');
+    });
+
+    it("sources the version from app config so it never drifts", () => {
+      // Version comes from Constants.expoConfig.version (mocked to 9.9.9),
+      // not a hardcoded literal.
+      expect(getAuthHeader("d")).toContain('Version="9.9.9"');
+    });
+  });
+
+  describe("fetchVideoDetails error propagation", () => {
+    const mockSecureStore = require("expo-secure-store");
+    const originalFetch = global.fetch;
+
+    beforeEach(async () => {
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const config: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(config[key] || null);
+      });
+      await refreshConfig();
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+      jest.restoreAllMocks();
+    });
+
+    // The whole point of the change: a status that reaches the player instead of
+    // every failure arriving as "Video not found or unavailable".
+    it("propagates the server's status instead of collapsing it into null", async () => {
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" }) as unknown as typeof fetch;
+
+      await expect(fetchVideoDetails("missing-item")).rejects.toThrow(/404/);
+    });
+
+    it("propagates a 500 as its own failure, not as a missing item", async () => {
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 500, statusText: "Internal Server Error" }) as unknown as typeof fetch;
+
+      await expect(fetchVideoDetails("broken-item")).rejects.toThrow(/500/);
+    });
+
+    const playbackInfo = { ok: true, json: async () => ({ MediaSources: [{ Id: "ms", MediaStreams: [] }] }) };
+
+    it("reads an episode's series rating and genres when the episode has none", async () => {
+      global.fetch = jest.fn(async (url: string) => {
+        if (url.includes("/PlaybackInfo")) return playbackInfo;
+        if (url.includes("/Items/series-1?")) return { ok: true, json: async () => ({ Id: "series-1", Type: "Series", OfficialRating: "TV-MA", Genres: ["Drama", "Mystery"] }) };
+        return { ok: true, json: async () => ({ Id: "unrated-episode", Type: "Episode", SeriesId: "series-1", Genres: [] }) };
+      }) as unknown as typeof fetch;
+
+      const details = await fetchVideoDetails("unrated-episode");
+
+      expect(details?.seriesOfficialRating).toBe("TV-MA");
+      expect(details?.seriesGenres).toEqual(["Drama", "Mystery"]);
+    });
+
+    it("skips the series read for an episode with its own rating and genres", async () => {
+      global.fetch = jest.fn(async (url: string) => {
+        if (url.includes("/PlaybackInfo")) return playbackInfo;
+        return { ok: true, json: async () => ({ Id: "rated-episode", Type: "Episode", SeriesId: "series-1", OfficialRating: "TV-14", Genres: ["Comedy"] }) };
+      }) as unknown as typeof fetch;
+
+      const details = await fetchVideoDetails("rated-episode");
+
+      expect(details?.seriesOfficialRating).toBeUndefined();
+      expect((global.fetch as jest.Mock).mock.calls.map(([url]) => String(url)).some((url) => url.includes("/Items/series-1"))).toBe(false);
+    });
+
+    it("plays the episode when the series read fails", async () => {
+      global.fetch = jest.fn(async (url: string) => {
+        if (url.includes("/PlaybackInfo")) return playbackInfo;
+        if (url.includes("/Items/series-2?")) return { ok: false, status: 500, statusText: "Internal Server Error" };
+        return { ok: true, json: async () => ({ Id: "orphan-episode", Type: "Episode", SeriesId: "series-2" }) };
+      }) as unknown as typeof fetch;
+
+      const details = await fetchVideoDetails("orphan-episode");
+
+      expect(details?.Id).toBe("orphan-episode");
+      expect(details?.seriesOfficialRating).toBeUndefined();
+    });
+  });
+
+  // The info panel's fetch. Jellyfin 10.11.11 answers PlaybackInfo with a 500 for
+  // Photo and Series (probed against a live server), so the panel cannot lead with it.
+  describe("fetchItemDetails", () => {
+    const mockSecureStore = require("expo-secure-store");
+    const { clearRequestCache } = require("../requestCache");
+    const originalFetch = global.fetch;
+
+    beforeEach(async () => {
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const config: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(config[key] || null);
+      });
+      await refreshConfig();
+      clearRequestCache();
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+      jest.restoreAllMocks();
+    });
+
+    it("returns a photo from metadata alone and never asks for playback info", async () => {
+      const photo = { Id: "photo-1", Name: "01-home", Type: "Photo", Width: 1320, Height: 2868, Path: "/pics/01-home.png" };
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => photo }) as unknown as typeof fetch;
+
+      const result = await fetchItemDetails("photo-1");
+
+      expect(result).toMatchObject({ Id: "photo-1", Width: 1320, Height: 2868 });
+      const urls = (global.fetch as jest.Mock).mock.calls.map((call) => String(call[0]));
+      expect(urls).toHaveLength(1);
+      expect(urls[0]).not.toContain("PlaybackInfo");
+    });
+
+    it("keeps the item when a playable kind's playback info fails", async () => {
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (String(url).includes("PlaybackInfo")) return Promise.resolve({ ok: false, status: 500, statusText: "Internal Server Error" });
+        return Promise.resolve({ ok: true, json: async () => ({ Id: "movie-1", Name: "Film", Type: "Movie" }) });
+      }) as unknown as typeof fetch;
+
+      const result = await fetchItemDetails("movie-1");
+
+      expect(result).toMatchObject({ Id: "movie-1", Name: "Film" });
+      expect(result?.MediaSources).toBeUndefined();
+    });
+
+    it("merges media sources and streams for a playable kind", async () => {
+      const streams = [{ Type: "Video", Codec: "hevc" }];
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (String(url).includes("PlaybackInfo")) return Promise.resolve({ ok: true, json: async () => ({ MediaSources: [{ Id: "src-1", Container: "mkv", MediaStreams: streams }] }) });
+        return Promise.resolve({ ok: true, json: async () => ({ Id: "movie-2", Name: "Film", Type: "Movie" }) });
+      }) as unknown as typeof fetch;
+
+      const result = await fetchItemDetails("movie-2");
+
+      expect(result?.MediaSources?.[0].Container).toBe("mkv");
+      expect(result?.MediaStreams).toEqual(streams);
+    });
+
+    it("propagates a metadata failure — there is nothing left to show", async () => {
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" }) as unknown as typeof fetch;
+
+      await expect(fetchItemDetails("missing-item")).rejects.toThrow(/404/);
+    });
+  });
+
+  describe("home shelf fetchers", () => {
+    const mockSecureStore = require("expo-secure-store");
+    const { clearRequestCache } = require("../requestCache");
+    const originalFetch = global.fetch;
+
+    beforeEach(async () => {
+      global.fetch = jest.fn();
+      mockSecureStore.getItemAsync.mockImplementation((key: string) => {
+        const config: Record<string, string> = {
+          jellyfin_server_url: "http://192.168.1.100:8096",
+          jellyfin_api_key: "test-api-key",
+          jellyfin_user_id: "test-user-id",
+          jellyfin_device_id: "test-device-id",
+        };
+        return Promise.resolve(config[key] || null);
+      });
+      await refreshConfig();
+      clearRequestCache();
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+      jest.restoreAllMocks();
+    });
+
+    it("fetchLatestItems parses the endpoint's bare array (no Items wrapper)", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          { Id: "1", Name: "New Movie", Type: "Movie" },
+          { Id: "2", Name: "New Series", Type: "Series" },
+        ],
+      });
+
+      const result = await fetchLatestItems();
+
+      const url = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(url).toContain("/Items/Latest?");
+      expect(url).toContain("userId=test-user-id");
+      expect(url).toContain("Limit=20");
+      expect(url).toContain("EnableUserData=true");
+      expect(result).toHaveLength(2);
+      expect(result?.[1].Type).toBe("Series");
+    });
+
+    it("fetchLatestItems asks for the episode count and drops the endpoint's grouped ChildCount", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ Id: "2", Name: "New Series", Type: "Series", ChildCount: 8, RecursiveItemCount: 116 }],
+      });
+
+      const result = await fetchLatestItems();
+
+      const url = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(new URLSearchParams(url.split("?")[1]).get("Fields")).toContain("RecursiveItemCount");
+      expect(result?.[0].ChildCount).toBeUndefined();
+      expect(result?.[0].RecursiveItemCount).toBe(116);
+    });
+
+    it("fetchLatestItems returns null on failure, not an empty list", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: false, status: 500, statusText: "Internal Server Error" });
+
+      expect(await fetchLatestItems()).toBeNull();
+    });
+
+    it("fetchFavoriteItems queries recursive IsFavorite newest-first with container kinds", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ Items: [{ Id: "f1", Name: "Fav Album", Type: "MusicAlbum" }], TotalRecordCount: 1 }),
+      });
+
+      const result = await fetchFavoriteItems();
+
+      const url = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(url).toContain("Recursive=true");
+      expect(url).toContain("Filters=IsFavorite");
+      expect(url).toContain("SortBy=DateCreated");
+      expect(url).toContain("SortOrder=Descending");
+      expect(decodeURIComponent(url)).toContain("Series");
+      expect(decodeURIComponent(url)).toContain("MusicAlbum");
+      expect(url).toContain("LocationTypes=");
+      expect(result).toEqual([{ Id: "f1", Name: "Fav Album", Type: "MusicAlbum" }]);
+    });
+
+    it("fetchFavoriteItems returns null on failure", async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: false, status: 503, statusText: "Service Unavailable" });
+
+      expect(await fetchFavoriteItems()).toBeNull();
+    });
+  });
+});

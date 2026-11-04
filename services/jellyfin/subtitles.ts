@@ -1,0 +1,135 @@
+/**
+ * Choosing subtitle tracks and addressing them.
+ *
+ * A track inside the media file is never asked of the server: Jellyfin answers by extracting
+ * every subtitle track from the whole file, uncancellable (its issue #17499). The engine reads
+ * such tracks from the bytes it already pulls; only a text sidecar is fetched from the server.
+ */
+import { JellyfinMediaStream, JellyfinVideoItem } from "@/types/jellyfin";
+import { logger } from "@/utils/logger";
+import { isImageBasedSubtitleCodec } from "@keiver/tomo-engine";
+import { getCachedConfig } from "./session";
+
+/**
+ * Image-based formats cannot be converted to WebVTT by Jellyfin, so they are dropped from
+ * its HLS manifests and burned into the video instead (MediaStream.IsTextSubtitleStream).
+ */
+export { isImageBasedSubtitleCodec } from "@keiver/tomo-engine";
+
+/** Blu-ray PGS, which the server hands over raw as Stream.pgssub. */
+export function isPgsCodec(codec: string | undefined): boolean {
+  const lower = (codec ?? "").toLowerCase();
+  return lower.includes("pgs");
+}
+
+/** DVD/VobSub, which the server hands over raw in Matroska as Stream.mks (the extension follows the codec). */
+export function isDvdSubCodec(codec: string | undefined): boolean {
+  const lower = (codec ?? "").toLowerCase();
+  return lower.includes("dvdsub") || lower.includes("dvd_subtitle") || lower.includes("vobsub");
+}
+
+/** A text file beside the movie, which the server serves on its own. An .mks sidecar is read with the whole film. */
+export function isTextSidecar(stream: JellyfinMediaStream): boolean {
+  return stream.IsExternal === true && !/\.mks$/i.test(stream.Path ?? "");
+}
+
+/** The bitmaps Jellyfin burns from the input it is transcoding; XSUB and teletext it files as text and extracts. */
+export function serverBurnsCodec(codec: string | undefined): boolean {
+  const lower = (codec ?? "").toLowerCase();
+  return isPgsCodec(lower) || isDvdSubCodec(lower) || lower === "dvbsub" || lower === "dvb_subtitle";
+}
+
+/**
+ * Pick the subtitle stream to burn into the video during transcoding
+ * Returns a candidate only when the item has subtitle streams and ALL of them
+ * are image-based (PGS/DVDSUB); among them only the ones Jellyfin burns without
+ * extracting. Priority: IsDefault > IsForced > first stream.
+ */
+export function getBurnInSubtitleStream(videoItem: JellyfinVideoItem | null): JellyfinMediaStream | null {
+  if (!videoItem || !videoItem.MediaStreams) {
+    return null;
+  }
+
+  const subtitleStreams = videoItem.MediaStreams.filter((stream) => stream.Type === "Subtitle" && stream.Index !== undefined);
+
+  if (subtitleStreams.length === 0) {
+    return null;
+  }
+
+  // ONLY image-based subtitles burn in. AVPlayer has no bitmap-subtitle renderer, so PGS/DVDSUB
+  // can never reach the screen any other way (see lessons-learned: "Jellyfin Silently Drops
+  // Image-Based Subtitles From HLS Manifests").
+  //
+  // Forced TEXT subtitles used to burn in too, on the belief that AVPlayer on tvOS cannot select
+  // HLS text renditions. It can: the local remux engine serves every text track as exactly that
+  // kind of rendition (Remuxer.swift subtitlePlaylist) and they are selectable on device. Burning
+  // them in cost direct play AND stream copy, because burn-in forces AllowVideoStreamCopy=false.
+  const allImageBased = subtitleStreams.every((stream) => isImageBasedSubtitleCodec(stream.Codec));
+  const burnable = subtitleStreams.filter((stream) => serverBurnsCodec(stream.Codec));
+
+  const candidate = allImageBased
+    ? burnable.find((stream) => stream.IsDefault) || burnable.find((stream) => stream.IsForced) || burnable[0] || null
+    : // Mixed file: a forced IMAGE track still burns in: it carries essential dialogue AVPlayer
+      // cannot render at all. A forced TEXT track does not: it renders fine.
+      burnable.find((stream) => stream.IsForced) || null;
+
+  if (!candidate) {
+    return null;
+  }
+
+  // A candidate, not a decision. Callers compute this before the playback mode
+  // is chosen, and the on-device engine wins for most of these files now and
+  // draws the bitmaps itself, so burn-in never happens. Saying "selected for
+  // burn-in" on every localRemux load read as though the server were about to
+  // re-encode the picture.
+  logger.info("Burn-in candidate (used only if the server path wins)", {
+    service: "Subtitles",
+    itemId: videoItem.Id,
+    streamIndex: candidate.Index,
+    codec: candidate.Codec,
+    language: candidate.Language || "und",
+    isDefault: candidate.IsDefault || false,
+    isForced: candidate.IsForced || false,
+    imageBased: isImageBasedSubtitleCodec(candidate.Codec),
+    totalSubtitles: subtitleStreams.length,
+  });
+
+  return candidate;
+}
+
+/**
+ * Text (non-image) subtitle streams: the ones deliverable to AVPlayer as
+ * selectable WebVTT renditions. Image-based tracks are excluded because they
+ * can only reach the screen by server-side burn-in (see getBurnInSubtitleStream).
+ *
+ * Both external sidecars (.srt next to the file) and embedded text streams
+ * count. Keying on IsExternal alone used to miss embedded tracks, which left an
+ * MP4 carrying one on direct play with nothing on screen unless the codec
+ * happened to be mov_text.
+ */
+export function getTextSubtitleStreams(videoItem: JellyfinVideoItem | null): JellyfinMediaStream[] {
+  if (!videoItem || !videoItem.MediaStreams) {
+    return [];
+  }
+
+  const streams = videoItem.MediaStreams.filter((stream) => stream.Type === "Subtitle" && stream.Index !== undefined && !isImageBasedSubtitleCodec(stream.Codec));
+
+  return streams;
+}
+
+/**
+ * The server's conversion of one subtitle stream. Empty when the config is not loaded yet.
+ *
+ * Path is `/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}` and the
+ * extension is required. Jellyfin sets MediaSourceId to the item id for a single-file item,
+ * which is every item the app selects: nothing here picks an alternate version.
+ */
+export function getRemoteSubtitleUrl(itemId: string, streamIndex: number, format: string = "vtt"): string {
+  if (!getCachedConfig().server || !getCachedConfig().apiKey) {
+    return "";
+  }
+  return `${getCachedConfig().server}/Videos/${itemId}/${itemId}/Subtitles/${streamIndex}/Stream.${format}?ApiKey=${getCachedConfig().apiKey}`;
+}
+
+/** Kept as the name the rest of the app calls. Always the server: see getRemoteSubtitleUrl. */
+export const getSubtitleUrl = getRemoteSubtitleUrl;

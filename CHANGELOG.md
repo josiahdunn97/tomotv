@@ -1,0 +1,965 @@
+# Changelog
+
+All notable changes to Tomo TV are documented here.
+
+## [2.2.14]
+
+### Added
+
+- With nothing signed in, the app opens on a Who's watching screen: the saved accounts as round faces, most recently used first, a Demo face while no account is saved, and Add Account, which opens the connect screen. Sign Out returns to it, and the connect screen carries the language, appearance and About rows while signed out. A phone with a finished download keeps its tabs while signed out, each showing the same screen
+- Tomo TV's own demo server, at tomotv.cubita.studio, replaces the Jellyfin project's public demo: a shared account with no password, with NASA and ESA space clips and photos, public-domain chill beats by HoliznaCC0, public-domain books and Blender open movies, reset every night. The Demo face, Go on the empty Add Server field and Try Demo Server all reach it, and Demo credits under About Tomo TV in Settings names each item's source and license on any server
+- Find Subtitles: on iPhone, iPad and Mac from any video's info panel, one search per episode when it is opened on a show or season, and on Apple TV from a button in the player's transport bar and from a video's info panel, in a panel of its own. The search asks the server's own subtitle search, then OpenSubtitles, by the item's title and by its file name, and names each result by its file. OpenSubtitles needs no account and no key from you: Tomo TV carries its own, and the panel credits OpenSubtitles.com beside its title. Settings > Subtitles turns the search off, holds an optional sign-in to your own OpenSubtitles account for downloads past the few a day OpenSubtitles allows without one, and its Save subtitles to my server switch decides where a pick lands. A pick is saved to the server as a sidecar when the account may manage subtitles and saving is on, and kept on the device otherwise, where the engine serves it with the video. The picked subtitle switches on by itself, and on a video already playing the running session takes the new track in place and the player reopens at the playhead, instead of the whole session restarting (`@keiver/tomo-engine@1.7.0`)
+- Subtitle timing: the subtitle that is on moves in half-second steps, back or forward, with a reset, from the subtitle panel, opened from the Apple TV player's transport bar or from a video's info panel on every platform. The correction is kept per video and track and applied by the engine as it serves the track, embedded tracks, server sidecars and device copies alike (`@keiver/tomo-engine@1.5.0`)
+- Sync to audio: one press lines the subtitle that is on up with the speech in the video, on the device. The engine marks where speech is in a window of the audio around the playhead and finds the shift that lays the track's cues over it; it runs on its own after a pick, a second press tries another window, and two failed tries say the subtitles may be for another cut of the video (`@keiver/tomo-engine@1.6.0`)
+- A Skip Automatically screen, in Settings and in Channel Settings, chooses which of the server's media segments playback seeks past on its own: intros, recaps, previews and commercials, on every platform. Commercials are on by default, as the old Skip commercials switch was, and that switch's setting carries over. Apple TV shows a Skip Intro, Skip Recap, Skip Preview or Skip Commercial pill only over a kind not skipped automatically, and Skip Credits when no Up Next card is coming. An item opened or resumed inside a skipped segment plays from its end. In a SyncPlay group nothing is skipped
+- Filters is now Sort & Filter: a library sorts by any of the server's orders (name, date added, release date, year, community, critic and parental rating, runtime, date played and play count; episode added for shows; album, album artist and artist for music), ascending or descending. Each library's sort and filters are saved on the account, in its display preferences on the server, so they return on every device; the demo and an account the server refuses keep them on the device
+- A live channel's info panel gains Rename and Hide. A rename shows in every list, the guide, search, the player and the Top Shelf, and an empty name brings the server's own back. A hidden channel leaves all of them, favorites included, and channel flipping passes over it; Channel Settings > Hidden Channels lists them and a press shows one again. Both are kept per account
+- In the book reader a tap in the outer tenth of the screen turns the page, back on the left and forward on the right. A tap elsewhere wakes the controls as before, and a zoomed page keeps its pan
+- Card size, under Appearance on every platform, sets how big the cards draw on Home, in folders and in search, names and corner text with them, and is saved on the device. Apple TV picks 75, 100, 125 or 150% and scales its rows, grid columns and posters with it; iPhone, iPad and Mac pick from a row of miniature cards at the sizes the window takes, from 0.75x up to a wide card at half the screen, 0.8 of the width on iPhone. A pinch over the cards sets the same size, easing into it and pulsing at either limit; on Mac, Command-plus, Command-minus and Command-0 do too. Each card asks the server for a poster as large as it is drawn
+- On iPhone, iPad and Mac, losing the connection, at launch or while the app runs, shows You're offline and switches to the Downloads tab when a finished download can play. Nothing happens while the player or an item screen is open over the tabs
+
+### Fixed
+
+- An external .ass or .ssa subtitle file showed its styling codes as text, `{\fad(120,120)}Some line` instead of `Some line`, on Jellyfin 10.11, which writes the dialogue into its WebVTT as it is (issue 111). The on-device engine now renders that markup in every sidecar and downloaded subtitle it serves: bold, italic and underline become tags, positioning, fades, drawings and the rest are dropped, line breaks and hard spaces are kept. Subtitles found by the app's own search drop the same codes from an SRT (`@keiver/tomo-engine@1.6.0`)
+- On Mac the left and right arrow keys turn pages in the book reader and step through photos; the focus system took them before
+- Show in Folder no longer shows on an episode opened from its own season screen. Jellyfin leaves a virtual season out of an episode's ancestors, so the panel also checks the folder it was opened from against the episode's parent
+- On Apple TV the info panel's title logo sits inside the card's 48 pt padding instead of running to its edges
+- On Apple TV the shadow layer behind a card darkened the art's top corners along its rounded edge and, at rest, stopped above the name base so the shadow fell under the base; it sits one point inside the art and covers the whole card now
+- A downloaded episode's row on the Downloads screen names its season and episode, S08E05, before its size
+- The channel wall showed Loading more items after its last channel while Tomo read the tuner playlists for channels only they carry; that read shows nothing now
+- Signed out, a subtitle or audio pick was forgotten: a downloaded episode opened with subtitles off every time. It is kept on the device now, through a relaunch. Signed in, a pick made offline was already kept on the device and sent to the account once the server is reachable. An account whose server settings hold no subtitle choice, read or not, plays with the latest subtitle pick made on this device instead of Jellyfin's defaults. A downloaded file plays in the system player, which keeps its own subtitle choice across episodes; Tomo no longer overrides it with the account's setting, and a download's playback never asks the server for anything
+- A subtitle picked in the last 1.5 s before the next item opened was dropped; it is stored now
+- Resuming a 4K HDR10 MP4 whose sync table lists few of its keyframes read the file from its first sample to the resume point and the open timed out: an 8.6 GB HEVC film read 4.15 GB in 106 s (issue 109). A seek that lands more than 18 s before its target now reads around the target for the keyframe the table did not list, found in the packets' own NAL units; a replica of that file with its table cut to one entry resumed in 5.6 s (`@keiver/tomo-engine@1.4.2`)
+- On resume with the server quality ladder offered, the player opened on the server rung the measured link picked; when that rung's segments did not exist (a static file host answers 404) the item failed instead of falling to the on-device copy, while the engine read the source from its first byte (issue 109). The playlist now leads with the copy when the rung's opening segment is answered a 4xx (other than 408 or 429), and the tier is reported declined; a rung still transcoding, or one that answered a passing server error, leads as before (`@keiver/tomo-engine@1.4.2`)
+- On a provider that allows one stream, the hold a recording put on the provider could outlast the recording: the app counted a clear as done whether or not the engine applied it, so every channel on that provider kept showing the recording screen until a relaunch. The hold now follows the engine's own held state, and a hold or clear the engine did not take is sent again on the next sync
+- A recording that started between a channel's hold check and its open showed the generic error; it shows the Limited Connections screen with Watch Recording
+- A live channel or recording whose audio is HE-AAC, common on terrestrial and low-bitrate feeds, played with no sound while AAC-LC channels were fine (issue 110). The on-device engine described the audio as plain AAC-LC; it now takes the setup from Apple's own ADTS parser, with the explicit SBR and PS signaling Apple's encoder writes. Measured on a public 720p H.264 + HE-AAC 48 kHz stereo channel through a Dispatcharr TS proxy on the Apple TV: silent on build 38, sound on the fix (`@keiver/tomo-engine@1.4.2`)
+- Live TV search dropped a channel shown again, or one hidden only on another account; it stays in the results
+- Settings > About > Demo credits on Apple TV shows each item's licence name at the row's edge as plain text
+- The demo server's link is measured like any other server's, on connect and on a fresh demo sign-in
+- On Apple TV the card's corner notch is rasterized, since its shadow has no path to draw from, and an engine keyframe poster landing renders at low priority, so a focus move never waits behind it
+
+### Changed
+
+- A Pluto TV link in a tuner playlist plays exactly as the playlist gives it, like any other link. Tomo no longer starts its own session with Pluto TV
+- A card's episode number, item count or NOW sits in a notch cut into the picture's top-left corner, in the card's own color and casting a shadow onto the art, in place of the tab above the card. Card names and the notch text are SF Pro Rounded, 11 pt on iPhone, 13 pt on iPad and Mac and 18 pt on Apple TV; the name's base and the notch rest on the card surface color, and card corners round at 14 pt, 23 pt on Apple TV
+- App Store screenshots sit on rust, where they sat on acid green
+- In Settings, Skip Automatically and Lyrics move out of the UI section into a Playback section below it
+- In Settings, About keeps two rows, Licenses and Demo credits, and saved diagnostics move to a Diagnostics section of their own, each row named by the video it played
+- Channel cards crop a live picture wider or narrower than 16:9 to the card, where it sat whole over a blurred copy of itself. A 16:9 picture fills the card as before
+- The channel wall no longer shows the groups band above its cards. The filter button in the bar is back on every platform and opens the Groups picker; its symbol fills while a group holds the list
+
+## [2.2.13]
+
+### Added
+
+- Channel Settings gains Connection limits: one row per tuner playlist, with the streams its provider allows this device at once, Auto or 1 to 5. Auto learns the limit from the provider's own refusals. A number set here reaches the engine at launch and whenever the tuner list reloads, for every host the playlist reads, so the guide preview, the channel ring and the wall clips never take the connection the playing channel needs
+- Two playlists at one provider count together, and the number is per device. A provider is its host and port, so two servers on one address never share a limit
+- On a provider that allows one stream, set or learned, a server recording comes first: while it records, Tomo reads nothing from that provider (playback, guide pictures and clips, the card preview, the channel ring). Opening one of its channels shows Limited Connections, with what is recording and until when, and Watch Recording, which plays the recording as it is written, Stop Recording and Play, which asks before it stops the recording, and Go Back. A toast warns a minute before a scheduled recording starts there, and channel swipes pass over its channels
+- On a provider that allows one stream, a recording started while Tomo was reading it is checked for video and made again until its file holds video; the provider's refusal no longer becomes the recording
+- A channel's info panel shows the channel's latest grabbed picture while it is on air, and plays its preview clip there unless auto update is off or playback holds the link. Its details line says when that picture was seen (Seen at and the time), after the channel number, or after the channel's name on a program's panel
+- On Apple TV, a Top Shelf card for an item the server has no poster for shows the keyframe Tomo made for it, in the shape of that picture, instead of the Tomo face. The app copies the keyframes of its Continue Watching items into the shared container, removes them when the items leave the row, and clears them on any server or account change
+
+### Changed
+
+- A live channel plays on Tomo's own engine or not at all. A channel the engine cannot take shows an error, where it fell back to the server's transcode, and every reopen stays on the device. When the device cannot reach a tuner's source, the server still carries the stream as a copy, never re-encoded
+- A live channel starts once 15 s are buffered, and a drop is recovered without you: the engine first opens the source again inside the same session, and when the session ends Tomo opens the channel again after 0.5, 1, 2, 4, then every 5 s for as long as you stay on it. Only a failure no new open fixes ends it: the account, a channel the server no longer has, DRM, or a provider at its stream limit
+- A live HLS channel read from its source carries every audio language its stream names, the one matching your audio language setting first, and shows its WebVTT subtitles, which the engine reads from the channel's own subtitle playlists
+- Channel cards show the whole live picture: a picture that would lose more than 3.5% a side to cropping shows whole over a blurred copy of itself, and its clip plays in the same box
+- Guide channel cards are 16:9, with no title bar, name or wash over the picture. A channel card's LIVE badge sits 2 points nearer the corner
+- A guide cell's first line names the channel, then the program title, shown once when the guide titles the block with the channel name. On a favorite channel the heart leads that line only on the program airing now, or on the one cell of a channel without listings. A cell without listings names the channel, and its second line reads No listings, after the Seen at time once a picture was seen
+- On the channel wall a card rests on a strip under its picture that names the channel: black with the name in the theme accent at rest, accent on focus, led by the favorite heart and, for a channel judged down, a cloud glyph in place of the Offline pill. A fresh picture turns the strip LIVE red under a white name, and the red steps down to black by the two-minute refresh floor in nine one-second native opacity fades
+- On Apple TV, focus starts on the guide's Channels button when Live TV opens, on Down from the tab bar and on each press of the Home Live TV card
+- On iPhone, iPad and Mac a channel's groups show as the band in the info panel's footer, as on Apple TV, and naming or renaming a group opens the system text prompt
+- On iPhone the info panel is a card only as tall as what it shows, on the bottom edge over a blur of the screen behind, as on iPad and Mac. A tap outside it, its close button or a drag down closes it: the card follows the finger, closes when dragged past 120 points or flicked past 64, and settles back otherwise. On a panel long enough to scroll, a drag down from its top moves the card, and the scroll holds still while the card is out
+- The channel wall opens with the guide's groups as a band above the cards, inside the cards' margins with round ends: New group, then All, Favorites, your groups, the playlist groups and the server's categories, one picked at a time. The filter button in the bar shows only while a group is picked, and pressing it shows every channel again. Picking a group keeps the band in place, and on Apple TV focus stays on the picked group; Up from a group under the bar's empty middle goes to Back or search, whichever is nearer. While a group loads, the hourglass sits centered under the band and the loading bar names the group
+- A programme card in search reads NOW while it airs (JETZT, AHORA, MAINTENANT), REC while it records and its start time before then. LIVE stays the mark of a channel picture seconds old
+- The download size sheet always opens. A size that would leave less than 500 MB free shows grayed, where the sheet left it out and showed a Not enough space alert when no size was left. When the smaller sizes are grayed because server transcoding is off on this device, the sheet adds a Transcoding Settings button, which closes the info panel and opens that screen, and its note reads "Smaller sizes need server transcoding, which is off."
+- Settings > Lyrics names its listening setting Transcribe with Apple Speech, where it read Listen for lyrics
+- Video and folder cards name themselves on a base under the art, whose bottom corners are square, in the channel strip's capitals: clear at rest, glass tinted with the card's colour on Apple TV, the accent on focus, and on Apple TV the focused name scrolls in full, four times at most. A favorite's heart, or the now-playing bars, leads the name. Resume and now-playing progress fills the base in the accent with the name inverting over it, a watched item fills it whole, a focused card keeps its fill, and a pressed card fills its base while the next screen loads. Episode and track numbers, a programme's NOW, REC or start time and a folder's item count sit on a tab standing above the card's top edge near its right corner, glass on Apple TV and the accent on focus. The title bar and the watched eye leave the card. The focus border goes around the art and the base
+- iPhone, iPad and Mac rows keep 24 points for the base. On Apple TV the 34-point base hangs into the padding under each card, Home shelf headings sit right on their row and shelves 44 points apart, and shelf rows no longer clip card shadows. Landscape cards are 16:9 on every platform, where they were 3:2, and Apple TV grids hold 7 posters, 5 squares or 4 landscape cards a row
+- On Apple TV with tvOS 26 or later the player's Channels tab draws each channel as glass with its logo on a soft white glow, and the Info tab shows a channel's logo with no outline and rounder corners
+- A logo channel card on Home reads NOW for its airing programme, leaving LIVE to channel pictures
+- On Apple TV the empty space after a short shelf's last card leads focus to that card
+- The card title scroll, the now-playing bars, the recording pulse, the search sweep and the avatar ring run on React Native's native driver. The folder loading bar and the Up Next countdown scale their fill instead of resizing it
+- On iPhone, iPad and Mac the info panel's loading line sits centred on the screen until the panel has its final height, then the card, its close button and its controls appear together. On iPhone the five round action buttons fit one row
+- The Open Source page credits React Native Video, the video player component, in its own row
+- App Store screenshots sit on a lighter acid green that stays green out to the corners, their titles carry a tighter, darker shadow, and on Apple TV the shade over the bottom of the screen is lighter
+
+### Fixed
+
+- An episode whose audio ran past its last frame stopped at the picture's end with "Video not found on server", and the Up Next countdown never started: the engine's playlist ran to Jellyfin's runtime, the longest stream, and listed segments nothing filled. The playlist now ends at the picture's last frame, audio that stops before it is carried on with silence, and a listed segment no stream fills is answered instead of refused
+- Without a credits marker the Up Next card on Apple TV never came: it was timed at the playback end, which AVKit never reached. It is now timed a second before the item ends
+- The Mac app plays up to 48 channel clips at once, as it did before it became a Mac Catalyst app; since 2.2.11 it played 16 and the cards past them showed a still
+- The New shelf on Home and an open folder show what the server just added each time they are opened, without waiting out the 5 minute cache. A folder shown again reads every loaded item in one request and keeps its place, and keeps its list when the read fails (issue 106)
+- A live channel refused with HTTP 429 (Too Many Requests) failed instead of retrying: the engine counted only 401, 403 and the other 4xx as a provider turning a connection away, and the FFmpeg build gives 429 its own code. Any HTTP answer but a 404 now makes the lower reads on that provider yield and retries the open; a 4xx also teaches the provider's limit, a 5xx does not, since the same 503 can mean a full account or a channel restarting (issue 104)
+- A channel opened right after another closed on a provider that still counts the closed stream failed on the refusal. The engine retries after any close on the provider, not only after a read it revoked itself
+- The wall and guide clips filled slowly, or not at all, on a provider allowing one stream: a card whose grab the provider turned away waited two minutes before its next try, doubling each time, the grab tried the server's copy of the channel, which reads the same account, and the warm session kept for the focused card held the provider's only stream against every other card. Every card now fights for its clip: a grab waits for a stream to free, tries a turned-away open again every second while the provider may still be counting a stream Tomo itself just closed, and once served has 15 s for its pictures and clip; the focused card's warm session yields its stream the first time a card's fight is lost against it, and the player then opens the channel itself on a play press, as it does with the limit set to 1. A turned-away card goes behind the others: its first failure adds no wait, and its second consecutive failure starts the two-minute wait, doubling to the cap. A grab served by the provider makes its turned-away cards due again. A turned-away open that nothing of Tomo's explains (a channel blocked for this region, another device on the account) costs a card one try, about a second, where it held one of the two reads for the whole 15 s and the cards on screen never refreshed
+- A card whose channel started too slowly for the 9 s first read was cut by Tomo itself and then waited two minutes. An open the provider has accepted is no longer cut by Tomo's clock at all: the channel is given until the provider serves it or ends it, and the 15 s for its pictures and clip count from the first byte the provider sends, so a slow link no longer holds a read open through a long probe. A provider that keeps counting a hung-up stream (Dispatcharr does, for up to 50 s) no longer gets one from Tomo. A first failure costs a card no wait, only its place in line, behind the cards that never failed and the refreshes that came due before it, and only a second failure in a row starts the two-minute wait, doubling as before. A grab that brings a picture and no clip counts as a failure, so a channel too slow for its clip no longer holds a read forever while the cards with clips never refresh. A card whose first picture arrived with only a moment of the 15 s left lost its clip (23 of 166 clips on a Mac wall); the clip now keeps its 5 s and a little more from the first picture, whatever the clock says
+- A channel the provider accepts and never serves (the provider ends the stream itself) now counts against the channel: twice and it is marked Offline, read only once every other card on screen has its clip, never first on focus, and never warmed for a play press. It also no longer brings the cards the provider turned away back for another try, so one dead channel in view no longer costs the others their place in line
+- The focused card's warm session for the play press starts once the card has a picture, so a channel that never serves costs the provider one connection, not two
+- When the engine reports HTTP 429, the player now says the provider limits how many streams play at once and another device is using them (PB-LIVE-LIMIT), and opens nothing on the server
+- On Apple TV the focused card comes first: once focus has rested on it, its clip is read before any other card's, no card on the same provider reads while it is being read, and it is read again every 30 s while focus stays. The other cards fill in while the focused card is fresh, or while it waits out a failure of its own
+- On Apple TV the wall and the guide read the rows wholly on screen first, nearest the focused row first, and no row below the screen is read ahead. A row at least 15% on screen is read once every whole row has its clip and is due no refresh, so it shows a picture while it waits for its turn. On every platform a wall or guide card plays its clip while at least a tenth of its row is on screen, at the top edge or the bottom
+- On iPhone, iPad and Mac the cards on screen kept their first pictures: the row cut by the screen's edge and the row below it counted as on screen, and their cards with no picture, often dead channels, always went before a refresh. Those two rows now read only while every row wholly on screen has its clip and is due no refresh
+- The channel ring no longer leaves a neighbour out for ten minutes when the provider's limit, not the channel, kept it from opening
+- A live channel carrying DVB or teletext subtitles failed to open with "Video not found on server": the engine answered 404 for the subtitle rendition's segments past the first
+- Channels went Offline on a provider at its connection cap: the wall judged a channel dead after two refusals with any 4xx or 5xx, and a 429 counted. HTTP errors other than 404, including 400, no longer count; two 404 open failures still mark the channel Offline
+- Pluto channels showed the same placeholder clip on every card: Pluto answers its stream URL call with an internal error when the request carries the app's own user agent, and the fallback session serves one placeholder for every channel. The call now carries a plain library agent, which Pluto answers
+- The live mark on a channel card animated every frame on every card with a picture (the draining wedge, then a pulsing dot), which kept the whole wall redrawing. LIVE now shows only while the picture is seconds old and nothing animates in the badge
+- A show's card on the New shelf counted only how many of the newest items the server grouped into it. It now counts all the show's episodes
+- On Apple TV a channel's logo could be cropped to fill the info panel's tile like a poster. It now sits whole on the tile however the channel was opened
+- A live channel the provider refused for a moment after a drop ended with an error: three refusals in 1.5 s, while the provider still counted the connection Tomo had just closed, were taken as final. For 15 s after that close a refusal no longer counts, and the channel opens again once the provider lets it
+- Picking a channel while the one before it was still opening could stop the new channel's warm session, so it started cold
+- A live subtitle segment whose download broke off was taken as whole, and its captions never showed. A cut-off download is read again
+- After a live channel's stream ended and Tomo opened it again, the audio went back to the language in Settings. It now reopens in the language that was playing
+- The iPad and Mac info card centers in the safe area, under the title-bar tabs
+- On iPad and Mac the info panel opened as a 320-point loading card and then resized to its content. The card now appears once its content is ready, at the size it keeps; until then, and when the load fails, only the loading line or the error and Retry show over the blur, with no card or close button, as on iPhone
+- On a provider that allows one stream, a channel opened right after Tomo closed another stream there showed the provider-limit error, and Retry failed until the provider let the old stream go (about 12 s with Dispatcharr). The spinner now stays and the channel opens again on each refusal until it plays
+- On a provider that allows one stream, a recording started while Tomo was reading the provider saved the provider's refusal, a 65-byte file, instead of video
+- The player's Record button kept showing Stop after the recording was stopped elsewhere, and Stop then failed
+- A video with no server poster, a recording in progress among them, paused a few seconds in when the poster Tomo made for it arrived: the new picture reloaded the stream. The player now leaves that poster for after playback
+- On a provider that allows one stream, a recording started right after Tomo closed its stream could still open into the stream the provider was counting and save its refusal. The recording now starts once the provider's own account API counts a stream free, read with no stream opened, for up to 30 s, and a recording made again after a refusal waits the same way. Measured on Dispatcharr, the count fell to 0 between 0.3 and 10.8 s after the close and every next open was admitted (5 of 5)
+
+## [2.2.12]
+
+### Added
+
+- The music player shows a song's lyrics on Apple TV, iPhone, iPad and Mac: synced lines follow playback, word by word where the lyrics carry word timing, and picking a line plays from it. The lines take the screen in place of the artwork, under the player's own controls, and on Apple TV they are centered. Lyrics come from the Jellyfin server first (10.9 or later)
+- A song the server has no lyrics for is looked up on lrclib.net
+- Where the system's speech transcriber is available (iOS, tvOS and macOS 26 or later), the device listens to the song: found lyrics gain word timing, a constant offset is corrected, plain text is timed line by line, and a song with no lyrics anywhere gets ones written from what was heard, captioned "Generated on this device". Songs over 10 minutes or 80 MB, and Ogg, Opus and WMA files, are not listened to
+- Lyrics found on lrclib.net or generated on the device are saved to the server as a lyric file, once per song. Jellyfin does not report whether an account may manage lyrics, so the app tries, and an account the server refuses is not asked again while the app runs. The file opens with a line naming its source, "Lyrics: lrclib.net" or "Lyrics: written by Tomo TV on iPhone" (or the device that wrote it), shown for 3 seconds or until the first lyric, so any app showing the server's lyrics shows where they came from
+- Settings gains a Lyrics screen: Show lyrics, Find missing lyrics, Listen for lyrics and Save lyrics to my server, all on by default. Listen for lyrics says it can get words wrong, and shows off and cannot be pressed on a device that cannot listen; on such an Apple TV it explains that playing the song once on an iPhone, iPad or Mac with Save lyrics to my server on brings its lyrics to the TV. Save lyrics to my server leaves the list once the server has refused a save from the account
+- A downloaded song keeps the lyrics the server or lrclib.net has, for offline playback
+- On Apple TV, the player's Info tab shows the content rating and genre. An episode with none of its own shows its series', and a live channel shows those of the programme airing when it opens, from the server's guide or an XMLTV guide already loaded on the device
+- On Apple TV, the player's title shows an episode's series with its season, episode and name above it (S04E19 · Episode name), a movie or home video with its year above its name, and a song with its artist and album above its name
+- A Pluto TV channel from a tuner playlist plays on a session the device starts with Pluto, falling back to Pluto's older start and then the playlist's own link
+
+### Changed
+
+- While a video or song plays, XMLTV guide and M3U playlist downloads pause and resume from their bytes after it, and no screen waits on them: a read gets the copy on disk, and a guide with none reads "Paused during playback" in Guide sources. When a held-back download finishes, the guide, channel lists and channel groups read again
+- An XMLTV guide keeps only the programmes of the server's and its tuner playlists' channels; the others are skipped while the file is read. A channel asked for that is not on the list opens the guide again with it added
+- When a video starts, the open XMLTV guides close and the first read after it opens them again. No guide is read at launch: the first screen or live search that needs one opens it
+- A subtitle track inside the media file is never asked of the server, which extracts every subtitle track from the whole film to answer for one, with no way to cancel it (Jellyfin issue 17499). A 102.7 GB remux on a USB disk ran three 30-minute extractions in a row and starved the playback reading the same disk. The track comes from the bytes the engine reads, so while a server stream carries playback on a slow connection it draws nothing until the original is read again; a server-transcoded stream and a download the server converts carry only subtitle files beside the video, and a .mks file beside the video counts as inside it
+- A file with many tracks starts with the tracks in play: the playing audio track, every copied track and the default, forced and chosen subtitle tracks. Another track is prepared when picked, and the remaining converted audio tracks come up one per segment after 45 seconds of playback. A file with 15 audio tracks and 74 image subtitle tracks made a 6 second segment in 9.48 seconds when every track was converted from the start
+- Finished segments are written off the engine's pipeline thread. The write took 0.9 to 1.5 seconds of every 3 to 6 second segment on the 2021 Apple TV
+- A server stream opens one video job and one audio job on the server. A rung the player left is ended 12 seconds later; it ran two segments plus 60 seconds until the server's own timer, four orphaned transcodes in one six-minute play
+- The iPhone and iPad app is 8 MB smaller installed and 3.3 MB smaller to download: Expo's modules build from source and link into the app, which loads 10 fewer frameworks at launch, and builds work on Xcode 27.1. `npm run archive` runs on Xcode 27.1 and still refuses a beta Xcode or macOS
+
+### Fixed
+
+- The player's subtitles menu reads On while the subtitle language saved on the account draws: the app sets its caption display type to always-on before the player opens. It read Off on a device where On had never been picked in that menu
+- Resuming an item whose default subtitle track is not the saved language's full track draws that track's subtitles: a subtitle segment behind the resumed read is answered without cues after 0.5 seconds, where the request hung for 25 seconds and the track drew nothing
+- A Matroska file read over a server that is slow to answer a seek no longer stops playing after jumping back, and its chapter and scrubbing pictures come from the right time: the engine seeks again
+- An original a fast connection carries opens as the original: the opening connection measurement reads over the engine's three connections. On an Apple TV one connection read 65.6 Mb/s on a connection the three then read at 150 to 320, and that opened the file on a server stream
+- A read the server stops answering on every connection starts again after 5 seconds of silence instead of waiting out the 20 second timeout, which delivered one segment 33 seconds late
+- A guide or playlist load stops with an error when less than 256 MB is left before the system's memory limit, and a memory warning closes the open guides, which open again at the next read. The system had closed the Apple TV app for exceeding its memory limit with an XMLTV guide of 4,613 channels and 210,401 programmes open
+- A live channel whose source opens with no streams in it counts toward Offline, as a refused open does, and a failed read of the server's copy of a channel no longer counts against the channel's own source
+- A song seeks to the exact time asked, so lyrics stay with the audio after a scrub; a variable bit rate MP3 used to land on an estimate
+- AV1 in the High or Professional profile (4:4:4, RGB or 12-bit) plays on a device with AV1 hardware, re-encoded on the device. Apple's AV1 decoder plays only Main profile, and those files stopped with Cannot Decode
+- A Dolby Digital Plus 7.1 track with Atmos in the Blu-ray layout (a Dolby Digital core, with the extra channels and the Atmos data in a second frame of each packet) plays as Dolby Atmos: the engine's FFmpeg (tomo.8) declares the Atmos flag it reads from that second frame, where it declared none and the player heard plain 7.1. On Apple TV with AirPods, Control Center shows Dolby Atmos for it, as for a 5.1 track
+
+## [2.2.11]
+
+### Added
+
+- A Mac app, its own Mac Catalyst binary, for Apple Silicon and Intel Macs on macOS 13.4 or later, with the same Jellyfin account, playback engine and offline downloads
+- A channel's info panel lists every group it can join: Favorites, your own groups and the groups its tuner's M3U playlist declares, each ticked while the channel is in it, and a press adds or removes it. On Apple TV they are a bar along the card's foot that starts with New group; on iPhone and iPad a Groups list, three rows before it scrolls, ends in a New group field
+- A playlist group keeps the channels you add to it or remove from it, per user: the guide, the channel wall and channel flipping follow your edits
+- A multi-episode file shows its episode range, S01E01-E02, on its card and info panel, between episodes, and in the Apple TV player's queue
+- Themes tint the ambient background, and Settings > Appearance gains a Background choice: Folder artwork (the default), Theme color or Clear
+- Search draws one grid with Live TV matches first and the library after them; on Apple TV a bar along the bottom reads "Searching your guides…" while the guide search is still out
+- A channel card showing a grabbed live frame wears LIVE for 15 seconds after its picture last changed; the badge then contracts to a red circle whose pie drains toward the next grab, with a breathing dot while that grab is overdue. A card showing only its logo wears a plain LIVE over the programme the guide says is airing
+- An original played from the server is read through three ranged connections at once, in 2 MB chunks, when the server answers range requests; any refusal keeps the single connection, and stopping playback ends a probe or read still waiting on the server
+- On iPhone, iPad and Mac an original of 64 MB or more downloads as up to four ranged parts, three in flight, that the engine joins into one file; a server that ignores range requests, or a converted copy, keeps the single download
+- A live channel whose source sends slower than it plays says so once in a toast, and a live start waiting on its source buffers two segments, for up to 8 seconds, before the picture appears
+- The engine logs the system's memory pressure events with the headroom left
+- The channel wall and the guide list a server M3U tuner's channels the server has not ingested yet, from the device's own parse of the playlist, and they tune; only for an account no parental rule can hide a channel from
+- The server's http(s) XMLTV listing providers join the guide sources with no setup on the device, and a channel listed without a current programme shows the one airing now from the guide sources already open. A guide still loading is passed over, so a channel list never waits on it
+- A search chained with a `+` standing alone, "news + sports", returns what either term finds
+
+### Changed
+
+- `npm run clear` prepares iOS, Mac and tvOS in that order, with a separate project and scheme for each; `npm run archive` produces both IPAs and the signed Mac installer with one shared build number. Mac store screenshots use manually captured images in `applestore/captures/mac/`
+- A channel's info panel ends at its groups, leaving out the description, cast, streams, details, file and playback sections; the Groups button is gone
+- The info panel shows a wide picture whole in a box when filling the artwork would blow it past 3x its size, such as a programme's title logo
+- On iPhone and iPad the Open Source list fills the screen under its intro and the Streaming Quality list shows three rows at a time
+- The theme picker is a horizontal strip of colour discs
+- The watched mark is the title bar's full gold fill and eye; the binge-next badge retires
+- Guide cells lead with the episode and carry seen time in their lines; programme posters leave the grid
+- The Open Source page names the platform the binary targets
+- Folder download enqueues batch their state writes into one manifest write, with bounded side fetches
+- The engine's poster work idles while a video plays
+- A channel card's title is the programme that is airing, alone, with the favorite heart, smaller and dimmed, at its right edge; the number pill is gone and the channel's info panel names the number, CH 5
+- The guide's time scale stretches so the grid fills a viewport wider than its shortest window
+- The guide's server reads are kept in memory for 30 minutes, so a reopen shows at once; a refresh press reads fresh, and only it shows the "TV guides updated" toast
+- The Settings streaming heading answers every press: "Link in use" while playback or a download holds the connection, "No reading" when a check reads nothing. The automatic check stands down beside either
+- The audio mini player's progress is a thin accent line along the pill's bottom edge
+- The Gold theme is named Tomo
+- The App Store header and search results art is gold cards that rise from the surface and sink back, rendered by `tvos-assets` 1.7.0; the row artwork stays as `applestore/listing/artwork-rows.svg`
+
+### Fixed
+
+- On Apple TV, Left from a guide programme whose neighbour is outside the grid's rendered range reaches the channel card instead of stopping
+- On Apple TV, closing an info panel or the player opened from the guide hands focus back to the programme you pressed, or the channel card you held, instead of the tab bar
+- A programme shorter than a minute shows its start and end with seconds, in the guide, the schedule and its info panel, instead of the same minute twice
+- A focused guide cell's ring no longer draws over the programme's artwork or live frames
+- Continue Watching leads with the episode after the one just finished, and a card that leaves the row hands focus to the card in its slot
+- Search answers fast and holds the grid steady; a library failure keeps the live shelf
+- The pressed photo paints first on recursive and filtered opens, and a loaded photo dismisses the error screen
+- The reader commits the current page first and drops stale renders
+- An interlaced H.264 channel or file plays a clean deinterlaced picture instead of woven, flickering fields: the engine routes it through its deinterlacer, reading the field coding from the stream's own opening keyframe when a live tune hides it
+- A memory warning releases the neighbour channels held warm for flipping and the focused card's warm session; the playing channel is untouched
+- One open XMLTV guide per URL serves every window asked of it, and a reopen never closes a guide while a read is in flight
+- A live HLS segment that fails to open is retried three times before it is skipped
+
+## [2.2.10]
+
+### Added
+
+- Server transcoding, in Settings: when the server may be asked to transcode on this device. "When needed" (the default) also sends smaller server streams on a slow connection; "Only for unsupported files" never transcodes for the connection, so a file plays as it is or buffers; "Off" plays only what the device supports. The card ends with the server's own setting for the account, its state in green or red, and the levels are disabled while the server refuses video transcoding
+- Themes, in Settings > Appearance: Gold, Blue, Green or Purple, or a colour of your own from a swatch grid, a hex code or hue, saturation and brightness sliders, named when saved. The app's accent takes the theme's colour, and the editor warns when a colour is hard to see on the dark background. Saved themes are kept in the Jellyfin user's display preferences, so every device signed in as that user lists them; removing one removes it everywhere, and each device keeps its own pick
+- Folder color, in Settings > Appearance, turns a folder's blurred artwork background on or off (on by default)
+- On iPhone, iPad and Mac an info panel drags left or right to its neighbours: a video's series across its seasons or its folder, a song's album, the folder, photo or book beside it in its folder, the next library, or the next channel in the guide
+- A day strip over the guide's channel column opens the guide on a picked day, today and the 13 days after it, one day at a time. Days without listings are dimmed. On iPhone and iPad a touch opens the system calendar, bounded to the days with listings
+- The player's error screen shows an error ID for the failing cause, with the lane and the native error code, and Diagnostics records it. With server transcoding off for the item, the screen says who turned it off: the account or this device
+- A programme from a guide source opens its own info panel, with its name, times, genres and rating, and accounts that manage recordings can record it: a timer on its channel for its start and end, named after the programme
+- Programme cards in Live TV search and the channel wall wear REC in place of LIVE while a recording covers them, and a scheduled programme's time wears the camera
+- Scrubbing shows the frame under the playhead: a thumbnail over the scrub bar on Apple TV, the picture itself on iPhone and iPad. A file the player opens as it is gets them from the system; a file the device plays itself, in any container, and a server stream get them from the file's own keyframes, read on demand. A picture larger than 1080p is scaled to 1080p and an HDR picture is converted to standard range first, as Apple's own streams do. Jellyfin's trickplay images are not needed. A Dolby Vision profile 5 file the engine or server plays, and a server stream of a codec the engine does not decode, have no scrub frames
+- Every download asks for a size: Original, or a smaller copy the server converts on the way down at 1080p, 720p or 480p, each with its estimated size. A size is offered at or under the video's own width or height and, when the original is offered too, under its bitrate; one the device has no room for is left out. With server transcoding off in Settings, or not allowed for the account, the smaller sizes are listed greyed with the reason. A held row names its size, Original or the rung
+- A smaller copy records one audio track, in your audio language, keeps the file's text subtitles as tracks to switch between, and burns the subtitle you would see into the picture when it is a picture subtitle (PGS, DVD or DVB)
+- The Downloads ON THIS DEVICE heading shows the download rate while anything downloads
+- Holding Resume on an info panel asks, then plays from the beginning
+
+### Changed
+
+- Settings' Streaming section is the measured connection speed over one row, Server transcoding, whose page holds the levels and, while the server may transcode video, the quality presets under them
+- The device posters setting reads "Generate missing posters", made locally and only when the server has none
+- Live TV search, on the Search tab and the Apple TV channel wall, finds programmes through the end of tomorrow by their name, episode title or description, from the server's guide and the guide sources alike, so a game named only in its description shows before it airs. A show repeating on a channel is one card, its next airing. The server's listings are read in the background and the results fill in when they land; a guide refresh reads them again
+- On iPhone and iPad the Channels screen's search is a search button in the navigation bar that opens the Search tab with its field focused
+- A programme card names its episode after the show, or its channel when the guide gives no episode, so a show on a channel of the same name no longer reads its name twice
+- A scheduled recording's info panel leaves out the Record status line; the Cancel Recording button already says it
+- Seeking in an MPEG-TS file, a Live TV recording among them, jumps by estimated byte position instead of FFmpeg's search over the wire: one to three requests where a recording over HTTPS took 5 to 17
+- The on-device playback engine is its own package, `@keiver/tomo-engine`, in the repository's `packages/` workspace: the remuxer, live sources and the FFmpeg build reach the app as the TomoEngine, TomoLiveSources and TomoFFmpeg pods through the package's config plugin, with their host tests alongside. The engine knows no Jellyfin routes; the app maps its server onto the engine's API, and the tuner groups module stays in the app
+- The live TV services are their own package, `@keiver/tomo-live`, beside the engine: the neighbour channel ring, the focused card's warm session, live frames and clips, channel health, XMLTV guide sources and the `LiveClip` view. The app hands it its channels once through `configureLive`; the engine's per-file verdict store moves into `@keiver/tomo-engine`
+- The download prompts read in German, French and Spanish
+- The Open Source list shows eight rows on iPhone and iPad and five on Apple TV
+
+### Fixed
+
+- On Apple TV with automatic subtitles on, the subtitle track the system marks On loads
+- A download the server converts played without its saved subtitles (since 2.2.2)
+- Pausing a download the server converts restarted it from zero: Jellyfin streams a conversion with no ranges to resume from, so its row has no pause
+- An original download rewrapped into MP4 kept only the audio tracks MP4 carries, so a film with DTS or TrueHD beside AC-3 kept the AC-3 alone. A file with such a track keeps its own container and every track, and plays through the engine (since 2.2.0)
+- The Downloads card could sit over the ON THIS DEVICE heading, and a new row draw over the old one, after the list changed
+- The Spanish playback line reads "sin trabajo en el servidor"
+- A file with a forced and an SDH image subtitle track in one language: subtitles set to that language land on the SDH track, not the forced one. The SDH track leads its language in the player's list and is marked as SDH for the system (#94)
+- A channel card whose airing programme shares the channel's name shows the name once
+- A picked channel group keeps its green wash while focused
+- An MP4 with its moov at the end plays instead of failing on segment 0: the engine's input opens a fresh connection per request (regressed in 2.2.9 by 62988f68)
+- Seeking in a file whose audio sits just behind the keyframe the seek lands on no longer closes the app: that audio is dropped instead of aborting the muxer (since 2.2.3, 3c04697b)
+- At "Only for unsupported files" or "Off", a slow link waits for the engine instead of reaching the server or erroring; with the server ruled out, the engine gets one fresh session before the error
+- The loading spinner holds until AVPlayer is playing, not on the start tick it sends while still filling its buffer
+- Picture in Picture leaves the player for where playback started, the window rolls a queue into its next item, and restoring it reopens the player
+- Tuner channel groups load from an M3U tuner the server reads on its own loopback, read at the server's host
+- A guide source's footer leaves out the playlist URL
+- A file read that stalls on an open connection reconnects at its offset after 2 seconds instead of waiting up to 15
+- A picture subtitle picked beside a text subtitle in the same language draws: both reported selected, and the pick could not be read
+
+## [2.2.9]
+
+### Added
+
+- Live TV groups: a band above the guide filters it to Favorites, All, your own groups, the groups a tuner's M3U playlist declares, and the server's News, Sports, Kids, Movies and Series categories. Your own groups are made in Channel Settings, or from the Groups button on a channel's info panel, which adds the channel to them and holds its favorite
+- Guide sources, in Channel Settings: listings for channels the server has none for, from any number of XMLTV guides you add and the guides your tuner playlists declare, asked in order. A channel is matched by its tvg-id, then its tvg-name, then its name, letter case aside. The screen shows each guide's status, how many channels it matched and which, its size on the device and when it last downloaded, turns a guide off, and clears the downloaded files. A downloaded guide is reused for an hour, and Refresh guide downloads the guides again and reports how it went
+- Live TV search: Search lists matching channels and programmes on a Live TV shelf above the library results, channels first, then programmes by start time, ended ones left out. The channel wall has a search of its own
+- Channel health: a channel whose source refuses it twice wears Offline, and Hide offline in Channel Settings leaves those channels out of the guide and the wall
+- Channel cards rest on their channel's newest frame and loop a five-second clip recorded on the device: on Apple TV while they or their guide row hold focus, on iPhone, iPad and Mac every card on screen while the channel column is at full width. A channel with no listings reads "No listings for" its name in the guide, and shows its recent frames under one "Seen at" caption. The clip is encoded on the device at up to 360p, 15 frames a second and 1 Mbps, so a wall of cards loops small files, and a clip cut off while it is written is never looped
+- Dragging the guide's time ruler scrolls the grid, with a fling on release
+- Record from the player on Apple TV: a Record button in the playback controls records the programme on air, and a channel with no guide records for the Recording length set in Channel Settings (30 minutes to 3 hours, 2 hours by default). The button reads Stop Recording while a timer records
+- A heart in the Apple TV playback controls adds the video or live channel to favorites, or removes it
+- The guide opens the info panel for a channel or programme: a programme's panel records it, and a channel's also favorites and groups it. An in-progress recording's panel shows its size, its length so far and a Stop action
+- A channel card wears a red REC pill while a timer records it
+- A recording in progress is marked outside the player: the Home tab's badge on iPhone and iPad, a red dot on the Libraries heading, REC on the Live TV card, and the guide's Schedule glyph badged in red. Scheduled opens a recording's panel from its row, and Stop All Recordings stops every one in progress
+- Short confirmations appear as a one-line strip: a recording started, with its length, or stopped, and a guide refresh starting, finishing or failing
+- Server admins can delete an item and its files from the server in the info panel, after a confirmation
+- On Apple TV, Live TV is a tab of its own when the server has a Live TV library
+- On Apple TV the speed above Streaming Quality in Settings takes focus, and selecting it measures again
+- On a Mac, Escape on a scrolled guide returns it to the first channel before it leaves the screen
+- A grid card's badge carries the watched eye, except on music
+- Commercial skipping, where the server marks commercial segments: a Skip Commercial pill over each break on Apple TV, and on iPhone, iPad and Mac playback seeks past each break itself while Skip commercials is on in Channel Settings (on by default)
+- The Apple TV Top Shelf adds recently played live channels to Continue Watching in one row, in last-played order, each channel's logo whole on the app's channel card
+- A UI section in Settings: Language picks English, Deutsch, Français or Español for every screen at once, System by default, and Show device generated posters (on by default) turned off leaves cards on the server's poster alone
+
+### Changed
+
+- The info panel's secondary actions are glass circles beneath its main buttons
+- On a series programme's info panel, Record Series or Cancel Series is a button beside Watch and Record, and the record buttons wear the gold outline with a red icon
+- The info panel's playback line (Direct Play, Re-encoded on this device, or Transcoded by the server) sits in a Playback section at the end of the panel, so the header reads the same for every file and connection
+- On iPad the info panel's centred card is at most 900 points tall, and a longer panel scrolls inside it
+- The info panel's artwork fills one 16:9 area across the top whatever the picture's shape, and the panel opens once its artwork and buttons are ready, so nothing below moves
+- The guide ruler shows the current time in gold above its labels
+- Names written by a metadata scraper with HTML entities, such as "&amp;", read as the character they stand for in the app's screens
+- Episode cards take the same landscape slot as the other cards in a folder grid, whatever the shape of their still
+- On-device playback runs on FFmpeg 8.1.3
+- A channel the tuner lets clients read directly is read by the device from its source, with no stream held open on the server; the server relays only what the device cannot reach
+- Previews, warm-ups and playback share one budget of connections to a provider, learned from the provider itself, and playback always wins
+- A channel focused for two seconds is already being read when Play is pressed, so playback starts from that instead of opening the channel again
+- Player loading shows a bare spinner for eight seconds, then a status line, and at twelve seconds what it waits on; the error screen says where playback stopped
+- Loading rows are a small gold spinner with its label centred beneath it
+- On iOS, toasts reach down past the navigation bar
+- On a connection that carries a file, playback offers only the device's own copy: the server starts no lower-quality version, audio or transcode for it. The server's versions are offered only on a connection too slow for the original
+- The connection speed in Settings is measured by reading ten seconds of a video on the server, never a test file of the server's own, and playback follows the speed the engine measures on the file it plays: a drop is followed at once, a rise once it holds
+- The guide ends two days out; nothing past that loads or scrolls into view
+
+### Fixed
+
+- On Apple TV a live channel on screen that dies shows its error screen with Retry focused, and Menu from it no longer sends the app to the background
+- A video paused from the playback controls stays paused through a stall, a rebuild after a stream error, an audio track switch and a seek, and one press of the space bar on a Mac resumes it
+- Cancelling one airing of a series keeps Cancel Series on its info panel: the panel reads the server's series rules
+- A long horizontal scroll through the guide no longer piles up cells: a row mounts only the cells within about two viewports either side of the one in view
+- Guide posters load only for the rows in view and the cells on or just past the screen, once the scroll rests, so a fling past them loads none
+- A stream error after the player screen has closed ends playback instead of retrying a player that cannot return
+- Channels either side of the one playing warm up only for 30 seconds after a flip, so they no longer starve the playing channel on a slow connection
+- The guide no longer pulls the focused row to the top on every move
+- After a fast scroll, the posters the engine makes for the cards on screen come first
+- A segment the engine fails to write is dropped instead of being served broken
+- Search results for an earlier query no longer replace those of the latest one when they arrive late
+- A live stream stayed open on the server after a preview or an ended playback; every open is closed by the app that made it, on the server that made it, and sent again at the next launch or return to the app until the server answers it
+- Two viewers of one channel no longer end each other's stream when one leaves
+- Servers on a plain http address outside the home network connect again, in the app and the Apple TV Top Shelf; App Transport Security had been left on since 1.5.0
+- Menu out of the player pops only the player, never the folder beneath it
+- A queue advance under Picture in Picture swaps the next item inside the window's player, and autoplay advances straight into it
+- The guide window restarts at the current half hour on a new sign-in, and grows until it fills a viewport wider than it
+- Picking another channel group opens the guide at its first channel
+- An account whose token is gone or rejected leaves the saved list
+- A deinterlaced transcode keeps the input's clock
+- 4K on a fast connection starts on the device's copy instead of on the server's lower-quality versions first
+- One speed reading that caught a Wi-Fi stall no longer lowers the playback ceiling; the speed moves only when the next reading agrees
+- A server disk waking from sleep no longer makes a fast connection read as slow at the start of playback
+- Show in Folder opens the folder already holding the item, instead of drawing the folder's top first
+- A play queue still being built no longer replaces a newer one started from another folder
+- High-bitrate files no longer run the Apple TV out of memory: the player's forward buffer is held to about 200 MB, and the engine writes each segment without a second full copy
+- A resumed recording no longer waits forever while getting the video ready: a segment that opens past its start restarts a segment earlier at once and is served short after three tries, and an MPEG-TS resume seeks once instead of twice
+- The Settings speed test stops when playback starts or the server or account changes, and a read cut off before its ten seconds is not kept
+- A live preview that finds the picture unchanged no longer counts as a lost connection to its provider
+- Guide and wall cards off screen, on a screen out of focus or during playback hold no preview player
+- A guide refresh drops programmes the server no longer lists, and a guide source that fails keeps its listings
+- A deleted item leaves the search results
+- On Apple TV the heart and Record in a live channel's playback controls no longer wait on a lineup of thousands of channels: the player reads the playing channel and the 29 after it
+- A Live TV channel from a tuner behind Jellyfin 12 plays: the server labels the channel's streams from the tuner lineup (an MP2 soundtrack reads MPEG) and every SD channel was declined on that label; a live channel is now judged by the engine on the stream itself, and a soundtrack the tuner lists but never sends (an audio description track) is left out instead of ending the session
+- A tuner's HD channel starts sooner: the engine's probe of a live MPEG-TS stops after two seconds instead of running to FFmpeg's limits on streams it cannot read
+- The Streaming Quality preset caps a live channel the server transcodes; Auto keeps the server's own cap
+
+## [2.2.8]
+
+### Added
+
+- The audio language and subtitle choice picked during playback are remembered in the account's own Jellyfin Playback settings, so the next item opens on them and every device signed in as that user follows them, other Jellyfin clients included. Choices made in Jellyfin's settings are followed too, Smart subtitles among them. A pick made offline syncs on the next item; the demo account, and a server that refuses the change, keep it on the device
+- Live TV on iPhone: the column's resize handle is a glass knob that slides along the seam, and the day cell above the channel column drags the column too
+
+### Changed
+
+- The iPhone and iPad app icon draws the brand mark smaller on its tile, and the Apple TV App Store icon sits on the splash screen's dark
+
+### Fixed
+
+- An audio track or subtitle picked mid-item no longer reverts when the app returns to the foreground
+- A remembered subtitle language no longer turns subtitles off on a file that spells it differently ("en" in an MP4, "eng" in a stream)
+- On iPad, Home, Search, Downloads and Settings clear the floating tab bar at the top
+- On Apple TV, the server list and SyncPlay keep the tab screens' header position, and the sign-in form narrows to a form's width with Back as wide as Sign In
+- The Live TV guide's now edge stands as tall as the ruler's hour marks
+
+## [2.2.7]
+
+### Added
+
+- Auto quality adapts between the original and smaller server-converted streams as the connection changes, without replacing the player. Audio and subtitle tracks remain selectable
+- Live TV on iPhone: a grip on the seam between the channel column and the guide resizes the column; drag it left past the snap zone and the column magnets to the channel logos alone, collapsing the rows to logos
+- A Live TV channel with no listings fills its guide cell with "No guide data" over "Listings unavailable for this channel", following the device language
+- On Apple TV, folder browsing covers the tab bar, and the folder header carries a Home button that leaves the whole folder stack in one press
+- A folder's background is tinted from its own artwork: its backdrop, else its poster, else the first poster inside it
+- Live TV Channels: a wall of every channel behind a Channels button that leads the Live TV header, its cards the guide's, tuning on select. Its Settings hold Auto update previews, Favorites only and the sort, channel number or name, and the wall and the guide follow them alike; a filter toggle beside Settings sets or lifts Favorites only
+- Live TV favorites: press and hold a channel on the wall or in the guide's column for a sheet that favorites or unfavorites it. Favorites wear a heart and are kept on the device by channel number and name, so they outlive the server; with Favorites only on, the wall and the guide hold to them and the Channels button shows the filter symbol
+- Live previews: every channel card in view wears a fresh frame of its channel, refreshed while it stays in view and kept across a reload, with the channel logo as a mark in the corner. A master playlist is read at one of its own variants
+- The guide's channel column is made of the same video cards as the wall, and programme cells carry a slot line and their artwork
+- Recordings: Filters and the folder header on the Recordings screen, and Show in Folder on a recording opens it there
+- The playing track's card wears the level bars on iPhone and iPad too
+- Recordings with nothing to show say the account may not have access to the Recordings library, and where a server admin grants it
+
+### Changed
+
+- Slow connections start with a smaller stream selected for the measured connection, with two segments buffered ahead
+- Home shelves show larger cards, with landscape artwork cropped to a 3:2 frame
+- A grid card's title sits on a translucent bar, so scrimmed artwork shows through behind it
+- On Apple TV the home shelves are sized so a third row peeks above the fold
+- The phone's Live TV programme panel closes with a glass button
+- The Filters button carries a funnel icon
+- On Apple TV, a focused glass button deepens its gold tint and turns its icon and text white
+- A poster the engine takes from a file is the keyframe nearest the batch's average, read from the 10% mark, with letterbox and pillarbox bars cropped out
+- Chapter pictures the engine makes are asked for once the picture is playing, and not on a connection measured too thin to carry them beside the stream
+- A channel card titles the programme on air before the channel name, recording cards wear a camera mark, and a card with no artwork wears a glyph for its kind
+- The guide ruler's marks centre on the cell edge, and the cell scrim reaches the cell's edges at rest
+- The photo viewer shows a spinner until a photo draws and opens a small preview first, and photos arrive as WebP, about a fifth of the PNG size
+
+### Fixed
+
+- Supported originals no longer trigger unnecessary server conversion on fast connections
+- Corrected HEVC and audio declarations that could prevent original-quality playback
+- Original video and audio responses wait for real media instead of sending placeholder bytes during preparation
+- Peak BANDWIDTH declarations account for indexed source data and produced segments instead of relying on average bitrate alone
+- Audio tracks map correctly when separate subtitle files change Jellyfin's stream numbering
+- Server fallback streams respect the account's video-transcoding permission
+- 8K video the device does not copy plays as one server transcode; the adaptive rungs each decoded the source and the pair stalled
+- On iPhone and iPad, Live TV Recordings and Schedule show their own back title instead of "(tabs)"
+- A book that renders no pages is turned away with an error instead of hanging the reader
+- A file the server no longer has shows its error at once instead of being retried through the server first
+- The loading stage line under the spinner shows in every build
+- On iPhone and iPad a folder stays put when the Show in Folder target already sits in view
+- A video that keeps failing stops retrying after two minutes and shows its error, and a file every lane reports as corrupt shows it at once instead of being retried through the server forever
+- With Favorites only on, a channel wall page that fails to load waits before it is asked for again instead of being requested back to back
+- Recordings filters search every recordings library on the server, not only the first
+
+## [2.2.6]
+
+### Added
+
+- Live TV. A Live TV library opens a guide laid out by time and channel. Selecting a channel, or a programme on air, tunes it; a later programme, or a long press, opens a panel that watches it, records it or the whole series, or cancels the recording, and timers are marked on the guide cells. Recordings and the Schedule are screens of their own, behind glass buttons on Apple TV and bar buttons on iPhone and iPad; the Schedule and the recording controls appear only for accounts the server lets manage recordings. A channel's card carries the programme on air and a red LIVE mark. A channel plays through the on-device engine, cut live on keyframes into a sliding five-minute window. An HLS or DASH origin is read directly with the tuner's own headers and no stream opened on the server; a tuner stream comes through the server untouched. AES-128 channels play; a FairPlay, Widevine, PlayReady or SAMPLE-AES channel is refused at the open. CEA-608/708 captions, DVB subtitles and teletext pages ride the live stream. A channel that drops reopens once, then plays on the server's transcode, which also takes a channel the engine cannot open or keep up with. On Apple TV the remote's channel-skip gesture flips channels through AVKit's own interstitial, the channels either side and the one just left keep running in the engine so a flip lands on a session already cutting segments, and the info panel carries the channel ring as a Channels tab
+- Books. A Book library opens in a full-screen reader on every platform: PDF, CBZ, CBR, CBT and CB7 comics, EPUB, MOBI and Kindle AZW/AZW3. Pages are rendered on the device as they come into view. On Apple TV play/pause zooms a page and the arrows pan it once zoomed; Cmd-plus and Cmd-minus zoom on a Mac; pinch and double tap zoom on iPhone and iPad. Text books step through four text sizes, on Apple TV with play/pause. Where you got to is written in the server's own encoding, so Jellyfin's web client resumes at the same page
+- German, French and Spanish, following the device language, across every screen: tabs, library, filters, search, downloads, settings, connect, player, info panel, photos, SyncPlay, diagnostics and licences. Product nouns follow Jellyfin's own translations
+- Saved sign-ins as a strip of avatars under Scan Network and Add Server, one per account across servers, the connected one ringed green; a tap reconnects with the stored token, no picker. Server rows read name over address with a chevron into the sign-in step. An account with no picture gets a generated two-disc avatar, covered by its photo once loaded. A long press on a person signs in again with a password or forgets the sign-in. On Apple TV the saved people stand in a column beside the server list, a focused server row shows only its own sign-ins, Right from a row lands on the nearest person, and Left returns to the row that led in
+- Scan Network lists every Jellyfin server on a host rather than the first to answer, and sweeps the common second-instance ports, 8097, 8098, 18096 and TrueNAS SCALE's 30013, after the defaults. An HTTPS answer whose certificate the device does not trust gives way to the server's HTTP port
+- Embedded text subtitles are decoded on the device and served to the player as WebVTT, SubRip, mov_text, ASS and SSA alike, cut on the session grid and rebased with it. The server's /Subtitles/Stream.vtt ran ffmpeg over the whole file before it answered, and the player held readiness on the selected track, so a film with subtitles waited 5.7 to 11.8s to start; it starts with the picture. A sidecar file keeps the server's URL, since it costs no extraction. ASS and SSA keep bold, italic and underline, drawings are dropped rather than printed, and a script written with CRLF, which is what Aegisub writes, parses: Swift reads CRLF as one Character, so its style table came out empty
+- The Open Source page lists libarchive, XZ Utils, foliate-js and libzvbi beside the rest of the media stack
+- Jellyfin's "Play next episode automatically" setting is followed: with it off, the Up Next card waits for Play Now or Close instead of counting down (#82)
+- While a video or channel opens, one line under the spinner names the stage it is in, once the first second has passed
+
+### Changed
+
+- The demo server leaves the server list. demo.jellyfin.org/stable is the Add Server field's placeholder, and Go on the empty field, or on that address typed out, signs into the demo server
+- On Apple TV the Up Next card arrives when the credits marker starts, or at the end of an episode without one, rather than 30 seconds before the end
+- On Apple TV the folder header, Filters, Diagnostics, SyncPlay, the Up Next buttons, the info panel's action circles and the sign-in links sit in glass capsules
+- Filters names the library it applies to under its heading on every platform, and on Apple TV Close and Clear All share one row
+- The Downloads storage gauge fills red across a gold track as the downloads grow
+- Grid cards catch light along their top edge
+
+### Fixed
+
+- A chapter picture marked on a fade or a black card comes from the first usable frame a few seconds away
+- A button on Apple TV keeps its focus lift after it is pressed
+- On Apple TV a seek as the Up Next card slides in no longer presents a second card over it
+- Shuffle on a library filtered by Favorites, Played or Unplayed no longer drops or repeats items as more pages load
+- An iTunes-tagged MP4 no longer wears an S00E00 badge. Its season_number=0 and episode_sort=0 reach the server as ParentIndexNumber 0 and IndexNumber 0, and a 0/0 pair is read as unset, so the name and filename decide
+- A fast page swipe in the photo viewer no longer counts as a double-tap zoom on iOS
+- The filter chips no longer sit on the baked ambient canvas
+- A live segment on the copy lane is cut on a keyframe rather than at a fixed four seconds, so a long-GOP channel never opens its next segment mid-picture
+- A splice packet that is itself a keyframe opened the next generation through a context the roll had freed, and the engine crashed in av_write_frame; the muxer is rebound after the roll
+- Leaving a channel no longer reopens it on the server: channels have no resume point, so the Stopped report's read-back skips them
+- A stream joined mid-GOP, a tuner or a tuner recording, no longer logs every packet before its first keyframe; the probe and the poster grabber read keyframes only
+
+## [2.2.5]
+
+### Added
+
+- SyncPlay: watch together through Jellyfin's own SyncPlay groups. Settings, Jellyfin Server, SyncPlay (shown when the account has SyncPlay access) makes a group on arrival and fills the screen with its join code; a phone or iPad signed into the same server scans it and is in, nothing typed and no credentials in the code. Where someone is already hosting, their groups are listed to join instead. The server drives playback for every device in the group, play, pause, seek and stop, and nobody starts until everyone is ready; a pause or a scrub on one device reaches the others, and a device that stalls holds the group until it catches up. Going to the background keeps the device in its group. The row says who is connected and whether playback is paused, and the Settings tab wears a dot on iPhone and iPad while in a group. Video only
+- Diagnostics is a versioned JSON document, `{schemaVersion, app, os, device, playback}`, described by `docs/diagnostics-session.schema.json`, with the plain-words story under it; Copy, Share and Mail export the same document with the story as `summary.description`. The device head names the model as Apple sells it, its identifier, the OS, cores and memory, and what VideoToolbox decodes in hardware, with the tallest frame each decoder opens
+- A poster the engine takes from a file skips fades and black frames (five positions are tried and the first with usable brightness and contrast wins), converts through the frame's own colour matrix, and is auto-enhanced. A file that would not open when its poster was asked for is asked again, with a doubling wait
+
+### Fixed
+
+- An HDR film that reaches the server lane plays. A server with tone mapping off answers an H.264 request with the PQ colour tags kept, under a master that says SDR, and AVPlayer refuses the pair (-12927). The server is asked for HEVC alone where this device decodes Main 10, so an uncapped session arrives as HDR, and every server stream of an HDR source runs through the playlist shim, which retags the init segment of any variant the server declares SDR to BT.709 before the player sees it
+- A file whose opening segment arrives slower than it plays stays on the engine. The pre-flight blamed the engine for the link: a short high-bitrate clip is one segment, so its first segment cannot finish before the whole file has been read, and the verdict sent it to the server. The engine reports how long each segment waited on the input; a segment that waited is kept, and a deadline that finds the session still pulling bytes waits again, up to a minute
+- The simulator plays through the engine again. The decode probe required a hardware decoder, which no simulator has, so every file there was re-encoded in software and a 4K file fell below realtime
+- Apple TV HD, and any device without an HEVC decoder in hardware, plays 10-bit HEVC again. The on-device converter built a 10-bit buffer for an 8-bit H.264 encoder, so no frame ever reached it and the session timed out at its first segment; it now lands in the encoder's own format. The server fallback then offered HEVC regardless of device and Jellyfin copied the stream back untouched; it asks for H.264 only where the device cannot decode HEVC in hardware, so the server re-encodes
+- Only a hardware decode is copied to AVPlayer. The decode probe required nothing of the decoder it found, so a device with only a software HEVC decoder was handed HEVC by the engine and by the server alike, with no lane that produced H.264. The probe now requires a hardware decoder, asks per codec, H.264 included, at the stream's own size, and reports the tallest frame each decoder opens; a taller frame takes the engine and is measured there, and the Original preset is capped at that height on the server. Below iOS and tvOS 17 the answer comes from `VTIsHardwareDecodeSupported`
+- The player no longer reads a file's metadata and drives the audio session on the main thread as it opens, which held the app until the playlists arrived
+- Downloads' empty state keeps its ON THIS DEVICE header and points at the long-press panel
+
+### Changed
+
+- Streaming Quality marks the chosen preset with a green tick at the trailing edge, like the other lists, instead of filling its row with gold
+- A fresh Diagnostics session shows a green circle before its subtitle rather than a gutter dot
+
+## [2.2.4]
+
+### Changed
+
+- The app icon is assembled from the layer art by tvos-assets 1.5.0, and the brand SVGs are redrawn
+
+## [2.2.3]
+
+### Fixed
+
+- 10-bit HEVC no longer fails with "Unable to Play" on a device that cannot decode it. The engine opens a VideoToolbox session against the file's own parameter sets before copying; where it does not open, the video is re-encoded on the device to 8-bit H.264 and the stream declares SDR to match. Direct play steps aside for the same files. A device that cannot keep up still routes to the server, as before
+- Resuming or scrubbing into some files waited half a minute and then played from the server. The first packets after a seek can carry no timestamp, or one a tick behind the last, which the muxer rejected and the engine treated as fatal. They are repaired past the last written timestamp, so the picture is up in seconds and the file stays on the device
+- A session on a slow link is no longer thrown to the server when its first segment misses realtime. The slow link is the reason the smaller server-fed rung exists, and the file is no longer pinned to the server for the rest of its playback
+- The connection measurement never repeats a request URL, so a cached response can no longer read as a link many times faster than it is
+- The quality rows say what each preset plays on the measured connection, off the player's own entry pick, and the note under them says files play as they are
+- Diagnostics said the server sent a downloaded file, and called a play stopped in its first seconds "Never started". Both fixed
+
+### Changed
+
+- AV1 without hardware decode plays on the device, decoded in software and re-encoded there, instead of being transcoded by the server. Where the hardware decodes AV1 it is still copied untouched
+
+### Added
+
+- The smaller server-fed rung is proved before it is offered: the opening segment is fetched and rewrapped first, so a server that refuses the request or cannot keep up is found before playback starts and the rung is withheld with a stated reason. A rung that stops delivering mid-playback is retired, and Diagnostics reads what the engine decided
+- Diagnostics a device sent arrive as a row under About Tomo TV rather than a prompt. This device's own session is a row too, rows swipe to Email or Remove, and a session under five minutes old wears an unread dot
+- Bundled Packages is one card with the licence list inside it, and licence text reflows to the screen
+
+## [2.2.2]
+
+### Added
+
+- Every codec the engine decodes now plays on the device at any size, 4K VP9 and AV1 included. The engine times its first segment before the player opens; a file this device cannot keep up with plays from the server instead, with nothing to restart, and the app remembers that answer per file until the next update
+- A video the server has no poster for shows a frame of itself. The engine opens the file, takes the keyframe a tenth of the way in, and the picture stands on the library cards and shelves, the info panel, the Up Next card, the Apple TV player's Up Next tab and the player's own artwork. Frames are made one at a time as cards come on screen, a card that scrolls away withdraws its request, and a downloaded item's frame comes from the file on the device. They keep in a 64 MB pool on the device, oldest out first
+- Chapters on Apple TV show a picture for every marker, whether or not the server extracted chapter images. Where it did not, the engine takes the keyframe at the chapter's start, or the last one before it, from the file on a connection of its own as soon as playback starts, and keeps it for the next play
+- A folder the server has no picture for shows its first videos as a collage on its card, the first across the top and the others side by side below, in the order the folder opens, and its info panel takes the same picture. A season without a poster of its own draws the series poster
+- A download without a server poster keeps the engine's keyframe beside its media, so the Downloads list draws the same picture the grid does with no server, and downloads held before this get theirs on the next launch
+- Send to iPhone on the Apple TV's Diagnostics screen: the last playback goes into your account's own settings slot on your Jellyfin server, one slot per Apple TV. Tomo TV on iPhone or iPad offers it once when it arrives, to view or to email with the whole log in the body, and lists each sending device as a row under About Tomo TV, with Copy and Share. Apple TV has no clipboard, and this is the only place the log ever goes
+- Share on the iPhone and iPad Diagnostics screen hands the log to Mail and the rest of the share sheet as a text file
+
+### Changed
+
+- The Diagnostics reading drops the second person and names what it measures, the note about the log sits at the foot of the card, and Copy is a button in the bar
+- The mini player's mark is a pair of level bars mirrored about their centre, moving only while the queue is playing
+
+- The Open Source page heads with two centred pills, the build and the app title, over one line, and off Apple TV the credits card caps at five rows and scrolls inside
+- The leading tile on every settings row keeps one width and one glyph size, and only its height follows the text beside it
+
+### Fixed
+
+- A downloaded track could be left unplayable. An MP3 was rewrapped into an MP4 that nothing on the device can open, and the rewrap deleted the original, so the row read ready over a file the player could not start. MP3, FLAC and WAV downloads keep their own container now, and a track an earlier build emptied this way is fetched again on the next launch
+- A downloaded video would not play with no network. Its subtitles sent it through the on-device engine and, when that could not be reached, on to the server, which is the one thing a download exists to do without. A file on the device plays from the device
+- Subtitles no longer send a film to the server to be re-encoded. They reach the engine, which draws image tracks and carries text tracks, and a file the engine cannot take plays as it is rather than being re-encoded to have subtitles painted into the picture
+- A folder of many downloads no longer stalls the Downloads list when it opens. Rows are drawn as they come on screen, so an album of 80 tracks costs what a screenful costs
+- Opening Downloads from a download's own button scrolls to that row instead of leaving it below the fold
+
+- On Apple TV, a file with chapter images could not start playing until every image had downloaded (#75). The pictures load on their own after playback starts
+- A picture kept for one server never stands in for another server's item of the same id: switching server or account empties the frame pool along with the other caches
+- File sizes under a megabyte read in kilobytes instead of 0 MB
+- After a restart, Diagnostics showed the last playback that ended or failed, not the last one played, and a session left by an older build appeared under the current build's name. Every event is now written as it happens, and the session carries the build that recorded it
+
+## [2.2.1]
+
+### Added
+
+- Chapters on Apple TV: a film or episode with chapter markers lists them in the player's info panel, and picking one jumps there (#71)
+- Hardware keyboard on the Mac: Escape goes back, space and Return play and pause whatever is playing, the arrow keys seek fifteen seconds in a video or a track, Command with the arrow keys changes track, Command F opens Search and Command comma opens Settings. Every one of them steps aside while you are typing, and the unmodified keys exist only while something is there to answer them, so a grid keeps its arrow scrolling and a focused control keeps space and Return (#72)
+- Pinch to zoom a photo, drag it around once it is zoomed, and double tap to zoom to the point you touched or to put it back
+- Drag left or right to change photo on iPhone and iPad, and drag down to close the viewer. Tapping the sides no longer steps, which is what used to override the drag
+- Share a photo from its info panel, through the system share sheet
+- The arrow keys step through photos in the viewer on the Mac, and a double click on a video fills the frame or restores the letterbox
+- Diagnostics, under About Tomo TV in Settings: what the engine did on the last playback, video or music. The lane it chose and its reason when it declined a file, the source as your server describes it, every error, and the build's version. iPhone and iPad can copy the log. Only the last session is kept and it never leaves the device
+
+### Changed
+
+- On iPhone, iPad and Mac the music player's artwork is a rounded card over a blurred wash of itself, sized to stay clear of the transport bar in any window. The card takes the artwork's own shape, so a 4:3 cover no longer sits in bands, and Apple TV shows the same card in place of the disc
+- The streaming quality rows read as ceilings, Up to 1080p, and a note under them says when a ceiling applies at all: a slow connection, or a file the server has to convert. Everything else plays at its original resolution
+- The photo viewer's close and slideshow are one control at the top left. Pressing it opens them both out of itself, and they merge back in when it closes. It fades while you leave it alone and comes back on a touch, a key or a moved pointer, and an open menu holds it there
+
+### Fixed
+
+- Opening a photo from its info panel showed the folder's first photo instead of the one that was pressed
+- A photo opened from the New, Favorites or Search shelves went to the video player, which said it could not be played
+- Show in Folder landed on the folder with nothing selected, then scrolled to the item once you had already started browsing
+- The mini player's previous and next did nothing at the ends of the queue instead of showing they could not move, and a press on the right of Pause landed on Next
+- The music player's poster could disappear in a landscape window
+
+## [2.2.0]
+
+### Added
+
+- Downloads on iPhone and iPad: keep an item or a whole folder on the device and play it with the server switched off, out of range, or gone. A Downloads tab lists what is stored, folders group their own items, and a gauge at the foot of the card shows what the downloads take and what is left free. Holding that gauge is what clears them, and nothing else does. Apple TV has no persistent storage of its own, so it has no Downloads tab
+- Positions you reach with no server are held and sent up the next time the app can reach it, so an episode watched offline is where you left it everywhere else
+- Dolby Vision plays as Dolby Vision. Single-layer files ride a straight copy. The dual-layer discs Apple hardware cannot decode are folded into one layer on the device as they play, which costs what a copy costs
+- A player control rides above the app while music plays, draggable to any corner and tucking itself out of the way when you leave it alone. Holding its artwork stops playback
+- Songs carry their disc and track number on the card, in the info panel's details, and under the title in the player
+- The info panel offers the play actions a folder actually holds: Play Videos, Play Music, Slideshow, or Open when there is nothing to play
+- Long press a search result for the same info panel the shelves give you, and play it with its resume position and a queue
+
+### Changed
+
+- Folders on iPhone and iPad open in a real navigation bar, with the folder's own name as the back label and Filters as a bar button, so the custom header is gone
+- Library tiles name what they are counting instead of showing a bare number: episodes, tracks, photos, or the items in a collection or playlist
+- Each streaming quality preset states the connection speed it needs, and the Video Quality heading reads out the measured rate
+- The build's version appears on the Settings Open Source row while you hold it down, instead of sitting on the row
+- Artwork crops from the top, so faces survive a wide card
+- Clearing progress from the info panel is reversible while the panel is open, and only written when you close it
+
+### Fixed
+
+- Songs were labelled with a season and episode tag (S01E01) instead of their track number (#68)
+- Music stopped when you left the player on Apple TV to browse. The queue keeps playing, and opening the track again brings the player back (#68)
+- The Apple TV player's Up Next panel called a queued song "Episode 5"
+- Show in Folder was offered on an item you were already viewing inside its own folder
+- Playlists longer than 500 items played only their first 500
+- A folder that failed to load said it was empty instead of saying the server did not answer
+- A long plot cut at its limit could leave a fragment of a tag or a broken character on screen
+- Marking an item watched or favorite from the info panel reported success even when the server refused the write
+- A picture-in-picture window detached from the app could not be closed once nothing was left to return to
+- The Library tab showed a Loading label on its first open
+- The Continue row jumped away from its first card after you removed an item from it
+
+## [2.1.0]
+
+### Added
+
+- Playback starts fast on slow servers and connections: the app measures the link to each server and remembers it, and a link that cannot carry the file opens on a smaller feed immediately instead of buffering toward full quality
+- Settings shows the measured server link: a signal ladder and a "carries up to" verdict in the Video Quality heading, presets marked when they sit above your link, and an Auto row that states where sessions will start
+- Resuming opens the stream at the saved position instead of buffering the beginning first, for both server and on-device sessions
+- A video that silently stops advancing recovers on its own: direct play re-routes at the playhead, and a starved on-device session restarts where it was
+- Music and audio files play in a dedicated native queue player: gapless track transitions, background playback on iPhone, Now Playing and Lock Screen controls, and previous/next on the Apple TV remote
+- Up Next tab in the Apple TV player's swipe-down panel, for both video and music: the remaining queue as selectable poster cards; picking one jumps playback there and closes the panel
+- Skip Intro and Skip Credits pills on Apple TV when the server provides segment markers
+- Image subtitles (PGS, DVD/VobSub, DVB, XSUB) play in the native player, decoded on the device and drawn over the video, so a disc rip whose only subtitles are pictures keeps its original video and lossless audio instead of being re-encoded by the server
+- Continue Watching shows an item inside the folder it belongs to
+- Your subtitle choice carries between items: a language you pick, or switching subtitles off, is remembered and applied to whatever you play next. With nothing remembered, the file's own default track is used
+- Saved sign-ins: each server card remembers who signed in and offers Continue as that user, reconnecting with the saved session instead of asking for a password. Several accounts on one server each get their own entry, Switch Server is its own screen, and signing out keeps saved sign-ins so coming back is one tap
+- Long-press any card for an info panel: artwork, plot and detail rows for every item kind, with Resume and its progress, Favorite, mark watched, Show in Folder, and Clear Progress
+- Resume progress shows on every card, not just the Continue Watching row
+- Library tiles show item counts, and cards carry a badge for their media kind
+
+### Changed
+
+- Auto is the default video quality: original quality when the link carries it, adaptive when it does not. The fixed presets are named by what they control (4K down to 480p) and act as ceilings, so a preset above the measured link opens lower and climbs toward it instead of rebuffering
+- Server conversions use shorter segments, so converted playback is ready sooner on slow servers
+- Far more video plays on the device instead of being converted by the server. DivX 3, Theora, DV camcorder footage, Cinepak, H.266/VVC, RealVideo, and the QuickTime and screen-capture formats now play locally, as do RealAudio, ATRAC, WavPack, Musepack and QDesign soundtracks. Files whose colour did not survive the old conversion, ProRes and DV in particular, are handled correctly now
+- Dolby Digital, Dolby Digital Plus and Dolby Atmos now reach your receiver untouched. The soundtrack is passed through exactly as it is stored instead of being decoded on the device, so Atmos stays Atmos
+- Surround and lossless soundtracks keep their quality on the device. Dolby TrueHD, DTS, DTS-HD Master Audio, PCM and FLAC are now carried losslessly instead of being re-encoded to 192 kbps AAC, and FLAC and Apple Lossless tracks pass through untouched
+- Surround layouts arrive intact: 6.1 and 7.1 soundtracks keep every channel, where they were previously folded down to 5.1, and 24-bit sources stay 24-bit
+- The between-episodes Up Next screen on Apple TV is now the system's native proposal card: the next episode's poster over the ending video, a live countdown, and Play Now / Close; iPhone keeps the full-screen announcement
+- The Apple TV tab bar picks up the system's Liquid Glass material on tvOS 26 and later; earlier systems keep the solid look
+- Help is now a section inside Settings instead of a tab of its own
+- Adding a server swaps the Add Server button for the address field in the same slot, so the rows below it never shift
+- The app version now appears on the Apple TV spine and the phone's library masthead rather than in Settings, and the Open Source link shows only while connected
+- Ambient backdrops are baked and pre-decoded at startup, so screens open on a finished canvas, and native Search sits on one too
+- Switching servers re-measures the link, so quality decisions follow the server you are on
+
+### Fixed
+
+- Subtitle tracks the file marks as forced are selectable again instead of vanishing from the picker
+- A file whose subtitles are all marked forced now shows them even when the on-device engine cannot take it: the server paints them into the picture instead of playing with nothing on screen. Skipped if you have subtitles switched off
+- Files with no subtitles no longer offer an empty Closed Captions option that draws nothing
+- Back now walks the login steps one at a time; previously it collapsed focus to the tab bar, where a second press quit the app
+- Opening the app before the device is unlocked no longer shows the connect screen as though you were signed out. Your credentials are read again and the app catches up on its own once you unlock
+- Seasons with no files behind them and missing or unaired episodes no longer appear as items that open into nothing
+
+## [2.0.0]
+
+### Added
+
+- On-device playback engine: H.264 and HEVC in any container (MKV, AVI, WMV, and more) play by stream copy without server transcoding; unsupported audio (AC3, TrueHD, MP3) converts to AAC on the device; legacy video codecs (VP8/VP9, MPEG-1/2/4, WMV, VC-1, H.263, FLV, RealVideo, VP6) transcode locally via VideoToolbox for sources up to 1080p, 8-bit, progressive
+- Multi-audio track switching served straight from the on-device engine
+- Text subtitles stay selectable in the native player during on-device playback
+- HDR10 and HLG pass through with the correct video range declared to the player
+- Original quality preset (untouched quality, now the default), listed first under Video Quality
+- Up Next between episodes: a full-screen announcement with the next episode's art over a blurred backdrop, a 5-second countdown, and Play Now / Close buttons
+- iPhone and iPad support: touch-tuned layouts, responsive columns, native player controls, safe-area handling
+- Top Shelf on Apple TV: a live Continue Watching row on the home screen; selecting an item deep-links straight into playback
+- Continue Watching keeps the binge going: finishing an episode puts the next unplayed one from that series or folder on the row, homevideos folders included
+- Long-press a card to mark it watched or unwatched, with an instant checkmark
+- Season and episode tags on video cards, from server metadata or parsed from the filename
+- Automatic reconnection when the server's LAN address changes: the app re-finds the server by its identity, no re-login; an unreachable server shows a clear error state with Retry instead of logging you out
+- Refreshed app icon, with true parallax layers on Apple TV
+- Open-source acknowledgements screen (FFmpeg, GnuTLS, dav1d, and friends) under Help
+- Loading bar with the folder name replaces the spinner when opening folders
+- Picture in Picture on iPhone and iPad: playback continues in a floating window, and starts automatically when you leave the app mid-video
+- The iPhone player opens in the system full-screen player for video and audio: the close button is always available, and swipe-down dismisses
+- AirPlay and the Lock Screen show the playing video's poster and title
+- The connected server card in Settings shows which account is signed in
+
+### Changed
+
+- Library tab is now Home; Continue Watching progress is drawn into the card title bar
+- Continue Watching episodes queue the rest of their series for binge playback
+- The folder header (breadcrumb and Filters) floats over the grid under a gradient scrim, so it never scrolls away
+- Help tab redesigned around an icon-forward feature index
+- Burn In Image Subtitles toggle removed: image subtitles still burn in automatically when the server transcodes
+- Forced subtitles no longer burn into the picture when they are text. Only image tracks (PGS, DVDSUB) do, because AVPlayer cannot render bitmaps; forced text tracks ship as selectable renditions instead, so those files keep direct play and stream copy rather than being re-encoded by the server
+- App icons for tvOS and iOS are generated at build time from a single set of brand source images
+- The phone search field and the connect flow inputs share the settings sunken-card look, with a gold sweep along the search field's bottom edge while a query is in flight
+
+### Fixed
+
+- Backing out of a video quickly no longer wipes the server resume point
+- Resume positions no longer corrupt when episodes auto-advance
+- Resuming from Continue Watching starts where the row said it would, without a stale refetch
+- Menu on Apple TV pops back one screen natively everywhere
+- Seeking with the remote in audio playback works on hardware and no longer sticks in pause
+- Focus lands on the first card when a folder opens, and no longer over-scrolls past the last row
+- Jellyfin 12 compatibility: the deprecated lowercase `api_key` query parameter is now sent as `ApiKey`, so streams, images, and subtitles keep authenticating
+
+## [1.8.0] - 2026-07-29
+
+### Added
+
+- Scan Network on the connect screen: sweeps the local subnet for Jellyfin servers and lists the ones it finds, so there is no address to type. The device's real netmask is honored, so a /23 is covered end to end rather than just the device's own /24
+- The connect screen shows this device's own IP address
+- Entering a private IP that is not on this device's subnet now says so
+
+### Changed
+
+- A failed connection lists every address that was tried and how each one failed, instead of one generic message
+- Connect probes wait longer for a cold server to answer its first request
+
+### Fixed
+
+- Reverse-proxy addresses with a subpath (for example `10.0.0.5/jellyfin`) no longer produce malformed URLs like `https://10.0.0.5/jellyfin:8920`. A subpath also implies a proxy on 443/80, so those are now tried before Jellyfin's own ports
+
+## [1.7.0] - 2026-07-15
+
+### Added
+
+- Filters panel: filter a library by Favorites, genre, artist, or year, with a shuffle toggle; shuffle plays the entire filtered set in a fresh random order that loops
+- Favorite hearts: favorited items show a gold heart while browsing, not only under the Favorites filter; long-press a card to add or remove a favorite
+- Image-based subtitles (PGS, DVDSUB) and forced foreign-language subtitles burn into the video during transcoding so they display on Apple TV
+- Resume positions sync to the server during playback, so you can resume where you left off across devices
+
+### Changed
+
+- Filter selections are scoped per library and carry over as you browse into sub-folders
+- The folder header (Filters button and breadcrumb) stays pinned at the top and shows the current library name as a faint oversized title
+- Revisiting a folder restores instantly from cache instead of showing a loading spinner
+
+### Fixed
+
+- Apple TV focus in folders and the Filters panel: Up from the top row reliably reaches the Filters button, focus is never lost when opening or returning to a loading or empty folder, and it no longer slips up to the tab bar
+- Favorite hearts paint from the authoritative favorites set, so they stay correct after toggling
+- Folders with many items paginate correctly when the server omits a total count
+
+## [1.6.0] - 2026-07-10
+
+### Added
+
+- Music Videos libraries now list and play their items (MusicVideo was missing from every library query)
+- Photo support: photos libraries, photo-enabled home videos libraries, and photo albums now show their pictures
+- Full-screen photo viewer: left/right steps photos with a slide animation; play/pause or select starts a 5-second slideshow with a countdown bar and crossfade; Menu exits
+- Trailer and audiobook items are now listed and playable
+- Album artwork shown during audio-only playback
+- Library tiles show real item counts (the server reports a bogus count for library roots)
+
+### Changed
+
+- Jellyfin media-type filters are centralized in one place so new kinds can't silently vanish again (books, live TV, and plugin channels remain intentionally unsupported)
+- New card focus treatment: gold glow and border with an opaque gold title bar; count badge is a matching gold pill; decorative folder icon removed
+- Accessibility pass: labels on inputs, images and overlays; Reduce Motion honored in marquee, slideshow and ambient background; low-contrast text bumped to 4.5:1; app forced to dark UI style
+- Poster art anchors to the top of the card instead of center-cropping
+
+### Fixed
+
+- Library tile counts on Jellyfin 10.11: recursive view queries only honor MediaTypes filters server-side (IsFolder is ignored and IncludeItemTypes returns 0 for most typed libraries), so counts now filter by media type
+- A count of 0 never renders as a badge; recursive count falls back to the direct child count
+- Focused card glow no longer clipped by the Continue Watching row; resume progress bar inverts colors on focus instead of disappearing against the gold bar
+
+## [1.5.1] - 2026-06-30
+
+### Changed
+
+- Folder browsing uses nested navigation so the Apple TV Menu button backs out one folder level at a time
+- Client reports its app version to the server in the authentication header
+
+### Fixed
+
+- tvOS focus no longer gets stuck on, or pops the screen away from, loading or empty folders
+- Stale or overlapping folder loads no longer overwrite the current view
+- Load-more no longer fires during a refresh, avoiding duplicate or skipped items
+- Root-appropriate empty-state copy on the libraries screen
+- Correct device name reported on Android and Android TV
+
+## [1.5.0] - 2026-06-23
+
+### Fixed
+
+- Connecting to HTTP and local-network Jellyfin servers on tvOS 16 (added App Transport Security exceptions for media playback and local networking)
+- Grid layout refinements from pre-release review
+
+## [1.4.0] - 2026-06-22
+
+### Added
+
+- Saved servers list on the connect screen, shown as selectable cards
+- Server auto-discovery from a bare IP or hostname (no full URL needed)
+- On-demand restore of the last connection with a reachability check
+- Ambient background (dark canvas, soft glows) across all tabs
+- Library background tinted by the focused card's poster
+
+### Changed
+
+- Upgraded to Expo SDK 56 (React Native 0.85, React 19.2)
+- Search tab hidden until signed in; native search preloaded for instant open
+- Grid adapts to content orientation (portrait or landscape) with per-card image fit
+- Redesigned cards: frosted title panel, folder count badge, shorter aspect
+- Continue Watching moved from a dedicated tab to a Library row
+- Watch progress stored on the local filesystem instead of SecureStore
+- Breadcrumb labels capped in width for deep paths
+
+### Fixed
+
+- Watch progress now persists on tvOS (cache directory; Documents writes are denied)
+- Login (Quick Connect, password, demo) lands on the Library
+- Library no longer empty immediately after sign-in
+- Stale disconnected load no longer overwrites the library after connecting
+- Removed dev-credential mechanism; Quick Connect sessions persist across launches
+- Sign-out no longer issues a request with empty credentials
+- Help tab no longer shows the version string
+
+## [1.3.4] - 2026-03-21
+
+### Fixed
+
+- Smooth MarqueeText scroll-back animation instead of instant jump
+- Stale items flash when navigating between folders
+- Container format check now handles Jellyfin's comma-separated Container field
+- Native AVPlayer errors (CoreMediaErrorDomain) now correctly classified as decode errors
+- Error messages no longer leak raw error strings to the UI
+
+### Changed
+
+- HLS manifest attributes sanitized against malformed metadata
+- URL-level native logging (manifest URLs, stream URLs) gated behind DEBUG builds
+
+## [1.3.3] - 2026-03-11
+
+### Changed
+
+- Allow HTTP connections on all networks via `NSAllowsArbitraryLoads` (previously local-only via `NSAllowsLocalNetworking`)
+- Loading username correctly when running the app locally with dev env variables
+
+## [1.3.2] - 2026-03-05
+
+### Fixed
+
+- MKV, AVI, and WebM containers now route to transcoding instead of crashing AVPlayer
+- Corrected direct play URL to include MediaSourceId
+
+## [1.3.1] - 2026-02-25
+
+### Added
+
+- 4K (2160p) transcoding: stream in Ultra HD quality
+- Per-preset H.264 levels for optimal encoding (level 5.1 for 4K)
+
+### Changed
+
+- Updated quality selector with 5 presets (480p through 4K)
+
+## [1.3.0] - 2026-01-24
+
+### Added
+
+- Quick Connect: sign in with a code from any Jellyfin device
+- Username & password sign-in
+- Continue watching: resume where you left off
+
+### Changed
+
+- Larger text for better readability on TV
+- Scrolling titles on cards for long names
+- Refined settings layout
+
+## [1.2.0]
+
+### Added
+
+- Play next queue: videos queue up and auto-continue
+- Up next overlay with progress bar
+- Seamless multi-audio track switching during playback
+- Subtitle support: external (.srt) and embedded tracks with native tvOS picker
+- Native audio player improvements
+- Updated app icons
+
+### Changed
+
+- Enhanced tvOS focus and navigation reliability
+- Faster native search loading
+- UI and stability fixes
+
+## [1.1.1]
+
+### Changed
+
+- Updated expo-tvos-search to v1.3.1 with improved native search integration
+- Removed deprecated UI code for better performance
+- Updated settings screen for improved reliability
+- Documentation updates for developers
+- Minor bug fixes and optimizations
+
+## [1.1.0]
+
+### Added
+
+- Demo mode: try TomoTV instantly with Jellyfin's official demo server
+- Full playlist support: browse and play videos from your Jellyfin playlists
+- One-tap demo connection in Settings
+- Navigate into playlists with breadcrumb navigation
+
+### Changed
+
+- Auto-fetched demo credentials from Jellyfin's public demo server
+- Playlist-specific API endpoint for proper Jellyfin integration
+- Improved folder type detection for UserView and Playlist types
+- Enhanced error handling for demo server connectivity
+
+## [1.0.8]
+
+### Added
+
+- Audio files visible when browsing folders
+- Audio files auto-play when selected
+- Dedicated audio player UI with play/pause controls
+
+### Changed
+
+- Play/pause button auto-focuses on Apple TV remote
+- TV remote select and play/pause buttons toggle playback
+- Improved button styling in audio player
+
+## [1.0.7]
+
+### Changed
+
+- Native tvOS search shows error alerts when connection fails
+- Debug Info screen protects API key (shows only last 4 characters)
+- Improved logging throughout the app
+- Cleaner validation flow for server settings
+
+### Fixed
+
+- Silent failures in tvOS native search
+- Error recovery during search operations
+
+## [1.0.6]
+
+### Added
+
+- Folder navigation with breadcrumb trail
+- Back button in grid for parent folder navigation
+- Redesigned Help screen with QR code to documentation
+
+### Changed
+
+- Unified dark background (#1C1C1E) across all screens
+- Removed animations for smoother folder navigation
+- Better focus feedback with instant border highlights
+- Settings sections with elevated card styling
+
+### Fixed
+
+- Jumpiness when switching folders
+- Animation lag on app startup
+
+## [1.0.5]
+
+### Added
+
+- Initial release
+- Automatic codec detection and transcoding
+- 4 quality presets (480p, 540p, 720p, 1080p)
+- Library browsing with infinite scroll
+- Remote search with live results
+- Autoplay playlist (continuous video playback)
+- Subtitle support (external tracks embedded automatically)
+- Secure on-device credential storage
+- Help section with troubleshooting
+- Native Apple TV remote support

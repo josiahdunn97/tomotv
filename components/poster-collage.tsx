@@ -1,0 +1,89 @@
+import type { ArtworkSlotShape } from "@/constants/app";
+import { COLORS } from "@/constants/colors";
+import { useItemPoster } from "@/hooks/useItemPoster";
+import type { JellyfinVideoItem } from "@/types/jellyfin";
+import { Image } from "expo-image";
+import React from "react";
+import { Platform, StyleSheet, View } from "react-native";
+
+const IS_TV = Platform.isTV;
+/** The gutter between two cells. */
+export const COLLAGE_GAP = IS_TV ? 4 : 2;
+
+interface PosterCollageProps {
+  /** The folder's first videos: the first takes the top row, the rest share the bottom. */
+  items: JellyfinVideoItem[];
+  height: number;
+  /** A library card's collage waits for a playing video to let go before asking for keyframes. */
+  deferWhileVideo?: boolean;
+  /** The card's shape: a poster stacks three full-width bands, a square two, so each 16:9 still keeps its width. */
+  shape?: ArtworkSlotShape;
+}
+
+/** How many full-width bands a card of this shape stacks; none keeps the top-and-bottom-row layout. */
+const BANDS: Partial<Record<ArtworkSlotShape, number>> = { portrait: 3, square: 2 };
+
+/**
+ * A folder's first videos as a collage inside its card: the first one across the top half,
+ * the others side by side across the bottom. One video fills the card alone.
+ */
+export function PosterCollage({ items, height, deferWhileVideo, shape }: PosterCollageProps) {
+  const [hero, ...rest] = items;
+  if (!hero) return null;
+  const bands = shape ? BANDS[shape] : undefined;
+  if (bands) {
+    return (
+      <View style={styles.collage} pointerEvents="none">
+        {items.slice(0, bands).map((item) => (
+          <Cell key={item.Id} item={item} height={height} deferWhileVideo={deferWhileVideo} />
+        ))}
+      </View>
+    );
+  }
+  return (
+    <View style={styles.collage} pointerEvents="none">
+      <Cell item={hero} height={height} deferWhileVideo={deferWhileVideo} />
+      {rest.length > 0 ? (
+        <View style={styles.row}>
+          {rest.map((item) => (
+            <Cell key={item.Id} item={item} height={height} deferWhileVideo={deferWhileVideo} />
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function Cell({ item, height, deferWhileVideo }: { item: JellyfinVideoItem; height: number; deferWhileVideo?: boolean }) {
+  const source = useItemPoster(item, height, { deferWhileVideo });
+  return (
+    <View style={styles.cell} testID="poster-collage-cell">
+      {source ? <Image source={source} style={styles.art} contentFit="cover" transition={0} cachePolicy="memory-disk" recyclingKey={item.Id} /> : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  // The gutter shows the card's own sunken fill, so the cells read as separate frames.
+  collage: {
+    width: "100%",
+    height: "100%",
+    gap: COLLAGE_GAP,
+    backgroundColor: COLORS.SURFACE_SUNKEN,
+  },
+  row: {
+    flex: 1,
+    flexDirection: "row",
+    gap: COLLAGE_GAP,
+  },
+  // The raised fill shows until the frame lands.
+  cell: {
+    flex: 1,
+    overflow: "hidden",
+    backgroundColor: COLORS.SURFACE_RAISED,
+  },
+  art: {
+    width: "100%",
+    height: "100%",
+  },
+});

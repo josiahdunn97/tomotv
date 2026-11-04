@@ -1,0 +1,116 @@
+/**
+ * A downloads row hands Remove to a screen reader as a named action, because the gesture that
+ * otherwise reaches it (a left swipe opening the panel) is one VoiceOver cannot perform. The
+ * swipe wrapper is mocked to a pass-through: what is under test is the row's own contract.
+ */
+import React from "react";
+import TestRenderer, { act } from "react-test-renderer";
+
+import { DownloadRow } from "@/components/settings/DownloadRow";
+import type { DownloadEntry, DownloadState } from "@/services/downloads/manifest";
+
+jest.mock("@/components/settings/SwipeToRemove", () => ({
+  SwipeToRemove: ({ children }: { children?: React.ReactNode }) => children,
+}));
+
+jest.mock("@/services/downloads/manager", () => ({
+  downloadManager: { subscribeProgress: jest.fn(() => () => {}) },
+}));
+
+jest.mock("@/services/downloads/localSource", () => ({
+  localArtworkUri: jest.fn(() => "file:///doc/downloads/a/poster.jpg"),
+}));
+
+import { PosterMark } from "@/components/settings/PosterMark";
+import { localArtworkUri } from "@/services/downloads/localSource";
+
+const ENTRY = (state: DownloadState, overrides: Partial<DownloadEntry> = {}): DownloadEntry =>
+  ({
+    itemId: "a",
+    fileUri: "file:///doc/downloads/a/media.mp4",
+    artworkUri: null,
+    bytesWritten: 100,
+    totalBytes: 100,
+    state,
+    addedAt: 1,
+    item: { Id: "a", Name: "Bloom" },
+    ...overrides,
+  }) as never;
+
+function render(entry: DownloadEntry, onRemove: () => void) {
+  let tree!: TestRenderer.ReactTestRenderer;
+  act(() => {
+    tree = TestRenderer.create(<DownloadRow entry={entry} selected={false} onPress={() => {}} onRemove={onRemove} />);
+  });
+  return tree;
+}
+
+function actionTarget(tree: TestRenderer.ReactTestRenderer) {
+  return tree.root.findAll((node) => typeof node.props?.onAccessibilityAction === "function")[0];
+}
+
+describe("DownloadRow", () => {
+  // The stored URI is an absolute path from the install that wrote it; a reinstall moves the
+  // container, so the row draws the path resolved against this one.
+  it("draws the poster resolved against the current container, not the stored path", () => {
+    const tree = render(ENTRY("ready", { artworkUri: "file:///old-container/downloads/a/poster.jpg" }), () => {});
+    const mark = tree.root.findByType(PosterMark);
+    expect(localArtworkUri).toHaveBeenCalledWith("a");
+    expect(mark.props.uri).toBe("file:///doc/downloads/a/poster.jpg");
+  });
+
+  it("offers Remove as a named action, which is the only route a screen reader has to it", () => {
+    const onRemove = jest.fn();
+    const target = actionTarget(render(ENTRY("ready"), onRemove));
+
+    expect(target.props.accessibilityActions).toEqual([{ name: "remove", label: "Remove" }]);
+
+    act(() => target.props.onAccessibilityAction({ nativeEvent: { actionName: "remove" } }));
+    expect(onRemove).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an action it does not name", () => {
+    const onRemove = jest.fn();
+    const target = actionTarget(render(ENTRY("ready"), onRemove));
+
+    act(() => target.props.onAccessibilityAction({ nativeEvent: { actionName: "activate" } }));
+    expect(onRemove).not.toHaveBeenCalled();
+  });
+
+  it("says what a press does, which is not the same thing on every row", () => {
+    const hint = (state: DownloadState) => actionTarget(render(ENTRY(state), jest.fn())).props.accessibilityHint;
+
+    expect(hint("ready")).toBe("Plays from this device. Swipe left or press and hold to remove.");
+    expect(hint("downloading")).toContain("Pauses this download.");
+    expect(hint("paused")).toContain("Resumes this download.");
+    expect(hint("failed")).toContain("Retries this download.");
+    // A press on either of these re-queues the transfer, which is not what the row offers.
+    expect(hint("queued")).toBe("Waiting. Swipe left or press and hold to remove.");
+    expect(hint("repackaging")).toBe("Waiting. Swipe left or press and hold to remove.");
+  });
+
+  it("names what a held file is: its rung, Original for a video, the bare size for a track", () => {
+    const RUNG = { label: "720p", bitrate: 4000000, width: 1280, height: 720 };
+    const subtitle = (overrides: Partial<DownloadEntry>) => actionTarget(render(ENTRY("ready", { totalBytes: 2048, ...overrides }), jest.fn())).props.subtitle;
+    const video = { Id: "a", Name: "Bloom", MediaStreams: [{ Index: 0, Type: "Video" }] } as never;
+
+    expect(subtitle({ item: video, converted: RUNG })).toBe("720p · 2 KB");
+    expect(subtitle({ item: video })).toBe("Original · 2 KB");
+    expect(subtitle({})).toBe("2 KB");
+  });
+
+  it("puts an episode's season and episode number before its size, and while it downloads", () => {
+    const episode = { Id: "a", Name: "Assault on the Leaf Village!", Type: "Episode", ParentIndexNumber: 8, IndexNumber: 5, MediaStreams: [{ Index: 0, Type: "Video" }] } as never;
+    expect(actionTarget(render(ENTRY("ready", { item: episode, totalBytes: 2048 }), jest.fn())).props.subtitle).toBe("S08E05 · Original · 2 KB");
+    expect(actionTarget(render(ENTRY("queued", { item: episode }), jest.fn())).props.subtitle).toBe("S08E05 · Waiting");
+  });
+
+  // A server conversion streams with no ranges, so it cannot resume: no pause glyph, no pause hint.
+  it("offers no pause on a transfer the server is converting", () => {
+    const RUNG = { label: "720p", bitrate: 4000000, width: 1280, height: 720 };
+    const target = actionTarget(render(ENTRY("downloading", { converted: RUNG, bytesWritten: 10, totalBytes: -1 }), jest.fn()));
+    expect(target.props.trailingIcon).toBeUndefined();
+    expect(target.props.accessibilityHint).not.toContain("Pauses");
+    expect(actionTarget(render(ENTRY("downloading"), jest.fn())).props.trailingIcon).toBe("pause");
+  });
+});

@@ -1,0 +1,148 @@
+import { STAND_NAME_TEXT, standNameText } from "@/components/card-stand";
+import { DESIGN, GRID } from "@/constants/app";
+import { COLORS } from "@/constants/colors";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { useCardZoom } from "@/hooks/useCardZoom";
+import React, { useEffect } from "react";
+import { Dimensions, Platform, StyleSheet, Text, View } from "react-native";
+import Animated, { Easing, useAnimatedStyle, useReducedMotion, useSharedValue, withTiming } from "react-native-reanimated";
+
+const IS_TV = Platform.isTV;
+// Tablet type off the physical short side, read once. The title is pure chrome and feeds
+// no layout math, so it needs no window subscription and cannot desync the row packer.
+const SCREEN = Dimensions.get("screen");
+const IS_TABLET = !IS_TV && Math.min(SCREEN.width, SCREEN.height) >= GRID.PHONE_WIDE_MIN_WIDTH;
+const TITLE_SIZE = IS_TV ? 22 : IS_TABLET ? 15 : 13;
+
+// Simulated trickle: an instant ack, easing toward ~90% while loading, then snapping to 100% on the
+// focus handoff. Real "percent remaining" can't be measured for a folder open (fetch + paint).
+const START = 0.08;
+const TRICKLE_TARGET = 0.9;
+
+/** Where the sweep opens: a resume card's watched fraction, floored to START so
+ *  the fill is visible and capped at a full bar. */
+export function sweepStart(startFraction?: number): number {
+  return Math.max(START, Math.min(startFraction ?? 0, 1));
+}
+
+interface CardNavProgressProps {
+  active: boolean;
+  /** Card title, shown difference-blended over the sweeping fill. */
+  title: string;
+  /** Where the sweep starts (0 to 1): a resume card starts at its watched fraction. */
+  startFraction?: number;
+  /** Fills a channel stand, in the stand's lettering, instead of the title bar. */
+  stand?: boolean;
+  /** The stand's resting colour under the sweep, where it differs from the wall's. */
+  baseColor?: string;
+}
+
+/**
+ * "Navigation in progress" feedback for the pressed grid card: the same
+ * title-bar-as-progress mechanism the Continue Watching cards use. While the
+ * next screen loads, an opaque dark bar overlays the card's title sliver and a
+ * gold fill sweeps across it, with the gold title difference-blending to black
+ * wherever the fill passes under it. Metrics mirror the infoOverlay bar in
+ * video-grid-item/folder-grid-item exactly, so it covers either seamlessly.
+ *
+ * Resume cards hand in their watched fraction as the sweep's starting point,
+ * so the fill visually continues from the progress already on screen.
+ *
+ * Honors Reduce Motion (static fill, no trickle). Purely presentational: the
+ * owning card drives `active` via useCardNavProgress (start on press, clear on
+ * blur), and already announces its own state to assistive tech; this overlay
+ * is hidden from it.
+ */
+export function CardNavProgress({ active, title, startFraction, stand = false, baseColor }: CardNavProgressProps) {
+  const progress = useSharedValue(0);
+  const opacity = useSharedValue(0);
+  const reducedMotion = useReducedMotion();
+  const { accent } = useCardPalette();
+  const zoom = useCardZoom();
+
+  useEffect(() => {
+    if (active) {
+      const from = sweepStart(startFraction);
+      opacity.value = 1;
+      if (reducedMotion) {
+        progress.value = TRICKLE_TARGET;
+      } else {
+        progress.value = from;
+        progress.value = withTiming(TRICKLE_TARGET, { duration: 900, easing: Easing.out(Easing.cubic) });
+      }
+    } else if (reducedMotion) {
+      opacity.value = 0;
+      progress.value = 0;
+    } else {
+      // Handoff: complete then fade (the card is usually covered by the destination by now).
+      progress.value = withTiming(1, { duration: 140, easing: Easing.out(Easing.quad) });
+      opacity.value = withTiming(0, { duration: 200 });
+    }
+  }, [active, reducedMotion, startFraction, progress, opacity]);
+
+  const fillStyle = useAnimatedStyle(() => ({ width: `${progress.value * 100}%` }));
+  const barStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.bar, stand && styles.barStand, baseColor ? { backgroundColor: baseColor } : null, barStyle]}
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants">
+      <Animated.View style={[styles.fill, { backgroundColor: accent }, fillStyle]} />
+      <View style={styles.titleBlend}>
+        <Text style={[styles.title, stand && STAND_NAME_TEXT, stand && standNameText(zoom), { color: accent }]} numberOfLines={1}>
+          {title}
+        </Text>
+      </View>
+    </Animated.View>
+  );
+}
+
+const styles = StyleSheet.create({
+  // Mirrors the cards' infoOverlay title sliver exactly (position, padding,
+  // radii, type metrics), opaque so it cleanly covers the bar beneath while
+  // active. Opaque background also keeps the difference blend's inputs fixed.
+  bar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    paddingVertical: IS_TV ? 10 : 8,
+    paddingHorizontal: IS_TV ? 16 : 14,
+    overflow: "hidden",
+    justifyContent: "center",
+    alignItems: "center",
+    borderBottomLeftRadius: DESIGN.BORDER_RADIUS_CARD,
+    borderBottomRightRadius: DESIGN.BORDER_RADIUS_CARD,
+    backgroundColor: COLORS.SURFACE_SUNKEN,
+  },
+  barStand: {
+    top: 0,
+    paddingVertical: 0,
+    backgroundColor: COLORS.BACKGROUND_DEEP,
+  },
+  // Same minWidth rule as the resume fill: clear the rounded bottom-left
+  // corner so the sweep's opening frames aren't clipped invisible.
+  fill: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    minWidth: DESIGN.BORDER_RADIUS_CARD + (IS_TV ? 20 : 12),
+  },
+  titleBlend: {
+    width: "100%",
+    mixBlendMode: "difference",
+  },
+  // The accent through the difference blend: black over the fill, the accent over the dark
+  // remainder, identical treatment to the Continue Watching title bar.
+  title: {
+    fontSize: TITLE_SIZE - 2,
+    fontWeight: "800",
+    letterSpacing: IS_TV ? 1.5 : 0.8,
+    textAlign: "center",
+    textTransform: "uppercase",
+    width: "100%",
+  },
+});

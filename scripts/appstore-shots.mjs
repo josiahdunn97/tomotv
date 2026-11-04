@@ -1,0 +1,638 @@
+#!/usr/bin/env node
+/**
+ * App Store Connect screenshot generator.
+ *
+ * Input is screenshots you took yourself: one folder per platform, named for it
+ * (ios/iphone, ipad, tvos), each holding up to ten images. The tool validates
+ * them against the platform's canvas, maps them onto the captions in
+ * applestore/shots.config.json, and composites each into a marketing image in
+ * the app's own visual language.
+ *
+ * Usage:
+ *   npm run shots                    scan ~/Desktop, adopt, compose every language, verify
+ *   npm run shots -- ~/Shots         scan somewhere else
+ *   npm run shots -- --dry-run       show the mapping and stop
+ *   npm run shots -- --device tv     one platform
+ *   npm run shots -- --locale de   just one language
+ *   npm run shots -- --capture       drive the simulators and shoot every slot
+ *   npm run shots -- --capture-only  capture and stop
+ *   npm run shots -- --render        re-render from what was already adopted
+ *   npm run shots -- --force         redraw even what the checksums call unchanged
+ *   npm run shots -- --background black --out applestore/generated/trial/black
+ *                                    try applestore/backgrounds/black.svg off the shipping set
+ *   npm run shots -- --clean         drop captures for slots this import cannot fill
+ *   npm run shots -- --verify        compliance gate only
+ *   npm run shots -- --list          print the caption plan and exit
+ *   npm run shots -- --self-check    assign() correctness only, no files touched
+ *   npm run shots -- --statusbar-template
+ *                                    shoot each booted phone/tablet's status bar at 9:41 into applestore/statusbar
+ *
+ * iPhone Duo is one set with two captures per shot in captures/duo: <id>.outer.png (closed,
+ * 1398x2034) and <id>.inner.png (open, 2853x2007). A shot's layout (pair, inner, outer) picks
+ * which of them its image draws; a Desktop folder named for the Duo sorts images by their shape.
+ *
+ * Every phone and tablet render swaps the capture's status bar for that reference ink.
+ * A shot's `platforms.<device>` replaces its copy or capture on that device; see shots.schema.json.
+ * A file whose name starts with a shot id claims that slot; the rest fill the
+ * remaining slots in the order they were taken.
+ *
+ * The backdrop is one image, `background` in shots.config.json or --background,
+ * cover-cropped from its centre onto every canvas. Each output folder keeps
+ * .shots-manifest.json, the checksum of every input an image was drawn from, so
+ * only images whose inputs moved are redrawn.
+ */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import sharp from "sharp";
+import { DEVICES, compose, layout, resetLayers, setFonts, setMetrics, wrongOrientation } from "./appstore/compose.mjs";
+import { fresh, hash, hashFile, loadManifest, saveManifest, toolchain } from "./appstore/cache.mjs";
+import { planImport, adopt, assign } from "./appstore/import.mjs";
+import { captureShots } from "./appstore/capture.mjs";
+import { ensurePlaceholders } from "./appstore/placeholder.mjs";
+import { captureFile, captureKey, layoutOf, shotCaptures, validateCaptures } from "./appstore/captures.mjs";
+import { COLORS } from "./appstore/palette.mjs";
+import { uploadedDevices } from "./appstore/platforms.mjs";
+import { loadFace, typeset } from "./appstore/typeset.mjs";
+import { STAMP_TIME, TEMPLATE_DIR, captureTemplate, findClusters, stampStatusBar, templateHash } from "./appstore/statusbar.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const CONFIG_PATH = path.join(ROOT, "applestore", "shots.config.json");
+const CAPTURE_DIR = path.join(ROOT, "applestore", "captures");
+const APP_JSON = JSON.parse(fs.readFileSync(path.join(ROOT, "app.json"), "utf8")).expo;
+const BUNDLE_ID = APP_JSON.ios.bundleIdentifier;
+const SCHEME = APP_JSON.scheme;
+
+/** App Store Connect: 1-10 per device set, PNG or JPEG, no alpha channel. */
+const MAX_SHOTS = 10;
+/** How far back the scan looks through the input directory. */
+const SCAN_LIMIT = 100;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => {
+  const i = args.indexOf(name);
+  const next = i >= 0 ? args[i + 1] : null;
+  return next && !next.startsWith("-") ? next : null;
+};
+/** The first bare argument is the directory to scan. */
+const VALUE_FLAGS = ["--device", "--only", "--out", "--locale", "--background", "--env"];
+const scanDir = args.find((a, i) => !a.startsWith("-") && !VALUE_FLAGS.some((f) => args[i - 1]?.startsWith(f))) || null;
+
+const fail = (msg) => {
+  console.error(`\n✗ ${msg}\n`);
+  process.exit(1);
+};
+
+function loadConfig(localeOverride) {
+  if (!fs.existsSync(CONFIG_PATH)) fail(`Missing ${path.relative(ROOT, CONFIG_PATH)}`);
+  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  const only = opt("--only")
+    ?.split(",")
+    .map((s) => s.trim());
+  const deviceFilter = opt("--device")
+    ?.split(",")
+    .map((s) => s.trim());
+
+  /** `--out` renders somewhere else, so a trial run leaves the shipping set alone. */
+  const out = opt("--out");
+  if (out) config.output = out;
+
+  const locale = localeOverride ?? opt("--locale") ?? "en";
+  const l10n = config.locales?.[locale];
+  if (!l10n) fail(`No "${locale}" in config.locales. Have: ${Object.keys(config.locales ?? {}).join(", ") || "none"}`);
+  config.locale = locale;
+  setFonts(l10n?.fonts);
+  for (const shot of config.shots) {
+    const why = platformProblem(shot);
+    if (why) fail(`${shot.id}: ${why}`);
+  }
+  for (const gap of untranslated(config.shots, locale)) console.log(`   ! ${locale} ${gap}, using the English`);
+  // Every language gets its own folder, English included, so no set is the odd one out.
+  config.output = path.join(config.output, locale);
+
+  for (const [key, device] of Object.entries(config.devices || {})) {
+    if (!DEVICES[key]) fail(`Unknown device "${key}" in config. Known: ${Object.keys(DEVICES).join(", ")}`);
+    const why = "layout" in device ? layoutProblem(key, device.layout) : null;
+    if (why) fail(`devices.${key}: ${why}`);
+  }
+  config.shots = config.shots.filter((s) => !only || only.some((o) => s.id.startsWith(o)));
+  config.background = resolveBackground(opt("--background") ?? config.background);
+  for (const shot of config.shots) {
+    shot.devices = (shot.devices || Object.keys(config.devices)).filter((d) => !deviceFilter || deviceFilter.includes(d));
+  }
+  for (const key of Object.keys(config.devices)) {
+    const n = config.shots.filter((s) => s.devices.includes(key)).length;
+    if (n > MAX_SHOTS) fail(`${key} has ${n} shots configured; App Store Connect accepts at most ${MAX_SHOTS}`);
+  }
+  return config;
+}
+
+/** A path from the repo root, or a name in applestore/backgrounds with or without its extension. */
+function resolveBackground(value) {
+  if (!value) fail(`No background: set "background" in ${path.relative(ROOT, CONFIG_PATH)} or pass --background`);
+  const dir = path.join(path.dirname(CONFIG_PATH), "backgrounds");
+  const found = [path.resolve(ROOT, value), path.join(dir, value), path.join(dir, `${value}.svg`), path.join(dir, `${value}.png`)].find((f) => fs.existsSync(f) && fs.statSync(f).isFile());
+  if (!found) fail(`No background "${value}". Have: ${fs.existsSync(dir) ? fs.readdirSync(dir).join(", ") : "none"}`);
+  return found;
+}
+
+const outputRoot = (config) => path.resolve(ROOT, config.output);
+const outputPath = (config, deviceKey, id) => path.join(outputRoot(config), deviceKey, `${id}.png`);
+
+const TEXT = ["title", "spec", "eyebrow"];
+const PLATFORM_KEYS = [...TEXT, "accent", "capture", "layout"];
+
+/**
+ * One shot as one device shows it in one language. Most specific wins: the language's
+ * device copy, the device's copy, the language, the shot. Untranslated copy stays English.
+ * On a device with several screens, `layout` says which of them the shot draws.
+ */
+function resolveShot(shot, deviceKey, locale, config) {
+  const own = shot.platforms?.[deviceKey] ?? {};
+  const t = shot.l10n?.[locale] ?? {};
+  const tOwn = t.platforms?.[deviceKey] ?? {};
+  const out = { ...shot };
+  for (const k of TEXT) out[k] = tOwn[k] ?? own[k] ?? t[k] ?? shot[k];
+  for (const k of ["accent", "capture"]) out[k] = own[k] ?? shot[k];
+  out.layout = layoutOf(config, deviceKey, shot);
+  return out;
+}
+
+/** Why a layout value cannot apply to a device, or null. */
+const layoutProblem = (device, value) =>
+  !DEVICES[device]?.layouts
+    ? `${device} shows one screen, so it takes no layout`
+    : DEVICES[device].layouts[value]
+      ? null
+      : `layout "${value}" is not one of ${Object.keys(DEVICES[device].layouts).join(", ")}`;
+
+/** Why a shot's platforms or l10n platforms name a device it does not ship on, or a key no device takes. */
+function platformProblem(shot) {
+  const sets = [["platforms", shot.platforms, PLATFORM_KEYS], ...Object.entries(shot.l10n ?? {}).map(([loc, t]) => [`l10n.${loc}.platforms`, t.platforms, TEXT])];
+  for (const [where, map, allowed] of sets) {
+    for (const [device, values] of Object.entries(map ?? {})) {
+      if (shot.devices && !shot.devices.includes(device)) return `${where}.${device} is set but ${device} is not in devices`;
+      const bad = Object.keys(values).filter((k) => !allowed.includes(k));
+      if (bad.length) return `${where}.${device} has ${bad.join(", ")}; it takes ${allowed.join(", ")}`;
+      const layout = "layout" in values ? layoutProblem(device, values.layout) : null;
+      if (layout) return `${where}.${device}: ${layout}`;
+    }
+  }
+  return null;
+}
+
+/** Device copy written in English with no translation for this language. */
+function untranslated(shots, locale) {
+  if (locale === "en") return [];
+  return shots.flatMap((s) =>
+    Object.entries(s.platforms ?? {}).flatMap(([device, own]) => TEXT.filter((k) => own[k] && !s.l10n?.[locale]?.platforms?.[device]?.[k]).map((k) => `${s.id} has no ${device} ${k}`)),
+  );
+}
+
+const plan = (config) =>
+  Object.keys(config.devices).map((deviceKey) => ({
+    deviceKey,
+    shots: config.shots.filter((s) => s.devices.includes(deviceKey)).map((s) => resolveShot(s, deviceKey, config.locale, config)),
+  }));
+
+/**
+ * Captures adopted before the set went upright are still on disk, so the shape
+ * is checked here as well as at import.
+ */
+async function guardOrientation(config) {
+  const wrong = [];
+  for (const { deviceKey, shots } of plan(config)) {
+    for (const shot of shots) {
+      for (const { mode, path: src } of shotCaptures(ROOT, config, deviceKey, shot, config.locale ?? "en")) {
+        if (!src) continue;
+        const why = await wrongOrientation(src, deviceKey, mode);
+        if (why) wrong.push(`${captureKey(deviceKey, shot.id, mode)}: ${why}`);
+      }
+    }
+  }
+  if (wrong.length) fail(`sideways capture(s):\n   ${wrong.join("\n   ")}\n\n  Re-take them upright, or drop them with --clean.`);
+}
+
+// ---------- adopt ----------
+
+/**
+ * Print the whole mapping before writing it. A wrong order here would otherwise
+ * render ten images against the wrong captions without a word.
+ */
+async function importShots(config) {
+  const { dir, results } = await planImport(config, plan(config), scanDir, SCAN_LIMIT);
+  console.log(`\n▸ scanning the ${SCAN_LIMIT} newest folders in ${dir}`);
+
+  let missing = 0;
+  let reused = 0;
+  const clean = flag("--clean");
+  for (const r of results) {
+    if (!r.shots.length) continue;
+    if (!r.folder) {
+      console.log(`\n▸ ${r.deviceKey} — no folder found (expected a directory named for ${r.deviceKey})`);
+      missing += r.shots.length;
+      continue;
+    }
+    const [w, h] = DEVICES[r.deviceKey].canvas;
+    console.log(`\n▸ ${r.deviceKey} — ${r.folder.name}/  (canvas ${w}x${h})`);
+    if (r.folder.ambiguous) console.log(`   ! name matches ${r.folder.ambiguous.join(" and ")}; read as ${r.deviceKey}`);
+
+    for (const { shot, mode, file } of r.assignments) {
+      const slot = (mode ? `${shot.id}.${mode}` : shot.id).padEnd(20);
+      if (!file) {
+        // A capture from an earlier run still composes under this caption. Say so, or drop
+        // it on --clean; silently reporting it skipped is what shipped the wrong image.
+        const stale = captureFile(ROOT, r.deviceKey, shot.id, mode);
+        if (fs.existsSync(stale)) {
+          if (clean) {
+            fs.unlinkSync(stale);
+            console.log(`   ✗ ${slot} no image left; removed the capture on disk`);
+            missing++;
+          } else {
+            console.log(`   · ${slot} no image left; reusing the capture on disk`);
+            reused++;
+          }
+          continue;
+        }
+        console.log(`   ✗ ${slot} no image left to assign`);
+        missing++;
+        continue;
+      }
+      console.log(`   ${file.exact ? "✓" : "⚠"} ${slot} ${file.name}  (${file.exact ? "native" : `${file.width}x${file.height}, scaled`})`);
+    }
+    for (const f of r.duplicates) console.log(`   ✗ duplicate          ${f.name} — ${f.shotId} is already claimed; nothing else will take it`);
+    for (const f of r.surplus) console.log(`   · unused             ${f.name}`);
+    for (const f of r.rejected) console.log(`   ✗ rejected           ${f.name} — ${f.why}`);
+  }
+
+  if (flag("--dry-run")) {
+    console.log("\n· dry run, nothing adopted\n");
+    return null;
+  }
+  const adopted = adopt(results, CAPTURE_DIR);
+  console.log(`\n✓ adopted ${adopted} image(s)`);
+  if (reused) console.log(`  ${reused} caption(s) reuse the capture already on disk (--clean drops them instead)`);
+  if (missing) console.log(`  ${missing} caption(s) have no image and will be skipped`);
+  return adopted;
+}
+
+// ---------- compose ----------
+
+/** Renders in flight at once. PNG deflate is single-threaded, so a few overlap well. */
+const WORKERS = Math.min(4, os.availableParallelism());
+
+async function pool(tasks, size) {
+  const queue = [...tasks];
+  await Promise.all(
+    Array.from({ length: Math.min(size, queue.length) }, async () => {
+      while (queue.length) await queue.shift()();
+    }),
+  );
+}
+
+/** Redraws what moved and returns the device sets that changed. */
+async function composeAll(config, manifest) {
+  const tools = toolchain();
+  const force = flag("--force");
+  const changed = new Set();
+  const tasks = [];
+  let unchanged = 0;
+
+  for (const { deviceKey, shots } of plan(config)) {
+    if (!shots.length) continue;
+    const device = DEVICES[deviceKey];
+    const [w, h] = device.canvas;
+    // One size for the whole device set, so the panel lands on the same pixel.
+    const shared = setMetrics(device, shots);
+
+    for (const shot of shots) {
+      // The locale's own capture of each screen, or English when that language has
+      // not been captured. The line below says which it used, so a run that fell back
+      // is visible rather than silently English under a translated caption.
+      const found = shotCaptures(ROOT, config, deviceKey, shot, config.locale ?? "en");
+      if (found.some((c) => !c.path)) continue;
+      const fellBack = config.locale !== "en" && found.some((c) => c.english);
+      const out = outputPath(config, deviceKey, shot.id);
+      const captures = found.map((c) => ({ path: path.relative(ROOT, c.path), sha: hashFile(c.path) }));
+      const key = hash(tools, config.locales?.[config.locale]?.fonts ?? null, layout(device, shot, shared), hashFile(config.background), captures, templateHash(deviceKey));
+      const id = `${deviceKey}/${shot.id}`;
+
+      if (!force && fresh(manifest[id], key, out)) {
+        unchanged++;
+        continue;
+      }
+      changed.add(deviceKey);
+      tasks.push(async () => {
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        const bars = await Promise.all(
+          found.map(async (c) => ({
+            mode: c.mode,
+            ...(await stampStatusBar(c.path, deviceKey).catch((e) => {
+              throw new Error(`${captureKey(deviceKey, shot.id, c.mode)}: ${e.message}`);
+            })),
+          })),
+        );
+        const info = await compose(device, shot, bars, out, shared, config.background);
+        const status = [...new Set(bars.map((b) => b.status))].join(", ");
+        manifest[id] = { key, sha: hashFile(out), background: path.relative(ROOT, config.background), captures, statusBar: status };
+        const note = status === "stamped" || deviceKey === "tv" ? "" : `  · ${status}`;
+        console.log(`   ${id} → ${path.relative(ROOT, out)}  ${w}x${h}  caption ${info.captionSize.toFixed(0)}px${fellBack ? "  ! english capture" : ""}${note}`);
+      });
+    }
+  }
+  await pool(tasks, WORKERS);
+  resetLayers();
+  if (unchanged) console.log(`   · ${unchanged} unchanged, checksums match`);
+  return changed;
+}
+
+// ---------- compliance ----------
+
+async function verify(config) {
+  let failures = 0;
+  for (const { deviceKey, shots } of plan(config)) {
+    if (!shots.length) continue;
+    const present = shots.map((s) => outputPath(config, deviceKey, s.id)).filter((f) => fs.existsSync(f));
+    const [w, h] = DEVICES[deviceKey].canvas;
+    console.log(`\n▸ ${deviceKey} — ${present.length} image(s), required ${w}x${h}`);
+    if (!present.length) console.log("   · nothing generated yet");
+
+    for (const file of present) {
+      const meta = await sharp(file).metadata();
+      const problems = [];
+      if (meta.width !== w || meta.height !== h) problems.push(`is ${meta.width}x${meta.height}, wanted ${w}x${h}`);
+      if (meta.hasAlpha) problems.push("has an alpha channel (App Store Connect rejects transparency)");
+      if (!["png", "jpeg"].includes(meta.format)) problems.push(`format ${meta.format}`);
+      const label = path.basename(file);
+      if (problems.length) {
+        console.log(`   ✗ ${label}: ${problems.join("; ")}`);
+        failures++;
+      } else {
+        console.log(`   ✓ ${label}  ${meta.width}x${meta.height} ${meta.format} ${(fs.statSync(file).size / 1e6).toFixed(2)} MB`);
+      }
+    }
+  }
+  return failures;
+}
+
+/**
+ * The store's tile corners, read from apps.apple.com's stylesheet: the 6.9" iPhone
+ * tile is `border-radius: 12.8% / 5.7%`, every other device takes its 20px default.
+ */
+const TILE_RADIUS = {
+  iphone: (w, h) => [w * 0.128, h * 0.057],
+  ipad: () => [20, 20],
+  tv: () => [20, 20],
+  mac: () => [20, 20],
+};
+
+/** The set's name over its contact sheet. */
+const SHEET_LABEL = { iphone: "iPhone", ipad: "iPad", mac: "Mac", tv: "Apple TV", duo: "iPhone Duo" };
+/** Tile width, the gap between tiles, the margin round the row, and the label's size and gap. */
+const SHEET = { tileW: 420, gap: 28, margin: 56, labelSize: 28, labelGap: 32 };
+const LABEL_FACE = loadFace(path.join(ROOT, "applestore", "fonts", "SpaceGrotesk-SemiBold.ttf"));
+
+/**
+ * One montage per platform, so the set can be judged as a row the way the store shows it: on the
+ * app's own dark, each tile on the store's corner with a faint rim, under the set's name and size.
+ */
+async function contactSheet(config, manifest) {
+  for (const { deviceKey, shots } of plan(config)) {
+    const files = shots.map((s) => outputPath(config, deviceKey, s.id)).filter((f) => fs.existsSync(f));
+    if (!files.length) continue;
+    const out = path.join(outputRoot(config), `contact-sheet-${deviceKey}.png`);
+    const id = `contact-sheet-${deviceKey}`;
+    const key = hash(
+      hashFile(fileURLToPath(import.meta.url)),
+      files.map((f) => [path.basename(f), hashFile(f)]),
+    );
+    if (!flag("--force") && fresh(manifest[id], key, out)) {
+      console.log(`   · ${deviceKey} unchanged`);
+      continue;
+    }
+
+    const [pw, ph] = DEVICES[deviceKey].canvas;
+    const { tileW, gap, margin, labelSize, labelGap } = SHEET;
+    const tileH = Math.round((ph / pw) * tileW);
+    const [rx, ry] = (TILE_RADIUS[deviceKey] ?? (() => [20, 20]))(tileW, tileH);
+    const svg = (body) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${tileW}" height="${tileH}">${body}</svg>`);
+    const mask = svg(`<rect width="${tileW}" height="${tileH}" rx="${rx}" ry="${ry}" fill="#fff"/>`);
+    const rim = svg(`<rect x="0.75" y="0.75" width="${tileW - 1.5}" height="${tileH - 1.5}" rx="${rx}" ry="${ry}" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>`);
+    const tiles = await Promise.all(
+      files.map((file) =>
+        sharp(file)
+          .resize(tileW, tileH)
+          .composite([{ input: mask, blend: "dest-in" }, { input: rim }])
+          .png()
+          .toBuffer(),
+      ),
+    );
+
+    const width = margin * 2 + tiles.length * tileW + (tiles.length - 1) * gap;
+    const name = typeset(LABEL_FACE, [SHEET_LABEL[deviceKey] ?? deviceKey], { size: labelSize, x: margin, y: margin });
+    const detail = typeset(LABEL_FACE, [`${pw} × ${ph} · ${tiles.length} screenshots`], { size: labelSize, x: margin + name.width + labelSize * 0.8, y: margin });
+    const top = Math.round(margin + name.height + labelGap);
+    const label = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${top}">
+  <path d="${name.d}" fill="${COLORS.TEXT_PRIMARY}"/>
+  <path d="${detail.d}" fill="${COLORS.TEXT_SECONDARY}"/>
+</svg>`);
+    const placed = tiles.map((buffer, i) => ({ input: buffer, left: margin + i * (tileW + gap), top }));
+    await sharp({ create: { width, height: top + tileH + margin, channels: 3, background: COLORS.BACKGROUND_DEEP } })
+      .composite([{ input: label, left: 0, top: 0 }, ...placed])
+      .png()
+      .toFile(out);
+    manifest[id] = { key, sha: hashFile(out) };
+    console.log(`   ${deviceKey} → ${path.relative(ROOT, out)}`);
+  }
+}
+
+// ---------- self check ----------
+
+/**
+ * Exercises assign() against the cases that decide which caption an image ships under.
+ * Runs in CI: jest's testMatch cannot see .mjs, so this follows the same node-run shape
+ * as playback-regression's --verify-manifest.
+ */
+function selfCheck() {
+  const shots = [{ id: "01-library" }, { id: "02-grid" }, { id: "03-info" }];
+  const file = (name) => ({ name, full: `/tmp/${name}`, mtime: 0 });
+  const problems = [];
+  const check = (label, ok) => {
+    console.log(`${ok ? "✓" : "✗"} ${label}`);
+    if (!ok) problems.push(label);
+  };
+
+  // The bug this guards: the second file naming a taken shot used to fall through to the
+  // fallback pass and fill another caption's slot.
+  const dup = assign(shots, [file("01-library.png"), file("01-library-alt.png"), file("shot-c.png")]);
+  check("a duplicate claim never fills another caption's slot", dup.byShot.get("02-grid")?.name === "shot-c.png");
+  check("a duplicate is reported against the shot it named", dup.duplicates.length === 1 && dup.duplicates[0].shotId === "01-library");
+  check("a duplicate is not offered as surplus", !dup.surplus.some((f) => f.name === "01-library-alt.png"));
+
+  const mixed = assign(shots, [file("03-info.png"), file("a.png"), file("b.png")]);
+  check("an explicit claim wins its own slot", mixed.byShot.get("03-info")?.name === "03-info.png");
+  check("the rest fill the remaining slots in capture order", mixed.byShot.get("01-library")?.name === "a.png" && mixed.byShot.get("02-grid")?.name === "b.png");
+
+  const over = assign(shots, [file("a.png"), file("b.png"), file("c.png"), file("d.png")]);
+  check("files past the last slot are surplus", over.surplus.length === 1 && over.surplus[0].name === "d.png");
+
+  const numbered = assign(shots, [file("02 grid.png")]);
+  check("a bare leading number claims its shot", numbered.byShot.get("02-grid")?.name === "02 grid.png");
+
+  const shot = {
+    id: "02-player",
+    title: "BASE",
+    spec: "base spec",
+    capture: { path: "/player" },
+    platforms: { tv: { spec: "tv spec", capture: { path: "/live-tv" } } },
+    l10n: { de: { title: "DE", spec: "de spec", platforms: { tv: { title: "DE TV" } } } },
+  };
+  check("a device's own copy replaces the shot's", resolveShot(shot, "tv", "en").spec === "tv spec" && resolveShot(shot, "iphone", "en").spec === "base spec");
+  check("a language's device copy beats every other", resolveShot(shot, "tv", "de").title === "DE TV");
+  check("an untranslated device line stays English, not the language's shared line", resolveShot(shot, "tv", "de").spec === "tv spec");
+  check("the language's shared line covers devices without their own", resolveShot(shot, "ipad", "de").spec === "de spec");
+  check("a device's capture replaces the shot's", resolveShot(shot, "tv", "en").capture.path === "/live-tv" && resolveShot(shot, "ipad", "en").capture.path === "/player");
+  check("a device copy for a device the shot skips is refused", platformProblem({ ...shot, devices: ["iphone"] })?.includes("tv is not in devices"));
+  check("a translation cannot move the capture", platformProblem({ ...shot, l10n: { de: { platforms: { tv: { capture: {} } } } } })?.includes("it takes"));
+  check("a missing device translation is reported", untranslated([shot], "de").join() === "02-player has no tv spec");
+
+  const duoConfig = { devices: { duo: { layout: "pair" } } };
+  const duoShot = { id: "02-player", devices: ["duo"], platforms: { duo: { layout: "inner" } } };
+  check("a shot's own Duo layout beats the device's", resolveShot(duoShot, "duo", "en", duoConfig).layout === "inner");
+  check("a Duo shot without its own layout takes the device's", resolveShot({ id: "01-library", devices: ["duo"] }, "duo", "en", duoConfig).layout === "pair");
+  check("the Duo falls back to drawing both screens", resolveShot({ id: "01-library", devices: ["duo"] }, "duo", "en", { devices: { duo: {} } }).layout === "pair");
+  check("a single-screen device gets no layout", resolveShot({ id: "01-library" }, "iphone", "en", { devices: { iphone: {} } }).layout === undefined);
+  check("a layout on a single-screen device is refused", platformProblem({ id: "01-library", platforms: { iphone: { layout: "pair" } } })?.includes("takes no layout"));
+  check("an unknown Duo layout is refused", platformProblem({ id: "01-library", platforms: { duo: { layout: "both" } } })?.includes("not one of pair, inner, outer"));
+
+  // A 100x60 dark frame: bar ink at rows 10-14, app chrome at rows 30-34, one stray edge pixel.
+  const W = 100;
+  const data = Buffer.alloc(W * 60 * 3, 30);
+  const paint = (x0, x1, y0, y1) => {
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) data.fill(250, (y * W + x) * 3, (y * W + x) * 3 + 3);
+  };
+  paint(10, 20, 10, 14);
+  paint(70, 85, 11, 13);
+  paint(5, 40, 30, 34);
+  paint(99, 99, 4, 4);
+  const bar = findClusters({ data, info: { width: W, height: 60, channels: 3 } }, 0, 50);
+  check("the bar is the first run of inked rows, not the chrome under it", bar.left?.top === 10 && bar.left?.bottom === 14 && bar.left?.right === 20);
+  check("a frame's edge pixel never starts the bar", bar.right?.top === 11 && bar.right?.right === 85);
+
+  console.log(problems.length ? `\n${problems.length} problem(s)` : "\nassign() holds every caption to its own image");
+  return problems.length === 0;
+}
+
+// ---------- main ----------
+
+async function main() {
+  if (flag("--self-check")) {
+    if (!selfCheck()) process.exit(1);
+    return;
+  }
+
+  const config = loadConfig();
+
+  if (flag("--check-captures")) {
+    // Only uploaded devices gate a release.
+    const devices = uploadedDevices(config).filter((key) => config.shots.some((shot) => shot.devices.includes(key)));
+    await validateCaptures(ROOT, config, devices, opt("--locale") ? [config.locale] : Object.keys(config.locales));
+    console.log("Every configured slot has a real capture.");
+    return;
+  }
+
+  if (flag("--list")) {
+    for (const { deviceKey, shots } of plan(config)) {
+      if (!shots.length) continue;
+      console.log(`\n${deviceKey}  ${DEVICES[deviceKey].canvas.join("x")}`);
+      shots.forEach((s, i) => console.log(`  ${String(i + 1).padStart(2)}. ${s.id.padEnd(20)} ${JSON.stringify(s.title)}`));
+    }
+    console.log();
+    return;
+  }
+
+  if (flag("--verify")) {
+    const failures = await verify(config);
+    console.log();
+    if (failures) fail(`${failures} compliance problem(s)`);
+    console.log("✓ every generated image is App Store Connect compliant\n");
+    return;
+  }
+
+  if (flag("--statusbar-template")) {
+    console.log(`\n▸ status bar templates at ${STAMP_TIME.toString().slice(0, 21)}`);
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "tomotv-statusbar-"));
+    for (const { deviceKey, shots } of plan(config)) {
+      if (!["iphone", "ipad"].includes(deviceKey) || !shots.length) continue;
+      await captureTemplate(deviceKey, DEVICES[deviceKey], scratch);
+      console.log(`   ✓ ${deviceKey} → ${path.relative(ROOT, TEMPLATE_DIR)}/${deviceKey}.png`);
+    }
+    fs.rmSync(scratch, { recursive: true, force: true });
+    return;
+  }
+
+  if (flag("--capture") || flag("--capture-only")) {
+    console.log("\n▸ capturing");
+    const captureLocales = opt("--locale") ? [opt("--locale")] : Object.keys(config.locales ?? { en: {} });
+    let shot = 0;
+    for (const locale of captureLocales) {
+      if (captureLocales.length > 1) console.log(`\n  ${locale}`);
+      shot += await captureShots(config, plan(config), {
+        root: ROOT,
+        captureDir: locale === "en" ? CAPTURE_DIR : path.join(CAPTURE_DIR, locale),
+        bundleId: BUNDLE_ID,
+        scheme: SCHEME,
+        envFile: opt("--env"),
+        locale,
+      });
+    }
+    console.log(`\n✓ captured ${shot} screen(s)`);
+    if (flag("--capture-only")) return;
+  } else if (!flag("--render")) {
+    const adopted = await importShots(config);
+    if (adopted === null) return;
+  }
+
+  console.log("\n▸ placeholders");
+  const stand = await ensurePlaceholders(plan(config), CAPTURE_DIR, (key, mode) =>
+    mode ? { canvas: DEVICES[key].modes[mode].capture, simulator: DEVICES[key].modes[mode].label } : { canvas: DEVICES[key].canvas, simulator: DEVICES[key].simulator },
+  );
+  for (const key of stand.written) console.log(`   + ${key}`);
+  console.log(`   ${stand.real} captured, ${stand.pending.length} pending${stand.written.length ? ` (${stand.written.length} new)` : ""}`);
+
+  await guardOrientation(config);
+
+  // Captures are shared, so the import runs once and only the type is redrawn per locale.
+  const targets = opt("--locale") ? [config.locale] : Object.keys(config.locales ?? { en: {} });
+  let failures = 0;
+  for (const locale of targets) {
+    const c = targets.length > 1 ? loadConfig(locale) : config;
+    if (targets.length > 1) console.log(`\n▸ ${locale}`);
+
+    const manifest = loadManifest(outputRoot(c));
+    console.log(`\n▸ composing on ${path.relative(ROOT, c.background)}`);
+    try {
+      await composeAll(c, manifest);
+      console.log("\n▸ contact sheets");
+      await contactSheet(c, manifest);
+    } finally {
+      saveManifest(outputRoot(c), manifest);
+    }
+
+    console.log("\n▸ verifying");
+    failures += await verify(c);
+  }
+  console.log();
+  if (failures) fail(`${failures} compliance problem(s)`);
+  if (stand.pending.length) {
+    console.log(`✓ done, ${stand.pending.length} slot(s) still showing CAPTURE PENDING:`);
+    for (const key of stand.pending) console.log(`   · ${key}`);
+    console.log();
+  } else {
+    console.log("✓ done, every configured slot has a real capture\n");
+  }
+}
+
+main().catch((e) => fail(e.message));

@@ -1,0 +1,349 @@
+import { FocusableButton } from "@/components/FocusableButton";
+import { GlassButton } from "@/components/glass-button";
+import { COLORS } from "@/constants/colors";
+import { useCardPalette } from "@/hooks/useCardPalette";
+import { useItemPoster } from "@/hooks/useItemPoster";
+import { getBackdropBlurUrl, hasPoster } from "@/services/jellyfinApi";
+import { JellyfinVideoItem } from "@/types/jellyfin";
+import { cleanLabel } from "@/utils/cleanLabel";
+import { formatSeasonEpisode } from "@/utils/seasonEpisode";
+import { Ionicons } from "@expo/vector-icons";
+import { Image } from "expo-image";
+import React, { useEffect, useMemo } from "react";
+import { AccessibilityInfo, GestureResponderEvent, Platform, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import Animated, { cancelAnimation, Easing, runOnJS, useAnimatedStyle, useSharedValue, withDelay, withTiming } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { t } from "@/services/i18n";
+
+interface UpNextInterstitialProps {
+  nextVideo: JellyfinVideoItem;
+  /**
+   * False while this is only PREWARMING: mounted behind playback so its poster and backdrop
+   * are fetched, decoded and laid out, but invisible, untouchable, silent to VoiceOver and
+   * with no countdown running. True the instant playback ends, which is then a style flip
+   * rather than a first render plus two network round trips.
+   */
+  armed: boolean;
+  /** Counts down into onPlayNext; false waits for a CTA. */
+  autoAdvance: boolean;
+  /** Advance the queue now (countdown expiry and the Play Now CTA both land here). */
+  onPlayNext: () => void;
+  /** Stop the binge: clear the queue and leave the player. */
+  onClose: () => void;
+}
+
+const COUNTDOWN_MS = 5000;
+// No entrance DELAY: the card is already on screen, under AVKit's presented player, and the
+// dismissal slide-down (~0.4s, not configurable in the lib) is what reveals it. The fade only
+// covers the case where nothing slides: it can never be the thing the viewer waits through.
+const ENTRANCE_FADE_MS = 250;
+const POSTER_HEIGHT = Platform.isTV ? 360 : 220;
+const COUNTDOWN_WIDTH = Platform.isTV ? 360 : 240;
+const CtaButton = Platform.isTV ? GlassButton : FocusableButton;
+// A frame shorter than the stack (a phone on its side) seats the poster beside the text column.
+const STACKED_MIN_HEIGHT = 560;
+const SIDE_COLUMN_WIDTH = 280;
+const SIDE_GAP = 28;
+const SIDE_PADDING = 16;
+
+/** Time left on the countdown clock at a progress of 0 to 1. */
+export function countdownRemainingMs(progress: number): number {
+  return Math.round((1 - Math.min(1, Math.max(0, progress))) * COUNTDOWN_MS);
+}
+
+/** Picks the layout for a window, and the poster height that fits beside the text column. */
+export function upNextLayout(
+  window: { width: number; height: number },
+  insets: { top: number; right: number; bottom: number; left: number },
+  aspectRatio: number,
+): { sideBySide: boolean; posterHeight: number } {
+  const height = window.height - insets.top - insets.bottom;
+  if (height >= STACKED_MIN_HEIGHT) return { sideBySide: false, posterHeight: POSTER_HEIGHT };
+  const posterWidth = window.width - insets.left - insets.right - SIDE_PADDING * 2 - SIDE_GAP - SIDE_COLUMN_WIDTH;
+  const fit = Math.min(POSTER_HEIGHT, height - SIDE_PADDING * 2, posterWidth / aspectRatio);
+  return { sideBySide: true, posterHeight: Math.max(0, Math.floor(fit)) };
+}
+
+/**
+ * Between-episodes "Up Next" screen for queue playback. Shown INSTEAD of advancing
+ * immediately at video end, never over the player: on iPhone the presented AVKit player
+ * owns the screen during playback and nothing RN-rendered can appear above it, so the
+ * announcement moved to the gap between episodes where the RN layer is visible again
+ * (the onEnd wrapper dismisses the presentation before this mounts).
+ *
+ * Background reuses the library-backdrop technique: the server-blurred 48px poster
+ * (blur=20) scaled full screen, here at near-full strength under a gradient scrim, so
+ * the next episode's artwork dominates the frame.
+ */
+export function UpNextInterstitial({ nextVideo, armed, autoAdvance, onPlayNext, onClose }: UpNextInterstitialProps) {
+  const seasonEpisode = useMemo(() => formatSeasonEpisode(nextVideo), [nextVideo]);
+  const palette = useCardPalette();
+  const window = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+  const aspectRatio = nextVideo.PrimaryImageAspectRatio || 2 / 3;
+  const { sideBySide, posterHeight } = upNextLayout(window, insets, aspectRatio);
+  const countdownWidth = sideBySide ? SIDE_COLUMN_WIDTH : COUNTDOWN_WIDTH;
+
+  const posterSource = useItemPoster(nextVideo, POSTER_HEIGHT * 2);
+
+  // The server's blurred wash where it has a poster; a keyframe washes itself, blurred here.
+  const serverPostered = hasPoster(nextVideo);
+  const backdropSource = useMemo(() => {
+    if (!serverPostered) return posterSource;
+    const uri = getBackdropBlurUrl(nextVideo.Id);
+    if (!uri) return undefined;
+    return { uri, cacheKey: `${nextVideo.Id}-${nextVideo.ImageTags?.Primary}-backdrop` };
+  }, [nextVideo, serverPostered, posterSource]);
+
+  // Entrance fade, then a single countdown clock: the draining bar and the auto-advance
+  // share one animation (photo-viewer slideshow pattern). Nothing runs while prewarming:
+  // a clock started behind playback would advance the queue mid-episode. Cancelled on
+  // unmount so a CTA press or a route change can never fire a stale advance.
+  const appear = useSharedValue(0);
+  const countdown = useSharedValue(0);
+  const runCountdown = (delayMs: number, durationMs: number) => {
+    countdown.set(
+      withDelay(
+        delayMs,
+        withTiming(1, { duration: durationMs, easing: Easing.linear }, (finished) => {
+          if (finished) runOnJS(onPlayNext)();
+        }),
+      ),
+    );
+  };
+  useEffect(() => {
+    if (!armed) return;
+    appear.set(withTiming(1, { duration: ENTRANCE_FADE_MS }));
+    if (autoAdvance) runCountdown(ENTRANCE_FADE_MS, COUNTDOWN_MS);
+    return () => {
+      cancelAnimation(appear);
+      cancelAnimation(countdown);
+    };
+    // Restart only if the announced item changes (queue advance remounts the route anyway).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [armed, autoAdvance, nextVideo.Id]);
+
+  // A finger held anywhere on the card stops the clock; the last one lifting runs what is left.
+  const holdable = armed && autoAdvance;
+  const pauseCountdown = () => cancelAnimation(countdown);
+  const resumeCountdown = (event: GestureResponderEvent) => {
+    if (event.nativeEvent.touches.length > 0) return;
+    const remaining = countdownRemainingMs(countdown.get());
+    if (remaining > 0) runCountdown(0, remaining);
+  };
+
+  const fadeStyle = useAnimatedStyle(() => ({
+    opacity: appear.value,
+  }));
+
+  const countdownStyle = useAnimatedStyle(() => ({
+    transform: [{ scaleX: 1 - countdown.value }],
+  }));
+
+  useEffect(() => {
+    if (!armed) return;
+    AccessibilityInfo.announceForAccessibility(t("player.upNextName").replace("{name}", cleanLabel(nextVideo.Name)));
+  }, [armed, nextVideo.Name, nextVideo.Id]);
+
+  const eyebrow = <Text style={styles.eyebrow}>{t("player.upNext")}</Text>;
+
+  const poster = posterSource && posterHeight > 0 && (
+    <Image
+      source={posterSource}
+      style={[styles.poster, { aspectRatio, height: posterHeight }]}
+      contentFit="cover"
+      transition={200}
+      cachePolicy="memory-disk"
+      accessible={true}
+      accessibilityLabel={t("a11y.poster").replace("{name}", cleanLabel(nextVideo.Name))}
+    />
+  );
+
+  const details = (
+    <>
+      {nextVideo.SeriesName ? <Text style={styles.seriesName}>{cleanLabel(nextVideo.SeriesName)}</Text> : null}
+      <Text style={[styles.episodeName, sideBySide && styles.sideEpisodeName]} numberOfLines={2}>
+        {seasonEpisode ? `${seasonEpisode} · ${cleanLabel(nextVideo.Name)}` : cleanLabel(nextVideo.Name)}
+      </Text>
+
+      {autoAdvance && (
+        <View style={[styles.countdownTrack, { width: countdownWidth }]}>
+          <Animated.View style={[styles.countdownFill, { backgroundColor: palette.accent }, countdownStyle]} />
+        </View>
+      )}
+
+      <View style={Platform.isTV ? styles.buttonRow : styles.buttonStack}>
+        <CtaButton
+          title={t("player.playNow")}
+          variant="primary"
+          hasTVPreferredFocus
+          icon={<Ionicons name="play" size={Platform.isTV ? 24 : 18} color={palette.onAccent} />}
+          onPress={onPlayNext}
+          style={Platform.isTV ? styles.button : styles.stackedButton}
+        />
+        <CtaButton
+          title={t("common.close")}
+          variant={Platform.isTV ? "link" : "secondary"}
+          icon={<Ionicons name="close" size={Platform.isTV ? 24 : 18} color={palette.accent} />}
+          onPress={onClose}
+          style={Platform.isTV ? styles.button : styles.stackedButton}
+        />
+      </View>
+    </>
+  );
+
+  const sidePadding = {
+    paddingTop: insets.top + SIDE_PADDING,
+    paddingRight: insets.right + SIDE_PADDING,
+    paddingBottom: insets.bottom + SIDE_PADDING,
+    paddingLeft: insets.left + SIDE_PADDING,
+  };
+
+  return (
+    <View
+      style={[styles.container, !armed && styles.prewarming]}
+      pointerEvents={armed ? "auto" : "none"}
+      onTouchStart={holdable ? pauseCountdown : undefined}
+      onTouchEnd={holdable ? resumeCountdown : undefined}
+      onTouchCancel={holdable ? resumeCountdown : undefined}
+      accessibilityElementsHidden={!armed}
+      importantForAccessibility={armed ? "auto" : "no-hide-descendants"}>
+      <Animated.View style={[styles.fill, fadeStyle]}>
+        {backdropSource && (
+          <Image source={backdropSource} style={styles.backdrop} contentFit="cover" transition={300} cachePolicy="memory-disk" blurRadius={serverPostered ? undefined : 24} accessible={false} />
+        )}
+        {/* Scrim keeps text/buttons legible over the full-strength poster wash: darker at the
+            bottom where the CTAs sit, lighter up top so the artwork's color carries the frame. */}
+        <View style={[styles.fill, styles.scrim]} />
+
+        {sideBySide ? (
+          <View style={[styles.content, styles.sideContent, sidePadding]}>
+            {poster}
+            <View style={styles.sideColumn}>
+              {eyebrow}
+              {details}
+            </View>
+          </View>
+        ) : (
+          <View style={styles.content}>
+            {eyebrow}
+            {poster}
+            {details}
+          </View>
+        )}
+      </Animated.View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  // Opaque: covers the ended video underneath.
+  container: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: COLORS.BACKGROUND,
+    zIndex: 200,
+  },
+  // Prewarming: laid out and loading, painting nothing. Not `display: none`: that skips
+  // layout, and the images would only start fetching at the moment they are needed.
+  prewarming: {
+    opacity: 0,
+  },
+  fill: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  scrim: {
+    experimental_backgroundImage: "linear-gradient(to bottom, rgba(20, 20, 20, 0.3) 0%, rgba(20, 20, 20, 0.82) 100%)",
+  },
+  // The library-backdrop technique (tiny server-blurred poster upscaled full screen), but at
+  // near-full strength: the gradient scrim above it restores legibility, so the artwork's
+  // color can dominate the frame instead of being a faint wash.
+  backdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    opacity: 0.85,
+  },
+  content: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: Platform.isTV ? 40 : "10%",
+    gap: Platform.isTV ? 20 : 14,
+  },
+  eyebrow: {
+    color: COLORS.TEXT_SECONDARY,
+    fontSize: Platform.isTV ? 22 : 13,
+    fontWeight: "700",
+    letterSpacing: 3,
+  },
+  poster: {
+    height: POSTER_HEIGHT,
+    borderRadius: Platform.isTV ? 12 : 8,
+    borderCurve: "continuous",
+  },
+  seriesName: {
+    color: COLORS.TEXT_SECONDARY,
+    fontSize: Platform.isTV ? 24 : 15,
+    fontWeight: "600",
+  },
+  episodeName: {
+    color: COLORS.TEXT_PRIMARY,
+    fontSize: Platform.isTV ? 32 : 19,
+    fontWeight: "700",
+    textAlign: "center",
+    maxWidth: Platform.isTV ? 720 : 320,
+  },
+  countdownTrack: {
+    width: COUNTDOWN_WIDTH,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    overflow: "hidden",
+    marginTop: Platform.isTV ? 12 : 8,
+  },
+  countdownFill: {
+    width: "100%",
+    height: "100%",
+    transformOrigin: "left",
+  },
+  buttonRow: {
+    flexDirection: "row",
+    gap: Platform.isTV ? 24 : 16,
+    marginTop: Platform.isTV ? 16 : 10,
+  },
+  button: {
+    minWidth: Platform.isTV ? 240 : 140,
+  },
+  sideContent: {
+    flexDirection: "row",
+    gap: SIDE_GAP,
+  },
+  sideColumn: {
+    width: SIDE_COLUMN_WIDTH,
+    alignItems: "flex-start",
+    gap: 10,
+  },
+  sideEpisodeName: {
+    textAlign: "left",
+  },
+  // One width, one under the other: a row pushes long labels past a phone's edges.
+  buttonStack: {
+    width: "100%",
+    maxWidth: 320,
+    gap: 10,
+    marginTop: 10,
+  },
+  stackedButton: {
+    alignSelf: "stretch",
+  },
+});

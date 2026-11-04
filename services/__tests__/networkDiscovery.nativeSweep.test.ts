@@ -1,0 +1,176 @@
+/**
+ * Tests for the native two-phase scan path (TCP sweep, then HTTP probes), which
+ * the main networkDiscovery suite never reaches because it runs without the
+ * NetworkInfo native module. The regression this file exists for: priority
+ * hosts were only reordered within the sweep, but rows come from the probe
+ * phase, which starts after the WHOLE subnet is swept — so the saved server
+ * still appeared last. Priority hosts must be probed over HTTP immediately,
+ * in parallel with the sweep.
+ *
+ * react-native is mocked to just what networkDiscovery imports; spreading the
+ * real barrel evaluates its lazy getters and trips TurboModule lookups.
+ */
+
+import { findServerById, scanLocalNetwork } from "../networkDiscovery";
+import type { LocalNetworkInfo } from "../networkDiscovery";
+
+const mockScanOpenPorts = jest.fn();
+const mockCheckServerInfo = jest.fn();
+const mockGetLocalNetworkInfo = jest.fn();
+const mockProbeSecureServerInfo = jest.fn<Promise<string | null>, [string, number, number]>(async () => null);
+
+jest.mock("react-native", () => ({
+  NativeModules: {
+    NetworkInfo: {
+      scanOpenPorts: (...args: unknown[]) => mockScanOpenPorts(...args),
+      getLocalNetworkInfo: () => mockGetLocalNetworkInfo(),
+      probeSecureServerInfo: (host: string, port: number, timeoutMs: number) => mockProbeSecureServerInfo(host, port, timeoutMs),
+    },
+  },
+
+  Platform: { OS: "ios", isTV: false },
+}));
+jest.mock("@/services/jellyfinApi", () => ({ checkServerInfo: (...args: unknown[]) => mockCheckServerInfo(...args) }));
+jest.mock("@/services/localNetworkPermission", () => ({
+  isLocalNetworkPrimed: () => true,
+  markLocalNetworkPrimedFor: jest.fn(),
+  LOCAL_NETWORK_GRACE_MS: 0,
+  LOCAL_NETWORK_POLL_MS: 0,
+}));
+jest.mock("@/utils/logger", () => ({ logger: { error: jest.fn(), info: jest.fn(), debug: jest.fn(), warn: jest.fn() } }));
+
+const LOCAL: LocalNetworkInfo = { ip: "10.48.1.20", netmask: "255.255.255.0", interfaceName: "en0" };
+
+/** Answer as Jellyfin for the listed base URLs, refuse everything else. */
+function serveJellyfinAt(servers: Record<string, { name: string; id: string }>) {
+  mockCheckServerInfo.mockImplementation(async (url: string) => {
+    const server = servers[url];
+    if (!server) throw new Error("connection refused");
+    return { ServerName: server.name, Version: "10.9.0", Id: server.id };
+  });
+}
+
+beforeEach(() => {
+  jest.clearAllMocks();
+});
+
+describe("scanLocalNetwork on the native sweep path", () => {
+  it("streams a priority host's server while the TCP sweep is still running", async () => {
+    serveJellyfinAt({ "http://10.48.1.51:8096": { name: "Home", id: "server-a" } });
+
+    // A slow sweep that never finds an open port: any result can only have come
+    // from the direct priority probe, and it must arrive before the sweep ends.
+    let chunksDone = 0;
+    mockScanOpenPorts.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      chunksDone++;
+      return [];
+    });
+
+    let chunksDoneAtFound = -1;
+    const found = await scanLocalNetwork(LOCAL, {
+      priorityHosts: ["10.48.1.51"],
+      onFound: () => {
+        chunksDoneAtFound = chunksDone;
+      },
+    });
+
+    expect(found).toEqual([{ url: "http://10.48.1.51:8096", name: "Home", id: "server-a", version: "10.9.0" }]);
+    // 254 hosts in chunks of 32 = 8 chunks; the row must not wait for them.
+    expect(chunksDone).toBe(8);
+    expect(chunksDoneAtFound).toBeLessThan(8);
+  });
+
+  it("probes the device's own address up front with no priority hosts, the simulator case", async () => {
+    // On the simulator the "device" IP is the host Mac's, where the server runs.
+    serveJellyfinAt({ "http://10.48.1.20:8096": { name: "Mac", id: "server-self" } });
+
+    let chunksDone = 0;
+    mockScanOpenPorts.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      chunksDone++;
+      return [];
+    });
+
+    let chunksDoneAtFound = -1;
+    const found = await scanLocalNetwork(LOCAL, {
+      onFound: () => {
+        chunksDoneAtFound = chunksDone;
+      },
+    });
+
+    expect(found).toEqual([{ url: "http://10.48.1.20:8096", name: "Mac", id: "server-self", version: "10.9.0" }]);
+    expect(chunksDoneAtFound).toBeLessThan(8);
+  });
+
+  it("dedups the priority probe against the sweep finding the same server", async () => {
+    serveJellyfinAt({ "http://10.48.1.51:8096": { name: "Home", id: "server-a" } });
+    mockScanOpenPorts.mockImplementation(async (hosts: string[]) => hosts.filter((host) => host === "10.48.1.51").map((host) => ({ host, port: 8096 })));
+
+    const onFound = jest.fn();
+    const found = await scanLocalNetwork(LOCAL, { priorityHosts: ["10.48.1.51"], onFound });
+
+    expect(found).toHaveLength(1);
+    expect(onFound).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists the HTTP port of a server whose HTTPS certificate the device does not trust", async () => {
+    // The native TLS read accepts the self-signed certificate; the fetch login uses does not.
+    mockProbeSecureServerInfo.mockImplementation(async (host: string, port: number) =>
+      host === "10.48.1.51" && port === 8920 ? JSON.stringify({ ServerName: "Home", Id: "server-a", Version: "10.9.0" }) : null,
+    );
+    serveJellyfinAt({ "http://10.48.1.51:8096": { name: "Home", id: "server-a" } });
+    mockScanOpenPorts.mockImplementation(async (hosts: string[]) => hosts.filter((host) => host === "10.48.1.51").flatMap((host) => [8920, 8096].map((port) => ({ host, port }))));
+
+    const found = await scanLocalNetwork(LOCAL);
+
+    expect(found).toEqual([{ url: "http://10.48.1.51:8096", name: "Home", id: "server-a", version: "10.9.0" }]);
+  });
+
+  it("prefers the HTTPS port when the device trusts its certificate", async () => {
+    mockProbeSecureServerInfo.mockImplementation(async (host: string, port: number) =>
+      host === "10.48.1.51" && port === 8920 ? JSON.stringify({ ServerName: "Home", Id: "server-a", Version: "10.9.0" }) : null,
+    );
+    serveJellyfinAt({ "https://10.48.1.51:8920": { name: "Home", id: "server-a" }, "http://10.48.1.51:8096": { name: "Home", id: "server-a" } });
+    mockScanOpenPorts.mockImplementation(async (hosts: string[]) => hosts.filter((host) => host === "10.48.1.51").flatMap((host) => [8920, 8096].map((port) => ({ host, port }))));
+
+    const found = await scanLocalNetwork(LOCAL);
+
+    expect(found).toEqual([{ url: "https://10.48.1.51:8920", name: "Home", id: "server-a", version: "10.9.0" }]);
+  });
+});
+
+describe("findServerById", () => {
+  it("returns the server carrying the Id and stops sweeping once it has it", async () => {
+    mockGetLocalNetworkInfo.mockResolvedValue(LOCAL);
+    // The device's own address answers, the simulator case: the match arrives from
+    // the priority probe while the chunked sweep is still running.
+    serveJellyfinAt({ "http://10.48.1.20:8096": { name: "Mac", id: "moved-server" } });
+    let chunksDone = 0;
+    mockScanOpenPorts.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      chunksDone++;
+      return [];
+    });
+
+    const found = await findServerById("moved-server");
+
+    expect(found).toEqual({ url: "http://10.48.1.20:8096", name: "Mac", id: "moved-server", version: "10.9.0" });
+    expect(chunksDone).toBeLessThan(8);
+  });
+
+  it("returns null when only other servers are on the subnet", async () => {
+    mockGetLocalNetworkInfo.mockResolvedValue(LOCAL);
+    serveJellyfinAt({ "http://10.48.1.51:8096": { name: "Other", id: "other-server" } });
+    mockScanOpenPorts.mockImplementation(async (hosts: string[]) => hosts.filter((host) => host === "10.48.1.51").map((host) => ({ host, port: 8096 })));
+
+    expect(await findServerById("moved-server")).toBeNull();
+  });
+
+  it("returns null without sweeping when the device has no address", async () => {
+    mockGetLocalNetworkInfo.mockResolvedValue(null);
+
+    expect(await findServerById("moved-server")).toBeNull();
+    expect(mockScanOpenPorts).not.toHaveBeenCalled();
+  });
+});

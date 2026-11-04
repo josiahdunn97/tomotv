@@ -1,0 +1,151 @@
+import { escapeAction, macKeyAction, type MacKeyState } from "@/components/mac-key-commands";
+import { claimMacContextKeys, claimMacEscape, consumeMacEscape, MAC_KEYS, macKeyContext } from "@/services/macKeyCommands";
+
+/**
+ * What one Escape press means on the Mac build.
+ *
+ * The consequential half is the first two: Escape while a session is live has to
+ * end that session, and must never reach the navigator and pop the route sitting
+ * behind the player.
+ */
+describe("escapeAction", () => {
+  it("leaves the player whenever a session owns the screen", () => {
+    expect(escapeAction("video", true, true)).toBe("leavePlayer");
+    expect(escapeAction("loading", true, true)).toBe("leavePlayer");
+    expect(escapeAction("error", true, true)).toBe("leavePlayer");
+    expect(escapeAction("pip-active", true, true)).toBe("leavePlayer");
+  });
+
+  it("ends the session itself when no route is listening", () => {
+    expect(escapeAction("pip-detached", false, true)).toBe("endSession");
+  });
+
+  it("never reaches the navigator while a session is live, even with somewhere to go back to", () => {
+    expect(escapeAction("video", true, true)).not.toBe("goBack");
+  });
+
+  it("goes back when nothing is playing and there is somewhere to go", () => {
+    expect(escapeAction("idle", false, true)).toBe("goBack");
+  });
+
+  it("does nothing at the root of a tab", () => {
+    expect(escapeAction("idle", false, false)).toBe("ignore");
+  });
+});
+
+const BROWSING: MacKeyState = { hostMode: "idle", hasRouteHandlers: false, canGoBack: false, audioActive: false, keyContext: "" };
+const PLAYING_VIDEO: MacKeyState = { hostMode: "video", hasRouteHandlers: true, canGoBack: true, audioActive: false, keyContext: "seek" };
+const PLAYING_AUDIO: MacKeyState = { ...BROWSING, audioActive: true };
+
+/**
+ * Every other key. The two rules worth pinning: a tab must never be pushed under a
+ * presented player, and transport with no queue running has to fall through rather
+ * than act on a player AVKit is already driving.
+ */
+describe("macKeyAction", () => {
+  it("hands Escape to the rule that already owns it", () => {
+    expect(macKeyAction("escape", PLAYING_VIDEO)).toBe("leavePlayer");
+    expect(macKeyAction("escape", { ...BROWSING, canGoBack: true })).toBe("goBack");
+  });
+
+  it("opens a tab while browsing", () => {
+    expect(macKeyAction("search", BROWSING)).toBe("openSearch");
+    expect(macKeyAction("settings", BROWSING)).toBe("openSettings");
+  });
+
+  it("never pushes a tab under a live session", () => {
+    expect(macKeyAction("search", PLAYING_VIDEO)).toBe("ignore");
+    expect(macKeyAction("settings", PLAYING_VIDEO)).toBe("ignore");
+    expect(macKeyAction("settings", { ...PLAYING_VIDEO, hostMode: "pip-detached" })).toBe("ignore");
+  });
+
+  it("drives the queue only while one is running", () => {
+    expect(macKeyAction("playPause", PLAYING_AUDIO)).toBe("togglePlay");
+    expect(macKeyAction("playPause", PLAYING_VIDEO)).toBe("togglePlay");
+    expect(macKeyAction("previousTrack", PLAYING_AUDIO)).toBe("previousTrack");
+    expect(macKeyAction("nextTrack", PLAYING_AUDIO)).toBe("nextTrack");
+    expect(macKeyAction("playPause", BROWSING)).toBe("ignore");
+    expect(macKeyAction("previousTrack", BROWSING)).toBe("ignore");
+    expect(macKeyAction("nextTrack", BROWSING)).toBe("ignore");
+  });
+
+  it("seeks whatever is playing, and nothing when nothing is", () => {
+    expect(macKeyAction("seekBackward", PLAYING_AUDIO)).toBe("seekBackward");
+    expect(macKeyAction("seekForward", PLAYING_VIDEO)).toBe("seekForward");
+    expect(macKeyAction("seekBackward", BROWSING)).toBe("ignore");
+    expect(macKeyAction("seekForward", BROWSING)).toBe("ignore");
+  });
+
+  it("fills the frame only for a video session, never for a bare audio queue", () => {
+    expect(macKeyAction("toggleVideoFill", PLAYING_VIDEO)).toBe("toggleVideoFill");
+    expect(macKeyAction("toggleVideoFill", PLAYING_AUDIO)).toBe("ignore");
+    expect(macKeyAction("toggleVideoFill", BROWSING)).toBe("ignore");
+  });
+
+  it("leaves the photo keys to the viewer that armed them", () => {
+    expect(macKeyAction("previousPhoto", BROWSING)).toBe("ignore");
+    expect(macKeyAction("nextPhoto", PLAYING_AUDIO)).toBe("ignore");
+  });
+
+  it("zooms the cards while browsing, with audio running too", () => {
+    expect(macKeyAction("zoomIn", BROWSING)).toBe("zoomCardsIn");
+    expect(macKeyAction("zoomOut", BROWSING)).toBe("zoomCardsOut");
+    expect(macKeyAction("zoomReset", BROWSING)).toBe("zoomCardsReset");
+    expect(macKeyAction("zoomIn", { ...PLAYING_AUDIO, keyContext: "seek" })).toBe("zoomCardsIn");
+  });
+
+  it("leaves the zoom keys to the photo or book viewer while it holds the keys", () => {
+    expect(macKeyAction("zoomIn", { ...BROWSING, keyContext: "photo" })).toBe("ignore");
+    expect(macKeyAction("zoomOut", { ...BROWSING, keyContext: "photo" })).toBe("ignore");
+    expect(macKeyAction("zoomReset", { ...BROWSING, keyContext: "photo" })).toBe("ignore");
+  });
+
+  it("never zooms the cards under a live video session", () => {
+    expect(macKeyAction("zoomIn", PLAYING_VIDEO)).toBe("ignore");
+    expect(macKeyAction("zoomOut", PLAYING_VIDEO)).toBe("ignore");
+    expect(macKeyAction("zoomReset", PLAYING_VIDEO)).toBe("ignore");
+  });
+
+  it("answers every key the native side can send", () => {
+    for (const key of MAC_KEYS) {
+      expect(macKeyAction(key, PLAYING_AUDIO)).toBeDefined();
+    }
+  });
+});
+
+describe("macKeyContext", () => {
+  it("reports the newest key claim and falls back to the one under it on release", () => {
+    expect(macKeyContext()).toBe("");
+    const releaseSeek = claimMacContextKeys("audio", "seek");
+    const releasePhoto = claimMacContextKeys("viewer", "photo");
+    expect(macKeyContext()).toBe("photo");
+    releasePhoto();
+    expect(macKeyContext()).toBe("seek");
+    releaseSeek();
+    expect(macKeyContext()).toBe("");
+  });
+});
+
+/** The claim stack behind goBack: the newest claim answers, releasing restores the one under it. */
+describe("claimMacEscape", () => {
+  it("answers false with nothing claimed", () => {
+    expect(consumeMacEscape()).toBe(false);
+  });
+
+  it("consults the newest claim and restores the previous on release", () => {
+    const releaseA = claimMacEscape("a", () => true);
+    const releaseB = claimMacEscape("b", () => false);
+    expect(consumeMacEscape()).toBe(false);
+    releaseB();
+    expect(consumeMacEscape()).toBe(true);
+    releaseA();
+    expect(consumeMacEscape()).toBe(false);
+  });
+
+  it("survives a double release", () => {
+    const release = claimMacEscape("a", () => true);
+    release();
+    release();
+    expect(consumeMacEscape()).toBe(false);
+  });
+});

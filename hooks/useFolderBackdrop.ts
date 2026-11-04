@@ -1,0 +1,50 @@
+import { useAuthSession } from "@/hooks/useAuthSession";
+import { useUiPreferences } from "@/hooks/useUiPreferences";
+import { fetchFolderPreviewItems, fetchItemDetails, getTintUrl } from "@/services/jellyfinApi";
+import { useEffect, useState } from "react";
+
+/** A folder's blurred background art. */
+export interface FolderBackdropSource {
+  uri: string;
+}
+
+/**
+ * The one image a folder blurs behind its grid, resolved once on open and held for the whole
+ * folder (never per-card: that thrashed the grid). Preference: the folder's own Backdrop fanart,
+ * then its own cover, then the first poster among its descendants (fetchFolderPreviewItems is
+ * server-side recursive), then nothing (the ambient glows show). Keyed by session + folder id so
+ * a recycled screen or a server switch never shows a stale image.
+ */
+export function useFolderBackdrop(folderId: string | null): FolderBackdropSource | null {
+  const session = useAuthSession();
+  // Any canvas but artwork: nothing is fetched, and the ambient glows show.
+  const artwork = useUiPreferences().background === "artwork";
+  const key = `${session}:${folderId ?? ""}`;
+  const [result, setResult] = useState<{ key: string; source: FolderBackdropSource | null }>({ key: "", source: null });
+
+  useEffect(() => {
+    if (!folderId || !artwork) return;
+    let cancelled = false;
+    void (async () => {
+      const details = await fetchItemDetails(folderId).catch(() => null);
+      if (cancelled) return;
+      if (details?.BackdropImageTags?.length) {
+        setResult({ key, source: { uri: getTintUrl(folderId, "Backdrop") } });
+        return;
+      }
+      if (details?.ImageTags?.Primary) {
+        setResult({ key, source: { uri: getTintUrl(folderId, "Primary") } });
+        return;
+      }
+      const preview = await fetchFolderPreviewItems(folderId).catch(() => []);
+      if (cancelled) return;
+      const first = preview.find((item) => item.ImageTags?.Primary);
+      setResult({ key, source: first ? { uri: getTintUrl(first.Id, "Primary") } : null });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [key, folderId, artwork]);
+
+  return artwork && result.key === key ? result.source : null;
+}

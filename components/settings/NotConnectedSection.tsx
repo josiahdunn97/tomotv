@@ -1,0 +1,447 @@
+import { AddServerRow } from "@/components/settings/AddServerRow";
+import { AccountStrip, AccountStripHandle, StripPerson } from "@/components/settings/AccountStrip";
+import { ServerRow } from "@/components/settings/ServerRow";
+import { settingsStyles as styles } from "./styles";
+import { DEMO_USERNAME, getUserImageUrl, isAddressTitle } from "@/services/jellyfinApi";
+import { describeSubnet } from "@/services/networkDiscovery";
+import { t } from "@/services/i18n";
+import type { UseNetworkScanReturn } from "@/hooks/useNetworkScan";
+import { SavedAccount, SavedServer } from "@/types/jellyfin";
+
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { findNodeHandle, Platform, ScrollView, TextInput, View } from "react-native";
+
+const IS_TV = Platform.isTV;
+
+/** Where the app is signed in right now, and as whom, so that person can wear the mark. */
+export interface ConnectedDestination {
+  serverId: string | null;
+  userId: string | null;
+  url: string;
+  demo: boolean;
+}
+
+interface NotConnectedSectionProps {
+  serverUrl: string;
+  setServerUrl: (v: string) => void;
+  serverUrlRef: React.RefObject<TextInput | null>;
+  isValidating: boolean;
+  /** The demo server connecting off the empty Add Server field; rows hold still meanwhile. */
+  isConnectingDemo: boolean;
+  onConnect: () => void;
+  /** Locally persisted server destinations, most-recent first. */
+  savedServers: SavedServer[];
+  /** The active session's server, null while signed out. */
+  connected?: ConnectedDestination | null;
+  /** Per-card people: the saved sign-ins that reconnect without a login, keyed by server id. */
+  savedServerAccounts?: Record<string, SavedAccount[]>;
+  /** Id of the saved server currently connecting, to show its spinner. */
+  connectingServerId: string | null;
+  /** Id of the account connecting on it, to turn that avatar's ring. */
+  connectingUserId: string | null;
+  /** Row press: the login flow on that server. */
+  onSelectServer: (server: SavedServer) => void;
+  /** Reconnect as one saved account: a press on its avatar in the strip. */
+  onContinueAs: (server: SavedServer, account: SavedAccount) => void;
+  /** Open the sign-in/forget menu for a saved account (long-press on its avatar). */
+  onAccountOptions?: (server: SavedServer, account: SavedAccount) => void;
+  /** Open the edit/remove menu for a saved server (long-press). */
+  onServerOptions: (server: SavedServer) => void;
+  /** Sign in to the demo server: the Demo face in the strip. */
+  onConnectDemo?: () => void;
+  /** Phone: the band the card ends in, under the people. */
+  footer?: React.ReactNode;
+  /** Local-subnet scan state and controls. */
+  scan: UseNetworkScanReturn;
+  /** Run the login flow for a server found by the scan. */
+  onSelectDiscovered: (url: string) => void;
+}
+
+/**
+ * Label and secondary line for the scan row, per scan state.
+ *
+ * The subtitle is one truncating line, so it stays a short factual fragment.
+ * Anything instructional belongs in the label, which is why the row renames
+ * itself to the action it performs rather than explaining itself in the margin.
+ *
+ * `alreadySavedCount` is how many of the scan's finds are also in the saved
+ * list. Those render as saved rows, not as new discoveries, so without this the
+ * row would finish a successful scan by reverting to its idle label with
+ * nothing else on screen changing, as if the scan had found nothing.
+ */
+export function scanRowLabels(scan: UseNetworkScanReturn, alreadySavedCount = 0): { name: string; subtitle?: string } {
+  if (scan.status === "UNSUPPORTED") {
+    // Pressable rather than dead: this is also what a device shows when it was
+    // launched before Wi-Fi came up, and that resolves on its own.
+    return { name: t("settings.scanNetwork"), subtitle: t("settings.noNetworkYet") };
+  }
+
+  if (scan.status === "SCANNING") {
+    const { done, total, phase } = scan.progress;
+    if (!total) return { name: t("settings.stopScanning"), subtitle: t("settings.starting") };
+    // The two phases move at very different speeds, and saying which one is
+    // running keeps the slower second stage from reading as a hang.
+    const detail = (phase === "sweep" ? t("settings.scanAddresses") : t("settings.scanAnswered")).replace("{done}", String(done)).replace("{total}", String(total));
+    return { name: t("settings.stopScanning"), subtitle: detail };
+  }
+
+  if (scan.status === "CANCELLED") {
+    // Says nothing about the subnet: a stopped scan is not evidence of anything.
+    return { name: t("settings.scanNetwork"), subtitle: scan.found.length ? t("settings.stoppedFound").replace("{count}", String(scan.found.length)) : t("settings.stopped") };
+  }
+
+  if (scan.status === "DONE" && scan.found.length === 0) {
+    // Names the range actually swept, which is the diagnostic part, and names the
+    // other explanation: a denied Local Network permission is indistinguishable
+    // from an empty subnet from in here.
+    const where = scan.local ? describeSubnet(scan.local.ip, scan.local.netmask) : t("settings.thisNetwork");
+    return { name: t("settings.scanAgain"), subtitle: t("settings.nothingOn").replace("{where}", where) };
+  }
+
+  if (scan.status === "DONE") {
+    const count = scan.found.length;
+    // When everything found was already saved, the row is the only place the
+    // result can be announced: no new rows appear below it.
+    if (alreadySavedCount >= count) {
+      const noun = count === 1 ? t("settings.server") : t("settings.servers");
+      return { name: t("settings.scanAgain"), subtitle: t("settings.foundAlready").replace("{count}", String(count)).replace("{noun}", noun) };
+    }
+    // Counts only the new finds, matching the "New" marks on the rows below.
+    const newCount = count - alreadySavedCount;
+    const noun = newCount === 1 ? t("settings.server") : t("settings.servers");
+    return { name: t("settings.scanAgain"), subtitle: t("settings.newFound").replace("{count}", String(newCount)).replace("{noun}", noun) };
+  }
+
+  return { name: t("settings.scanNetwork"), subtitle: scan.local ? t("settings.findServersFrom").replace("{ip}", scan.local.ip) : undefined };
+}
+
+/**
+ * Whether a row is the live session. Both sides with an Id compare by Id, so a moved address
+ * still matches and a reused one does not; the url decides only when either side has no Id.
+ * The demo session matches no server row; it is the Demo face in the strip.
+ */
+export function isConnectedDestination(connected: ConnectedDestination | null, serverId: string | undefined, url: string): boolean {
+  if (connected === null || connected.demo) return false;
+  if (serverId && connected.serverId) return serverId === connected.serverId;
+  return url === connected.url;
+}
+
+/** A server still titled by its address shows a placeholder; the address stays on the subtitle line. */
+export function serverTitle(name: string): string {
+  return isAddressTitle(name) ? t("common.unknown") : name;
+}
+
+/** The host alone out of an address, for the people column's second line. */
+export function serverHost(address: string): string {
+  return address
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/[:/?#].*$/, "");
+}
+
+/** A press on the person already signed in does nothing, so it never signs in again. */
+export function ignorePressOnSignedIn(person: StripPerson): StripPerson {
+  return person.connected ? { ...person, onPress: () => undefined } : person;
+}
+
+/** The Demo face: first and ringed while the demo session is live, last otherwise. */
+export function demoStripPerson(demoActive: boolean, loading: boolean, onPress: () => void): StripPerson {
+  return {
+    key: "demo",
+    serverKey: "demo",
+    label: DEMO_USERNAME,
+    sublabel: "Tomo TV",
+    connected: demoActive,
+    loading,
+    lastUsedAt: demoActive ? Number.MAX_SAFE_INTEGER : 0,
+    onPress,
+  };
+}
+
+/** One destination row in the capped list: a discovered server or a saved one. */
+interface DestinationRow {
+  key: string;
+  /** Matches StripPerson.serverKey: the people on this server. */
+  serverKey: string;
+  variant: "server";
+  name: string;
+  subtitle?: string;
+  onPress: () => void;
+  onLongPress?: () => void;
+  isLoading: boolean;
+  isNew?: boolean;
+  connected?: boolean;
+}
+
+export function NotConnectedSection({
+  serverUrl,
+  setServerUrl,
+  serverUrlRef,
+  isValidating,
+  isConnectingDemo,
+  onConnect,
+  savedServers,
+  connected = null,
+  savedServerAccounts,
+  connectingServerId,
+  connectingUserId,
+  onSelectServer,
+  onContinueAs,
+  onAccountOptions,
+  onServerOptions,
+  onConnectDemo,
+  footer,
+  scan,
+  onSelectDiscovered,
+}: NotConnectedSectionProps) {
+  const busy = isValidating || isConnectingDemo;
+  const scanning = scan.status === "SCANNING";
+
+  // Discovered servers already in the saved list are shown once, as saved rows.
+  const savedUrls = new Set(savedServers.map((server) => server.url));
+  const newlyDiscovered = scan.found.filter((server) => !savedUrls.has(server.url));
+  const { name: scanName, subtitle: scanSubtitle } = scanRowLabels(scan, scan.found.length - newlyDiscovered.length);
+
+  // The first server a scan finds takes focus, whichever row it lands on: a saved
+  // card carries no mark of its own, so without this "already in your list" names
+  // nothing. Touch has no focus, so there the row holds the gold fill instead and
+  // gives it up when another control in the section is used, as focus would.
+  const firstFound = scan.found[0];
+  const firstFoundKey = firstFound ? (savedServers.find((server) => server.url === firstFound.url)?.id ?? firstFound.url) : null;
+  // Every row's native node by key: the scan and add rows, then the list by row key. Two maps that
+  // never change identity, so a row's callback ref is stable across renders.
+  const [rowNodes] = useState(() => new Map<string, View>());
+  const [rowRefs] = useState(() => new Map<string, (node: View | null) => void>());
+  const rowRef = (key: string) => {
+    let callback = rowRefs.get(key);
+    if (!callback) {
+      callback = (node) => {
+        if (node) rowNodes.set(key, node);
+        else rowNodes.delete(key);
+      };
+      rowRefs.set(key, callback);
+    }
+    return callback;
+  };
+  // Fires on the null-to-found transition only, so a section mounted after the scan never yanks focus.
+  const previousFirstFoundKey = useRef(firstFoundKey);
+  useEffect(() => {
+    const previous = previousFirstFoundKey.current;
+    previousFirstFoundKey.current = firstFoundKey;
+    if (!IS_TV || previous !== null || firstFoundKey === null) return;
+    const node = rowNodes.get(firstFoundKey) as unknown as { requestTVFocus?: () => void } | undefined;
+    node?.requestTVFocus?.();
+  }, [firstFoundKey, rowNodes]);
+  // The touch side of the same transition, kept as state so a control can release it.
+  const [seenFirstFoundKey, setSeenFirstFoundKey] = useState(firstFoundKey);
+  const [heldKey, setHeldKey] = useState<string | null>(null);
+  if (seenFirstFoundKey !== firstFoundKey) {
+    setSeenFirstFoundKey(firstFoundKey);
+    if (!IS_TV && seenFirstFoundKey === null) setHeldKey(firstFoundKey);
+  }
+  // Using any control but the held row itself takes the fill off it; pressing the
+  // held row keeps it, the way focus stays on the row that was pressed.
+  const releasing =
+    <A extends unknown[]>(fn: (...args: A) => void, key?: string) =>
+    (...args: A) => {
+      if (key !== heldKey) setHeldKey(null);
+      fn(...args);
+    };
+
+  // One list, so the capped scroll below knows which rows are its ends. Discovered first
+  // (they are the result of an action just taken), then saved.
+  const isConnected = (serverId: string | undefined, url: string) => isConnectedDestination(connected, serverId, url);
+  const destinations: DestinationRow[] = [
+    ...newlyDiscovered.map((server) => ({
+      key: server.url,
+      serverKey: server.url,
+      variant: "server" as const,
+      name: serverTitle(server.name),
+      subtitle: server.url,
+      onPress: () => onSelectDiscovered(server.url),
+      isLoading: connectingServerId === server.url,
+      isNew: true,
+      connected: isConnected(server.id, server.url),
+    })),
+    ...savedServers.map((server) => ({
+      key: server.id,
+      serverKey: server.id,
+      variant: "server" as const,
+      name: serverTitle(server.name),
+      subtitle: server.url,
+      onPress: () => onSelectServer(server),
+      onLongPress: () => onServerOptions(server),
+      isLoading: connectingServerId === server.id,
+      connected: isConnected(server.serverId, server.url),
+    })),
+  ];
+
+  // Everyone who can continue without a login, across servers, most recent first.
+  const people: StripPerson[] = savedServers
+    .flatMap<StripPerson>((server) =>
+      (savedServerAccounts?.[server.id] ?? []).map((account) => ({
+        key: `${server.id}:${account.userId}`,
+        serverKey: server.id,
+        label: account.userName,
+        sublabel: isAddressTitle(server.name) ? serverHost(server.name) : server.name,
+        // Only the connected server is asked for a face: a saved server off this network runs
+        // the request out to its timeout, and the placeholder says the same thing at once.
+        imageUri: isConnected(server.serverId, server.url) ? getUserImageUrl(server.url, account.userId) : undefined,
+        connected: isConnected(server.serverId, server.url) && connected?.userId === account.userId,
+        loading: connectingServerId === server.id && connectingUserId === account.userId,
+        lastUsedAt: account.lastUsedAt,
+        onPress: releasing(() => onContinueAs(server, account)),
+        onLongPress: onAccountOptions && releasing(() => onAccountOptions(server, account)),
+      })),
+    )
+    .concat(onConnectDemo ? [demoStripPerson(!!connected?.demo, isConnectingDemo, releasing(onConnectDemo))] : [])
+    .map(ignorePressOnSignedIn)
+    .sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+
+  // tvOS can only move focus out of a ScrollView while its offset is at the matching end:
+  // RCTScrollViewComponentView's shouldUpdateFocusInContext rejects an upward focus update
+  // that leaves a scrolled view, and the same for downward. Landing on the first/last row is
+  // the only moment focus can leave, so pin the offset there. Same fix, same reason, as the
+  // Video Quality list in app/(tabs)/settings.tsx, where the rows above this scroll (Scan,
+  // Add Server) are what Up has to reach.
+  const listRef = useRef<ScrollView>(null);
+  const pinToTop = useCallback(() => listRef.current?.scrollTo({ y: 0, animated: false }), []);
+  const pinToBottom = useCallback(() => listRef.current?.scrollToEnd({ animated: false }), []);
+
+  // TV stands the people in a gold column on the card's right, where the rows can't push them off screen.
+  // While a server row has focus the column shows only its people; the two action rows show everyone.
+  const sidePanel = IS_TV && people.length > 0;
+  const [focusedServerKey, setFocusedServerKey] = useState<string | null>(null);
+  const showEveryone = () => setFocusedServerKey(null);
+  // The row focus was on last: Left from any person returns to it, not to whichever row is level.
+  const [leadRowKey, setLeadRowKey] = useState<string | null>(null);
+  const leadRow = (key: string) => {
+    focusWithin(key);
+    setLeadRowKey(key);
+  };
+  const leadRowHandle = sidePanel && leadRowKey ? (findNodeHandle(rowNodes.get(leadRowKey) ?? null) ?? undefined) : undefined;
+  // Focus leaving the section altogether (Sign Out, the tab bar) resets the column: everyone,
+  // scrolled to the top. The next item's focus can arrive before the last one's blur, so a leave
+  // is "no item of ours holds focus" a beat after a blur, over the keys still mounted.
+  const stripRef = useRef<AccountStripHandle>(null);
+  const focusedKeys = useRef(new Set<string>());
+  const liveKeys = useRef(new Set<string>());
+  const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    liveKeys.current = new Set(["scan", "add", ...destinations.map((row) => row.key), ...people.map((person) => person.key)]);
+  });
+  useEffect(() => () => clearTimeout(leaveTimer.current ?? undefined), []);
+  const focusWithin = (key: string) => focusedKeys.current.add(key);
+  const blurWithin = (key: string) => {
+    focusedKeys.current.delete(key);
+    if (leaveTimer.current !== null) clearTimeout(leaveTimer.current);
+    leaveTimer.current = setTimeout(() => {
+      leaveTimer.current = null;
+      for (const held of focusedKeys.current) if (!liveKeys.current.has(held)) focusedKeys.current.delete(held);
+      if (focusedKeys.current.size > 0) return;
+      setFocusedServerKey(null);
+      stripRef.current?.scrollToStart();
+    }, 50);
+  };
+  const visiblePeople = sidePanel && focusedServerKey !== null ? people.filter((person) => person.serverKey === focusedServerKey) : people;
+
+  return (
+    <View style={styles.section}>
+      <View style={sidePanel ? styles.sectionMain : undefined}>
+        {/* Not disabled while UNSUPPORTED: pressing it re-reads the device address,
+          which is the way back for a TV that booted before its network did.
+          Claims no preferred focus: on the Settings tab, taking focus on mount would
+          drag the user into the form every time they land there. */}
+        <ServerRow
+          ref={rowRef("scan")}
+          variant="scan"
+          name={scanName}
+          subtitle={scanSubtitle}
+          onPress={releasing(scanning ? scan.cancel : scan.start)}
+          onFocus={
+            sidePanel
+              ? () => {
+                  leadRow("scan");
+                  showEveryone();
+                }
+              : undefined
+          }
+          onBlur={sidePanel ? () => blurWithin("scan") : undefined}
+          disabled={busy}
+          isLoading={scanning}
+          flushRight={sidePanel}
+        />
+        {/* CTA plus the address field parked under it; both stay mounted. */}
+        <AddServerRow
+          ref={rowRef("add")}
+          serverUrl={serverUrl}
+          setServerUrl={releasing(setServerUrl)}
+          serverUrlRef={serverUrlRef}
+          isValidating={isValidating}
+          onReveal={releasing(() => undefined)}
+          onConnect={releasing(onConnect)}
+          onFocus={
+            sidePanel
+              ? () => {
+                  leadRow("add");
+                  showEveryone();
+                }
+              : undefined
+          }
+          onBlur={sidePanel ? () => blurWithin("add") : undefined}
+          disabled={busy}
+          flushRight={sidePanel}
+        />
+
+        {/* Capped and internally scrolling once the destinations outgrow it, so a scan that
+          finds several servers can't push the rest of the screen off the bottom. Under the
+          cap the ScrollView just sizes to its rows and nothing scrolls. */}
+        {/* keyboardShouldPersistTaps is not inherited from the host's scroll view: without it here,
+          a tap on a row while the Add Server field has the keyboard up would be spent dismissing
+          the keyboard, and the row would need a second tap. */}
+        <ScrollView ref={listRef} style={styles.serverListScrollable} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} nestedScrollEnabled focusable={false}>
+          {destinations.map((row, index) => {
+            const pin = index === 0 ? pinToTop : index === destinations.length - 1 ? pinToBottom : undefined;
+            const onFocus = sidePanel
+              ? () => {
+                  pin?.();
+                  leadRow(row.key);
+                  setFocusedServerKey(row.serverKey);
+                }
+              : pin;
+            return (
+              <ServerRow
+                key={row.key}
+                ref={rowRef(row.key)}
+                selected={row.key === heldKey}
+                variant={row.variant}
+                name={row.name}
+                subtitle={row.subtitle}
+                onPress={releasing(row.onPress, row.key)}
+                onLongPress={row.onLongPress && releasing(row.onLongPress, row.key)}
+                onFocus={onFocus}
+                onBlur={sidePanel ? () => blurWithin(row.key) : undefined}
+                isLoading={row.isLoading}
+                isNew={row.isNew}
+                connected={row.connected}
+                disabled={busy}
+                flushRight={sidePanel}
+              />
+            );
+          })}
+        </ScrollView>
+      </View>
+      {people.length > 0 ? (
+        <AccountStrip
+          ref={stripRef}
+          people={visiblePeople}
+          disabled={busy}
+          onFocusWithin={sidePanel ? focusWithin : undefined}
+          onBlurWithin={sidePanel ? blurWithin : undefined}
+          nextFocusLeft={leadRowHandle}
+        />
+      ) : null}
+      {footer}
+    </View>
+  );
+}

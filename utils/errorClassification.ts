@@ -1,0 +1,169 @@
+/**
+ * errorClassification.ts
+ *
+ * Pattern-based classification of playback and data-load errors into stable
+ * types, plus user-facing message mapping. Lives in utils/ (not the player
+ * hook) so services and hooks can both use it: raw fetch/AVPlayer errors carry
+ * native exception text and source filenames that must never reach a screen.
+ */
+import { t } from "@/services/i18n";
+import type { StringKey } from "@/services/i18n/strings";
+
+/**
+ * Error types for video playback classification
+ * Using specific patterns instead of loose string matching
+ */
+export enum PlaybackErrorType {
+  NOT_FOUND = "NOT_FOUND",
+  UNAUTHORIZED = "UNAUTHORIZED",
+  NETWORK = "NETWORK",
+  TIMEOUT = "TIMEOUT",
+  CORRUPT = "CORRUPT",
+  DECODE = "DECODE",
+  /** AVPlayer starved of media data (CoreMedia -12889): the feed stalled, not the file. */
+  STALLED = "STALLED",
+  /** A stream behind real DRM (FairPlay, Widevine, PlayReady, SAMPLE-AES): no lane can play it. */
+  PROTECTED = "PROTECTED",
+  /** A live provider refused the channel (429): its streams at once are in use elsewhere. */
+  PROVIDER_LIMIT = "PROVIDER_LIMIT",
+  /** A recording holds the channel's provider, whose limit is one connection. */
+  RECORDING_HOLD = "RECORDING_HOLD",
+  UNKNOWN = "UNKNOWN",
+}
+
+// Patterns for classifying errors - order matters (more specific first)
+const ERROR_PATTERNS: { type: PlaybackErrorType; patterns: RegExp[] }[] = [
+  {
+    type: PlaybackErrorType.RECORDING_HOLD,
+    patterns: [/held by a recording/i],
+  },
+  {
+    type: PlaybackErrorType.PROTECTED,
+    patterns: [/\bDRM\b/, /SAMPLE-AES/i, /streamingkeydelivery/i, /widevine/i, /playready/i],
+  },
+  {
+    // Before NOT_FOUND: RNV sometimes surfaces only the localizedDescription text,
+    // whose "-12889" would otherwise never match a pattern and land on UNKNOWN.
+    type: PlaybackErrorType.STALLED,
+    patterns: [/error -12889/i, /did not start/i],
+  },
+  {
+    type: PlaybackErrorType.NOT_FOUND,
+    patterns: [/not found/i, /404/i, /item.*not.*exist/i],
+  },
+  {
+    type: PlaybackErrorType.UNAUTHORIZED,
+    patterns: [
+      /unauthorized/i,
+      /401/i,
+      /not authorized/i,
+      /authentication.*fail/i,
+      /invalid.*credentials/i,
+      /error -1013/i, // NSURLErrorResourceUnavailable (often indicates 401/403)
+    ],
+  },
+  {
+    type: PlaybackErrorType.TIMEOUT,
+    patterns: [/timed?\s*out/i, /timeout/i, /etimedout/i, /\babort/i, /cancell?ed/i],
+  },
+  {
+    type: PlaybackErrorType.CORRUPT,
+    patterns: [/HostFunction/i, /corrupted/i, /invalid.*format/i, /invalid.*data/i],
+  },
+  {
+    type: PlaybackErrorType.DECODE,
+    patterns: [/decode/i, /codec.*not.*supported/i, /unable.*play/i],
+  },
+  {
+    type: PlaybackErrorType.NETWORK,
+    patterns: [
+      /network\s*(error|fail|issue)/i,
+      /network\s*request\s*failed/i,
+      /fetch\s*(error|fail)/i,
+      /connection\s*(refused|reset|closed)/i,
+      /econnreset/i,
+      /econnrefused/i,
+      /unable.*connect/i,
+      /could\s*not\s*connect/i,
+    ],
+  },
+];
+
+/**
+ * Classifies an error into a specific type using pattern matching
+ * More reliable than loose includes() checks
+ */
+export function classifyPlaybackError(error: unknown): PlaybackErrorType {
+  if (!error) return PlaybackErrorType.UNKNOWN;
+
+  // Native AVPlayer: CoreMediaErrorDomain -12971 = failed to parse segment
+  if (typeof error === "object" && error !== null && "code" in error && "domain" in error) {
+    const native = error as { code: number; domain: string };
+    if (native.code === -12971 && native.domain === "CoreMediaErrorDomain") return PlaybackErrorType.DECODE;
+    // -12889 = "no response for media file": a segment request starved, the stream itself is fine.
+    if (native.code === -12889 && native.domain === "CoreMediaErrorDomain") return PlaybackErrorType.STALLED;
+  }
+
+  // Extract error message, preferring localizedDescription for native AVPlayer errors
+  let errorMessage: string;
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (typeof error === "object" && error !== null) {
+    const obj = error as Record<string, unknown>;
+    errorMessage = String(obj.localizedDescription ?? obj.message ?? obj.errorString ?? "");
+  } else {
+    errorMessage = String(error);
+  }
+
+  for (const { type, patterns } of ERROR_PATTERNS) {
+    if (patterns.some((pattern) => pattern.test(errorMessage))) {
+      return type;
+    }
+  }
+
+  return PlaybackErrorType.UNKNOWN;
+}
+
+const PLAYBACK_ERROR_KEYS: Record<PlaybackErrorType, StringKey> = {
+  [PlaybackErrorType.NOT_FOUND]: "player.error.notFound",
+  [PlaybackErrorType.UNAUTHORIZED]: "player.error.unauthorized",
+  [PlaybackErrorType.NETWORK]: "player.error.network",
+  [PlaybackErrorType.TIMEOUT]: "player.error.timeout",
+  [PlaybackErrorType.CORRUPT]: "player.error.corrupt",
+  [PlaybackErrorType.DECODE]: "player.error.decode",
+  [PlaybackErrorType.STALLED]: "player.error.stalled",
+  [PlaybackErrorType.PROTECTED]: "player.error.protected",
+  [PlaybackErrorType.PROVIDER_LIMIT]: "player.error.providerLimit",
+  [PlaybackErrorType.RECORDING_HOLD]: "player.error.providerLimit",
+  [PlaybackErrorType.UNKNOWN]: "player.error.unknown",
+};
+
+/** The error screen's message for a classified failure, in the active language. */
+export function getPlaybackErrorMessage(errorType: PlaybackErrorType): string {
+  return t(PLAYBACK_ERROR_KEYS[errorType] ?? "player.error.unknown");
+}
+
+/** True when the error looks like the server being unreachable (vs. a data problem). */
+export function isConnectivityError(error: unknown): boolean {
+  const type = classifyPlaybackError(error);
+  return type === PlaybackErrorType.NETWORK || type === PlaybackErrorType.TIMEOUT;
+}
+
+/**
+ * User-facing message for data-load failures (library, search, photos).
+ * Same classification as playback, worded for browsing instead of video.
+ */
+export function getLoadErrorMessage(error: unknown): string {
+  switch (classifyPlaybackError(error)) {
+    case PlaybackErrorType.NETWORK:
+      return "Unable to connect to your Jellyfin server";
+    case PlaybackErrorType.TIMEOUT:
+      return "Connection timed out. Check your network.";
+    case PlaybackErrorType.UNAUTHORIZED:
+      return "Authentication failed. Your session may have expired.";
+    case PlaybackErrorType.NOT_FOUND:
+      return "The server couldn't find this content";
+    default:
+      return "Something went wrong loading your library";
+  }
+}

@@ -1,0 +1,398 @@
+/**
+ * Guide geometry: time to pixels, cells clipped to the loaded window, ruler ticks. Pure (durationLabel
+ * reads the active language), so the canvas and its tests share one source of truth.
+ */
+import { GRID, slotCardPadding } from "@/constants/app";
+import { t } from "@/services/i18n";
+import type { JellyfinProgram, JellyfinTimer, JellyfinVideoItem } from "@/types/jellyfin";
+import { GUIDE_SPAN_MINUTES, guideWindowStart, MINUTE_MS, TICK_MINUTES } from "@keiver/tomo-live";
+
+export { GUIDE_SPAN_MINUTES, guideWindowStart, MINUTE_MS, TICK_MINUTES };
+/** Minor scale marks between the labelled half hours. */
+export const MINOR_TICK_MINUTES = 5;
+/** Days the day strip offers from today: the deepest guide a provider ships. */
+export const GUIDE_DAYS = 14;
+
+/** Local midnight of the day `ms` falls in. */
+export function dayStartMs(ms: number): number {
+  const day = new Date(ms);
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+}
+
+/** Today and the days after it, each by its local midnight; a DST change moves a midnight, never a day. */
+export function guideDays(nowMs: number, count = GUIDE_DAYS): number[] {
+  const today = new Date(dayStartMs(nowMs));
+  return Array.from({ length: count }, (_, i) => new Date(today.getFullYear(), today.getMonth(), today.getDate() + i).getTime());
+}
+
+/**
+ * The window a picked day opens on and where its guide ends: today from the current half hour to
+ * midnight, at least one span so a late evening still shows a stretch; another day midnight to midnight.
+ */
+export function guideDayWindow(dayMs: number, nowMs: number): { startMs: number; horizonMs: number } {
+  const day = new Date(dayMs);
+  const nextMidnight = new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime();
+  if (dayMs !== dayStartMs(nowMs)) return { startMs: dayMs, horizonMs: nextMidnight };
+  const startMs = guideWindowStart(nowMs);
+  return { startMs, horizonMs: Math.max(nextMidnight, startMs + GUIDE_SPAN_MINUTES * MINUTE_MS) };
+}
+
+/**
+ * Whether a day has listings: one a loaded program fell on does; otherwise the server guide runs up
+ * to its last program's start, so days before that have listings and days after have none. Null
+ * before the server has answered.
+ */
+export function dayHasListings(dayMs: number, guideEndMs: number | null, coveredDays: ReadonlySet<number>): boolean | null {
+  if (coveredDays.has(dayMs)) return true;
+  if (guideEndMs === null) return null;
+  return guideEndMs >= dayMs;
+}
+
+export interface GuideMetrics {
+  pxPerMinute: number;
+  rowHeight: number;
+  channelColumnWidth: number;
+  /** Phone: the column's width once dragged to the left magnet, a portrait channel card per row. */
+  compactColumnWidth: number;
+  rulerHeight: number;
+  /** The channel card's padding inside its row slot. */
+  cardInset: { vertical: number; horizontal: number };
+}
+
+/**
+ * The channel card is one more program cell: a 16:9 picture the column's full width and the cell's height, the
+ * row's grid line under it. Widths are multiples of 16 so both sides are whole points.
+ */
+export function guideMetrics(isTV: boolean): GuideMetrics {
+  const channelColumnWidth = isTV ? 368 : 176;
+  const padding = slotCardPadding(isTV);
+  const rowHeight = Math.round(channelColumnWidth / GRID.LIVE_RATIO) + 1;
+  // The compact column holds a portrait card the row's own height, capping the row: padded on the left only.
+  const compactColumnWidth = isTV ? channelColumnWidth : Math.round((rowHeight - 1) * GRID.PORTRAIT_RATIO + padding);
+  const cardInset = { vertical: 0, horizontal: 0 };
+  return isTV
+    ? { pxPerMinute: 8, rowHeight, channelColumnWidth, compactColumnWidth, rulerHeight: 81, cardInset }
+    : { pxPerMinute: 4, rowHeight, channelColumnWidth, compactColumnWidth, rulerHeight: 51, cardInset };
+}
+
+export interface CellGeometry {
+  left: number;
+  width: number;
+}
+
+/** Where a program lands on the canvas, clipped to the window; null when it lies outside it. */
+export function cellGeometry(startMs: number, endMs: number, windowStartMs: number, windowEndMs: number, metrics: GuideMetrics): CellGeometry | null {
+  if (!(endMs > startMs) || endMs <= windowStartMs || startMs >= windowEndMs) return null;
+  const from = Math.max(startMs, windowStartMs);
+  const to = Math.min(endMs, windowEndMs);
+  const left = ((from - windowStartMs) / MINUTE_MS) * metrics.pxPerMinute;
+  const width = Math.max(1, ((to - from) / MINUTE_MS) * metrics.pxPerMinute);
+  return { left, width };
+}
+
+/** A horizontal stretch of the canvas. */
+export interface CanvasSpan {
+  fromPx: number;
+  toPx: number;
+}
+
+/** The cells mounted while the view's left edge is on `page`: a whole viewport past either edge of the view. */
+export function mountSpanFor(page: number, viewportWidth: number): CanvasSpan {
+  return { fromPx: (page - 1) * viewportWidth, toPx: (page + 3) * viewportWidth };
+}
+
+/**
+ * TV row snap: a focused row lands as the list's lowest whole row. The bottom pad puts the list's end
+ * exactly where its last row lands, so the end sits on the row grid the interval snap rounds to.
+ */
+export function rowSnap(listHeight: number, rowHeight: number): { offset: number; bottomPad: number } {
+  const offset = Math.max(0, Math.floor((listHeight - rowHeight) / rowHeight)) * rowHeight;
+  return { offset, bottomPad: Math.max(0, listHeight - rowHeight - offset) };
+}
+
+/**
+ * Where the grid scrolls on a move within a row: a cell's start when it began left of the visible edge. The
+ * focusable covers only the cell's stretch on screen, so the focus engine reveals a cell cut by the right edge itself.
+ */
+export function revealOffset(cell: CellGeometry, scrollX: number): number | undefined {
+  return cell.left < scrollX ? cell.left : undefined;
+}
+
+/** A Left press or swipe on a cell with no cell to its left in a scrolled grid: the scroll view refuses that focus move out, so the canvas makes it. */
+export function exitsToCard(eventType: string, leavesRow: boolean, scrollX: number): boolean {
+  return leavesRow && scrollX > 0 && (eventType === "left" || eventType === "swipeLeft");
+}
+
+/** True when Left from this cell has no cell to land on: none in the row starts before it, or the one just before is not mounted. */
+export function leftLeavesRow(
+  cells: Pick<JellyfinProgram, "StartDate" | "EndDate">[],
+  program: Pick<JellyfinProgram, "StartDate" | "EndDate">,
+  windowStartMs: number,
+  windowEndMs: number,
+  metrics: GuideMetrics,
+  mountSpan?: CanvasSpan,
+): boolean {
+  const { startMs } = programTimes(program);
+  let previous: { startMs: number; endMs: number } | undefined;
+  for (const cell of cells) {
+    const times = programTimes(cell);
+    if (times.startMs < startMs && (!previous || times.startMs > previous.startMs)) previous = times;
+  }
+  if (!previous) return true;
+  if (!mountSpan) return false;
+  const geometry = cellGeometry(previous.startMs, previous.endMs, windowStartMs, windowEndMs, metrics);
+  return !geometry || !cellInSpan(geometry, mountSpan);
+}
+
+/** True when any part of the cell lies inside the span. */
+export function cellInSpan(cell: CellGeometry, span: CanvasSpan): boolean {
+  return cell.left + cell.width >= span.fromPx && cell.left <= span.toPx;
+}
+
+export interface RulerTick {
+  left: number;
+  atMs: number;
+  isHour: boolean;
+  /** A bare mark between the labelled half hours. */
+  isMinor: boolean;
+}
+
+/** The window's marks, or only those inside `span`. */
+export function rulerTicks(windowStartMs: number, windowEndMs: number, metrics: GuideMetrics, span?: CanvasSpan): RulerTick[] {
+  const ticks: RulerTick[] = [];
+  const step = MINOR_TICK_MINUTES * MINUTE_MS;
+  const stepPx = MINOR_TICK_MINUTES * metrics.pxPerMinute;
+  const from = span ? windowStartMs + Math.max(0, Math.floor(span.fromPx / stepPx)) * step : windowStartMs;
+  const to = span ? Math.min(windowEndMs, windowStartMs + (Math.floor(span.toPx / stepPx) + 1) * step) : windowEndMs;
+  for (let at = from; at < to; at += step) {
+    const minutes = new Date(at).getMinutes();
+    ticks.push({ left: ((at - windowStartMs) / MINUTE_MS) * metrics.pxPerMinute, atMs: at, isHour: minutes === 0, isMinor: minutes % TICK_MINUTES !== 0 });
+  }
+  return ticks;
+}
+
+export type ProgramCategory = "news" | "sports" | "kids" | "movie";
+
+export function programCategory(program: Pick<JellyfinProgram, "IsNews" | "IsSports" | "IsKids" | "IsMovie">): ProgramCategory | null {
+  if (program.IsSports) return "sports";
+  if (program.IsNews) return "news";
+  if (program.IsKids) return "kids";
+  if (program.IsMovie) return "movie";
+  return null;
+}
+
+export function programTimes(program: Pick<JellyfinProgram, "StartDate" | "EndDate">): { startMs: number; endMs: number } {
+  return { startMs: Date.parse(program.StartDate ?? ""), endMs: Date.parse(program.EndDate ?? "") };
+}
+
+/** The cell a vertical move lands on: the one under the edge, else the first after it. */
+export function cellAtEdge<T extends Pick<JellyfinProgram, "StartDate" | "EndDate">>(programs: T[], edgeMs: number): T | undefined {
+  let next: T | undefined;
+  for (const program of programs) {
+    const { startMs, endMs } = programTimes(program);
+    if (startMs <= edgeMs && edgeMs < endMs) return program;
+    if (startMs > edgeMs && (!next || startMs < programTimes(next).startMs)) next = program;
+  }
+  return next ?? programs[programs.length - 1];
+}
+
+/** A timer still scheduled or recording. */
+export function isActiveTimer(timer: Pick<JellyfinTimer, "Status">): boolean {
+  return timer.Status !== "Cancelled" && timer.Status !== "Completed";
+}
+
+/**
+ * The timer covering this target: a program's by id, else the channel's over the clock now. A program
+ * no timer names falls back to a manual timer only (no ProgramId), over the program's span when known.
+ */
+export function activeRecordTimer(
+  timers: JellyfinTimer[],
+  target: { programId?: string; channelId: string; program?: Pick<JellyfinProgram, "StartDate" | "EndDate"> | null },
+  nowMs: number,
+): JellyfinTimer | null {
+  const byProgram = target.programId ? timers.find((candidate) => candidate.ProgramId === target.programId && isActiveTimer(candidate)) : undefined;
+  if (byProgram) return byProgram;
+  const span = target.program ? programTimes(target.program) : null;
+  return (
+    timers.find((candidate) => {
+      if (candidate.ChannelId !== target.channelId || !isActiveTimer(candidate)) return false;
+      if (target.programId && candidate.ProgramId) return false;
+      const { startMs, endMs } = programTimes(candidate);
+      if (span && Number.isFinite(span.startMs) && Number.isFinite(span.endMs)) return startMs < span.endMs && span.startMs < endMs;
+      return startMs <= nowMs && nowMs < endMs;
+    }) ?? null
+  );
+}
+
+/** A programme card is recording when a live timer covers it, the info panel's own match. */
+export function programRecording(timers: JellyfinTimer[], item: Pick<JellyfinVideoItem, "Id" | "Type" | "ChannelId" | "StartDate" | "EndDate">, nowMs: number): boolean {
+  return item.Type === "Program" && !!activeRecordTimer(timers, { programId: item.Id, channelId: item.ChannelId ?? "", program: item }, nowMs);
+}
+
+/** "2h", "1h 12m" or "45m" in the active language's units: the length a recording toast names. */
+export function durationLabel(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) return t("common.durationMinutes").replace("{minutes}", String(rest));
+  if (rest === 0) return t("common.durationHours").replace("{hours}", String(hours));
+  return t("common.durationHoursMinutes").replace("{hours}", String(hours)).replace("{minutes}", String(rest));
+}
+
+export function isAiring(program: Pick<JellyfinProgram, "StartDate" | "EndDate">, nowMs: number): boolean {
+  const { startMs, endMs } = programTimes(program);
+  return startMs <= nowMs && nowMs < endMs;
+}
+
+export function formatClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+/** A slot's two clock times; one inside a single minute shows its seconds, so it never reads as no time at all. */
+export function formatClockRange(startMs: number, endMs: number): { start: string; end: string } {
+  const start = formatClock(startMs);
+  const end = formatClock(endMs);
+  if (start !== end) return { start, end };
+  const withSeconds = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  return { start: withSeconds(startMs), end: withSeconds(endMs) };
+}
+
+/** "Today", "Tomorrow", else the weekday: the guide never spans further than a viewer scrolls. */
+export function formatDayLabel(ms: number, nowMs: number, labels: { today: string; tomorrow: string }): string {
+  const day = new Date(ms);
+  const now = new Date(nowMs);
+  const dayStart = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+  const nowStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const diff = Math.round((dayStart - nowStart) / 86_400_000);
+  if (diff === 0) return labels.today;
+  if (diff === 1) return labels.tomorrow;
+  return day.toLocaleDateString([], { weekday: "long" });
+}
+
+/** The day strip's heading for a day: "Today", "Tomorrow" or the weekday, then the short date. */
+export function formatDayHeading(ms: number, nowMs: number, labels: { today: string; tomorrow: string }): string {
+  return `${formatDayLabel(ms, nowMs, labels)} · ${new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" })}`;
+}
+
+/** A box's text: the day of the month, or the month's short name on its first day so 31 then 1 reads. */
+export function formatDayBox(ms: number): string {
+  const day = new Date(ms);
+  return day.getDate() === 1 ? day.toLocaleDateString([], { month: "short" }) : String(day.getDate());
+}
+
+/** The first day in view once `index` is: unchanged while it shows, else the crossed edge lands on it. */
+export function dayStripFirst(index: number, first: number, inView: number): number {
+  if (index < first) return index;
+  if (index >= first + inView) return index - inView + 1;
+  return first;
+}
+
+type PickerDay = { startMs: number; hasListings: boolean | null };
+
+/** The calendar's pickable span: the first day to the end of the last one not known to lack listings. */
+export function dayPickerRange(days: readonly PickerDay[]): { start: Date; end: Date } | null {
+  const last = [...days].reverse().find((day) => day.hasListings !== false);
+  if (!days[0] || !last) return null;
+  const lastDay = new Date(last.startMs);
+  return { start: new Date(days[0].startMs), end: new Date(new Date(lastDay.getFullYear(), lastDay.getMonth(), lastDay.getDate() + 1).getTime() - 1) };
+}
+
+/** The strip's day a calendar pick lands in, null for one outside it or without listings. */
+export function pickedDay(days: readonly PickerDay[], pickedMs: number): number | null {
+  const day = days.find((candidate) => candidate.startMs === dayStartMs(pickedMs));
+  return day && day.hasListings !== false ? day.startMs : null;
+}
+
+/** Id prefix of the stand-in cell a channel without guide data shows; select tunes, nothing else. */
+export const NO_GUIDE_PREFIX = "no-guide:";
+
+/** The channel a stand-in cell stands for, null for any other program id. */
+export function standInChannelId(programId: string | undefined): string | null {
+  return programId?.startsWith(NO_GUIDE_PREFIX) ? programId.slice(NO_GUIDE_PREFIX.length) : null;
+}
+
+/** Id prefix of a programme from the viewer's external XMLTV guide: not on the server, never fetched. */
+export const EXTERNAL_GUIDE_PREFIX = "epg:";
+
+/** What a finished refresh tells the viewer: the load failed, no row has listings, or the guide updated. */
+export function guideRefreshOutcome(failed: boolean, hasListings: boolean): { title: "liveTv.guideUnavailable" | "liveTv.noGuide" | "liveTv.guideUpdated"; kind: "error" | "info" | "success" } {
+  if (failed) return { title: "liveTv.guideUnavailable", kind: "error" };
+  return hasListings ? { title: "liveTv.guideUpdated", kind: "success" } : { title: "liveTv.noGuide", kind: "info" };
+}
+
+/**
+ * Replace the requested window with its successful response, including an empty one. Keep other
+ * windows when extending the guide; the returned programmes alone cannot describe what was removed.
+ */
+export function mergePrograms(existing: readonly JellyfinProgram[] | undefined, incoming: readonly JellyfinProgram[], window: { from: number; to: number }): JellyfinProgram[] {
+  const fresh = new Map(incoming.map((program) => [program.Id, program]));
+  const kept = (existing ?? []).filter((program) => {
+    if (fresh.has(program.Id)) return false;
+    const { startMs, endMs } = programTimes(program);
+    if (!Number.isFinite(endMs) || endMs <= startMs) return startMs < window.from || startMs >= window.to;
+    return endMs <= window.from || startMs >= window.to;
+  });
+  return kept.concat(Array.from(fresh.values())).sort((a, b) => Date.parse(a.StartDate ?? "") - Date.parse(b.StartDate ?? ""));
+}
+
+/** Whole spans of loaded listings kept past the stretch the view needs, on each side. */
+export const GUIDE_KEEP_SPANS = 2;
+
+/** The stretch worth keeping loaded: the needed one widened to whole spans from the origin, GUIDE_KEEP_SPANS more each side. */
+export function keepRange(originMs: number, needFromMs: number, needToMs: number): { from: number; to: number } {
+  const span = GUIDE_SPAN_MINUTES * MINUTE_MS;
+  const from = originMs + (Math.floor((needFromMs - originMs) / span) - GUIDE_KEEP_SPANS) * span;
+  const to = originMs + (Math.ceil((needToMs - originMs) / span) + GUIDE_KEEP_SPANS) * span;
+  return { from: Math.max(originMs, from), to };
+}
+
+/**
+ * The programmes touching [from, to), one with no end placed by its start; the same list when none leaves.
+ * A list never empties: its nearest programme stays, so a channel with listings elsewhere never reads as one without.
+ */
+export function trimPrograms(programs: JellyfinProgram[], from: number, to: number): JellyfinProgram[] {
+  const kept = programs.filter((program) => {
+    const { startMs, endMs } = programTimes(program);
+    if (!Number.isFinite(endMs) || endMs <= startMs) return startMs >= from && startMs < to;
+    return endMs > from && startMs < to;
+  });
+  if (kept.length === programs.length || programs.length === 1) return programs;
+  if (kept.length > 0) return kept;
+  const before = programs.filter((program) => programTimes(program).startMs < from);
+  return [before.length > 0 ? before[before.length - 1] : programs[0]];
+}
+
+/**
+ * The channel one flip away, wrapping at the ends: +1 for the next channel, -1 for the previous.
+ * Returns null when the id is not in the list or the list has fewer than two entries (nothing to
+ * flip to). Pure, so the player's flip handler and its test share the one rule.
+ */
+export function adjacentChannelId<T extends { Id: string }>(channels: T[], currentId: string, direction: 1 | -1): string | null {
+  if (channels.length < 2) return null;
+  const index = channels.findIndex((channel) => channel.Id === currentId);
+  if (index < 0) return null;
+  const next = (index + direction + channels.length) % channels.length;
+  return channels[next].Id;
+}
+
+/** The node a press opened a screen from: its cell while mounted, else its row's channel card. */
+export function restoreFocusNode<N>(source: { programId?: string; channelId: string }, cellNodes: ReadonlyMap<string, N>, cardNodes: ReadonlyMap<string, N>): N | undefined {
+  return (source.programId !== undefined ? cellNodes.get(source.programId) : undefined) ?? cardNodes.get(source.channelId);
+}
+
+/** The ring with the playing channel in it: one tuned from outside the shown list is appended, so a flip from it lands in the list. */
+export function ringWithCenter<T extends { Id: string }>(ring: readonly T[], center: T): T[] {
+  return ring.some((entry) => entry.Id === center.Id) ? [...ring] : [...ring, center];
+}
+
+/**
+ * The ids the player shows around the playing channel: the previous one (a flip back), then it and up
+ * to `ahead` after it, wrapping, each once. Just the playing channel until the lineup has it.
+ */
+export function channelWindow<T extends { Id: string }>(channels: readonly T[], currentId: string, ahead: number): string[] {
+  const index = channels.findIndex((channel) => channel.Id === currentId);
+  if (index < 0) return [currentId];
+  const count = Math.min(channels.length, ahead + 1);
+  const at = (offset: number) => channels[(index + offset + channels.length) % channels.length].Id;
+  return [...new Set([at(-1), ...Array.from({ length: count }, (_, offset) => at(offset))])];
+}

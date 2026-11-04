@@ -1,0 +1,112 @@
+/**
+ * Tests for useOpenShelfItem, the press handler behind every shelf card. A photo carries no
+ * media source, so routing one to the player is what put "Unable to Play / Failed to load
+ * video" on screen for a PNG that opens fine from the folder grid.
+ *
+ * Rendered with react-test-renderer through a null-rendering harness, the same pattern as
+ * hooks/__tests__/useFolderPlay.test.tsx.
+ */
+import { useOpenShelfItem } from "@/hooks/useOpenShelfItem";
+import { JellyfinItem } from "@/types/jellyfin";
+import React, { forwardRef, useImperativeHandle } from "react";
+import TestRenderer, { act } from "react-test-renderer";
+
+const mockPush = jest.fn();
+const mockReplace = jest.fn();
+const mockBuildQueue = jest.fn();
+
+jest.mock("expo-router", () => ({
+  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+}));
+
+jest.mock("@/contexts/LoadingContext", () => ({
+  useLoadingActions: () => ({ showGlobalLoader: jest.fn(), hideGlobalLoader: jest.fn() }),
+}));
+
+jest.mock("@/contexts/PlayQueueContext", () => ({
+  usePlayQueue: () => ({ buildQueue: mockBuildQueue }),
+}));
+
+jest.mock("@/services/jellyfinApi", () => ({
+  isAudioItem: (item: JellyfinItem) => item.Type === "Audio",
+  isFolder: (item: JellyfinItem) => item.Type === "Folder" || item.Type === "Series",
+  isPhoto: (item: JellyfinItem) => item.Type === "Photo",
+  isBook: (item: JellyfinItem) => item.Type === "Book",
+  isLiveChannel: (item: JellyfinItem) => item.Type === "TvChannel",
+}));
+
+type OpenHandle = { open: (item: JellyfinItem, options?: { replace?: boolean }) => void };
+
+const Harness = forwardRef<OpenHandle>((_props, ref) => {
+  const openItem = useOpenShelfItem();
+  useImperativeHandle(ref, () => ({ open: openItem }), [openItem]);
+  return null;
+});
+Harness.displayName = "Harness";
+
+function mountHarness(): OpenHandle {
+  const ref = React.createRef<OpenHandle>();
+  act(() => {
+    TestRenderer.create(<Harness ref={ref} />);
+  });
+  return ref.current!;
+}
+
+describe("useOpenShelfItem", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("opens a photo in the viewer over the folder it lives in", () => {
+    mountHarness().open({ Id: "photo-1", Name: "reference_00011_", Type: "Photo", ParentId: "folder-1" } as JellyfinItem);
+
+    expect(mockPush).toHaveBeenCalledWith({ pathname: "/photo-viewer", params: { photoId: "photo-1", folderId: "folder-1" } });
+    expect(mockBuildQueue).not.toHaveBeenCalled();
+  });
+
+  it("opens a parentless photo on its own rather than sending it to the player", () => {
+    mountHarness().open({ Id: "photo-2", Name: "loose", Type: "Photo" } as JellyfinItem);
+
+    expect(mockPush).toHaveBeenCalledWith({ pathname: "/photo-viewer", params: { photoId: "photo-2" } });
+  });
+
+  it("opens a book in the reader, never the player", () => {
+    mountHarness().open({ Id: "book-1", Name: "Comic", Type: "Book", ParentId: "folder-1" } as JellyfinItem);
+
+    expect(mockPush).toHaveBeenCalledWith({ pathname: "/book-reader", params: { itemId: "book-1", name: "Comic" } });
+    expect(mockBuildQueue).not.toHaveBeenCalled();
+  });
+
+  it("still routes a video to the player", () => {
+    mountHarness().open({ Id: "movie-1", Name: "Movie", Type: "Movie", ParentId: "folder-1" } as JellyfinItem);
+
+    expect(mockPush).toHaveBeenCalledWith(expect.objectContaining({ pathname: "/player" }));
+  });
+
+  it("tunes the channel of a programme on now, and opens the panel of a later one", () => {
+    const now = Date.now();
+    const iso = (offsetMin: number) => new Date(now + offsetMin * 60_000).toISOString();
+    const handle = mountHarness();
+    handle.open({ Id: "p1", Name: "Witness", Type: "Program", ChannelId: "ch1", ChannelName: "Al Jazeera", StartDate: iso(-10), EndDate: iso(20) } as JellyfinItem);
+    expect(mockPush).toHaveBeenLastCalledWith({ pathname: "/player", params: { videoId: "ch1", videoName: "Al Jazeera", live: "1" } });
+    handle.open({ Id: "p2", Name: "Witness", Type: "Program", ChannelId: "ch1", ChannelName: "Al Jazeera", StartDate: iso(60), EndDate: iso(90) } as JellyfinItem);
+    expect(mockPush).toHaveBeenLastCalledWith({ pathname: "/video-info", params: { videoId: "p2", name: "Witness" } });
+    expect(mockBuildQueue).not.toHaveBeenCalled();
+  });
+
+  it("tunes a guide-source programme on now, and preserves a later programme in its panel", () => {
+    const now = Date.now();
+    const iso = (offsetMin: number) => new Date(now + offsetMin * 60_000).toISOString();
+    const handle = mountHarness();
+    handle.open({ Id: "epg:tbs:1", Name: "MLB Baseball", Type: "Program", ChannelId: "tbs", ChannelName: "TBS", StartDate: iso(-10), EndDate: iso(20) } as JellyfinItem);
+    expect(mockPush).toHaveBeenLastCalledWith({ pathname: "/player", params: { videoId: "tbs", videoName: "TBS", live: "1" } });
+    const later = { Id: "epg:tbs:2", Name: "MLB Baseball", Type: "Program", ChannelId: "tbs", ChannelName: "TBS", StartDate: iso(60), EndDate: iso(90), Overview: "Yankees at Rays." } as JellyfinItem;
+    handle.open(later);
+    expect(mockPush).toHaveBeenLastCalledWith({ pathname: "/video-info", params: { videoId: "tbs", name: "MLB Baseball", guideProgram: JSON.stringify(later) } });
+  });
+
+  it("replaces the presenting sheet with a live channel when asked", () => {
+    mountHarness().open({ Id: "ch1", Name: "Al Jazeera", Type: "TvChannel" } as JellyfinItem, { replace: true });
+
+    expect(mockReplace).toHaveBeenCalledWith({ pathname: "/player", params: { videoId: "ch1", videoName: "Al Jazeera", live: "1" } });
+    expect(mockPush).not.toHaveBeenCalledWith(expect.objectContaining({ pathname: "/player" }));
+  });
+});
