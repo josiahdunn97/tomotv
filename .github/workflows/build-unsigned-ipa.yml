@@ -7,7 +7,7 @@ jobs:
   build:
     # If the build complains about the Xcode/SDK version, switch to the newest
     # macOS image GitHub offers (e.g. macos-26) or pick Xcode with xcode-select.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 90
 
     steps:
