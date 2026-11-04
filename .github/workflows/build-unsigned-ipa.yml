@@ -43,12 +43,24 @@ jobs:
           chmod +x "$RUNNER_TEMP/fakebin/ffmpeg"
           echo "FFMPEG_PATH=$RUNNER_TEMP/fakebin/ffmpeg" >> "$GITHUB_ENV"
 
+      # Same sequence the project's own archive script uses: prebuild without the
+      # install step, then pod install as a separate command.
       - name: Expo prebuild (iOS)
         timeout-minutes: 30
         run: |
           date +%T
-          npm run prebuild:ios
+          CI=1 EXPO_TV=0 EXPO_MACCATALYST=0 npx expo prebuild --clean -p ios --no-install
           date +%T
+          ls ios
+
+      - name: Pod install
+        timeout-minutes: 40
+        working-directory: ios
+        run: |
+          date +%T
+          pod install
+          date +%T
+          ls -d *.xcworkspace
 
       - name: Show ffmpeg calls
         if: always()
@@ -59,6 +71,7 @@ jobs:
         run: |
           WORKSPACE=$(ls -d *.xcworkspace | head -1)
           SCHEME=$(basename -s .xcscheme "$(ls ${WORKSPACE%.xcworkspace}.xcodeproj/xcshareddata/xcschemes/*.xcscheme | head -1)")
+          [ -n "$WORKSPACE" ] && [ -n "$SCHEME" ] || { echo "no workspace/scheme found"; ls -la; exit 1; }
           echo "workspace=$WORKSPACE scheme=$SCHEME"
           mkdir -p ../build
           xcodebuild build \
